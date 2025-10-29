@@ -2429,7 +2429,7 @@ public:
         uint32_t vc = NOC_UNICAST_WRITE_VC,
         uint32_t trid = INVALID_TXN_ID) const {
         if constexpr (txn_id_mode == TxnIdMode::ENABLED) {
-            // TODO (#31535): Need to add check in ncrisc_noc_fast_write_any_len to ensure outstanding transaction register does not overflow
+            // TODO (#29562): Need to add check in ncrisc_noc_fast_write_any_len to ensure outstanding transaction register does not overflow
             WAYPOINT("NAWW");
             ASSERT(trid != INVALID_TXN_ID);
             auto src_addr = get_src_ptr<AddressType::LOCAL_L1>(src, src_args);
