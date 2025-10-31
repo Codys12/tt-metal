@@ -152,7 +152,7 @@ void MetalContext::initialize(
 
         // Launch async tasks for each device
         std::vector<std::future<void>> futures;
-        std::vector<ChipId> device_ids; // Store device IDs in the same order as futures
+        std::vector<ChipId> device_ids;  // Store device IDs in the same order as futures
 
         futures.reserve(all_devices.size());
         device_ids.reserve(all_devices.size());
@@ -161,9 +161,9 @@ void MetalContext::initialize(
         for (ChipId device_id : all_devices) {
             device_ids.push_back(device_id);
             futures.emplace_back(std::async(std::launch::async, [this, device_id, fw_compile_hash]() {
-                //ZoneScoped;
-                //ZoneName("Device Init", 11);
-                //ZoneValue(device_id);
+                // ZoneScoped;
+                // ZoneName("Device Init", 11);
+                // ZoneValue(device_id);
 
                 // Clear L1/DRAM if requested
                 if (rtoptions_.get_clear_l1()) {
@@ -194,20 +194,20 @@ void MetalContext::initialize(
                     }
                 }
 
-                // Clear the entire launch message ring buffer on ethernet cores before application firmware is activated.
-                // This is required since ethernet cores context switch between application and routing firmware.
-                // If ERISC application firmware is activated before the launch messages are cleared, it can enter an undefined
-                // state by reading a corrupted launch message. Routing firmware will never run in this case, causing UMD issued
-                // transactions to hang.
+                // Clear the entire launch message ring buffer on ethernet cores before application firmware is
+                // activated. This is required since ethernet cores context switch between application and routing
+                // firmware. If ERISC application firmware is activated before the launch messages are cleared, it can
+                // enter an undefined state by reading a corrupted launch message. Routing firmware will never run in
+                // this case, causing UMD issued transactions to hang.
                 clear_launch_messages_on_eth_cores(device_id);
             }));
         }
 
         // Wait for all async tasks to complete
         for (size_t i = 0; i < futures.size(); ++i) {
-            ChipId device_id = device_ids[i]; // Get the corresponding device ID
+            ChipId device_id = device_ids[i];  // Get the corresponding device ID
             try {
-                futures[i].wait(); // This handles synchronization and exception propagation
+                futures[i].wait();  // This handles synchronization and exception propagation
             } catch (const std::exception& e) {
                 TT_THROW("Device initialization failed for device {}: {}", device_id, e.what());
             } catch (...) {
@@ -231,15 +231,44 @@ void MetalContext::initialize(
         dprint_server_->attach_devices();
     }
     watcher_server_->init_devices();
-    for (ChipId device_id : all_devices) {
-        ClearNocData(device_id);
 
-        // TODO: as optimization, investigate removing all this call for already initialized devivces
-        if (!rtoptions_.get_skip_reset_cores_on_init()) {
-            reset_cores(device_id);
+    // Parallelize device initialization
+    {
+        ZoneScoped;
+        ZoneName("Parallel Device Final Initialization", 32);
+
+        std::vector<std::future<void>> futures;
+        std::vector<ChipId> device_ids;
+
+        futures.reserve(all_devices.size());
+        device_ids.reserve(all_devices.size());
+
+        // Launch async tasks for each device
+        for (ChipId device_id : all_devices) {
+            device_ids.push_back(device_id);
+            futures.emplace_back(std::async(std::launch::async, [this, device_id]() {
+                ClearNocData(device_id);
+
+                // TODO: as optimization, investigate removing all this call for already initialized devivces
+                if (!rtoptions_.get_skip_reset_cores_on_init()) {
+                    reset_cores(device_id);
+                }
+
+                initialize_and_launch_firmware(device_id);
+            }));
         }
 
-        initialize_and_launch_firmware(device_id);
+        // Wait for all async tasks to complete
+        for (size_t i = 0; i < futures.size(); ++i) {
+            ChipId device_id = device_ids[i];
+            try {
+                futures[i].wait();
+            } catch (const std::exception& e) {
+                TT_THROW("Device final initialization failed for device {}: {}", device_id, e.what());
+            } catch (...) {
+                TT_THROW("Device final initialization failed for device {} with unknown exception", device_id);
+            }
+        }
     }
     // Watcher needs to init before FW since FW needs watcher mailboxes to be set up, and needs to attach after FW
     // starts since it also writes to watcher mailboxes.
