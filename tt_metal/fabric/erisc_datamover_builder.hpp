@@ -152,6 +152,14 @@ struct StreamRegAssignments {
     static constexpr uint32_t sender_channel_6_free_slots_stream_id =
         27;  // for upstream E/W/N/S edge on: 2D X/Y Router->VC1
     static constexpr uint32_t sender_channel_7_free_slots_stream_id = 28;  // for upstream Z edge on: 2D+Z->VC1
+    // Used by Lite Fabric
+    // Consult tt_metal/lite_fabric/hw/inc/constants.hpp to ensure no conflicts.
+    static constexpr uint32_t reserved_lite_fabric_0_stream_id = sender_channel_2_free_slots_stream_id;
+    static constexpr uint32_t reserved_lite_fabric_1_stream_id = sender_channel_3_free_slots_stream_id;
+    static constexpr uint32_t reserved_lite_fabric_2_stream_id = sender_channel_4_free_slots_stream_id;
+    static constexpr uint32_t reserved_lite_fabric_3_stream_id = sender_channel_5_free_slots_stream_id;
+    static constexpr uint32_t reserved_lite_fabric_4_stream_id = sender_channel_6_free_slots_stream_id;
+    static constexpr uint32_t reserved_lite_fabric_5_stream_id = sender_channel_7_free_slots_stream_id;
 
     // Local tensix relay free slots stream ID (UDM mode only)
     static constexpr uint32_t tensix_relay_local_free_slots_stream_id = 29;

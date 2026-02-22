@@ -35,7 +35,7 @@ int32_t get_static_tlb_size() {
 namespace blackhole {
 
 static constexpr uint32_t NUM_PORTS_PER_DRAM_CHANNEL = 3;
-static constexpr uint32_t NUM_DRAM_CHANNELS = 8;
+[[maybe_unused]] static constexpr uint32_t NUM_DRAM_CHANNELS = 8;
 
 int32_t get_static_tlb_size() {
     return 2 * (1 << 20);
