@@ -37,6 +37,18 @@ class MoE(SharedStateAddOn, AbstractModule):
     See the `AbstractModule` docstring for usage info.
     """
 
+    @staticmethod
+    def _select_dispatch_cluster_axis(mesh_device: ttnn.Device) -> int:
+        """Select a valid cluster axis for MoE all-to-all on the given mesh.
+
+        The MoE all-to-all ops require at least 2 devices along the chosen axis.
+        Default to axis 0 (rows), but fall back to axis 1 for 1xN meshes.
+        """
+        mesh_shape = list(mesh_device.shape)
+        if len(mesh_shape) >= 2 and mesh_shape[0] <= 1 and mesh_shape[1] > 1:
+            return 1
+        return 0
+
     @classmethod
     def convert_weights(
         cls,
@@ -79,7 +91,8 @@ class MoE(SharedStateAddOn, AbstractModule):
 
         num_devices = mesh_device.get_num_devices()
         num_experts_per_device = MoEExperts._get_num_experts_per_device(hf_config, mesh_device)
-        num_dispatch_device_rows = mesh_device.shape[0]
+        dispatch_cluster_axis = cls._select_dispatch_cluster_axis(mesh_device)
+        num_dispatch_devices = mesh_device.shape[dispatch_cluster_axis]
 
         expert_mapping_tensors = ttnn.from_torch(
             torch.eye(num_devices, dtype=torch.int32)
@@ -94,7 +107,7 @@ class MoE(SharedStateAddOn, AbstractModule):
         )
 
         remap_topk_mask = ttnn.from_torch(
-            torch.ones((1, num_dispatch_device_rows, 1, hf_config.n_routed_experts), dtype=torch.bfloat16),
+            torch.ones((1, num_dispatch_devices, 1, hf_config.n_routed_experts), dtype=torch.bfloat16),
             device=mesh_device,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
             dtype=ttnn.bfloat16,
@@ -134,6 +147,7 @@ class MoE(SharedStateAddOn, AbstractModule):
         """
 
         num_experts_per_device = MoEExperts._get_num_experts_per_device(hf_config, mesh_device)
+        dispatch_cluster_axis = cls._select_dispatch_cluster_axis(mesh_device)
 
         if mode == "decode":
             memory_config = ttnn.L1_MEMORY_CONFIG
@@ -155,7 +169,7 @@ class MoE(SharedStateAddOn, AbstractModule):
                 "num_experts_per_device": num_experts_per_device,
                 "hidden_size": hf_config.hidden_size,
                 "num_experts_per_tok": hf_config.num_experts_per_tok,
-                "num_dispatch_devices": mesh_device.shape[0],
+                "num_dispatch_devices": mesh_device.shape[dispatch_cluster_axis],
                 "moe_gate": MoEGate.model_config(hf_config, mesh_device, mode, topk_fallback=topk_fallback),
                 "all_to_all_dispatch_output_memory_config": memory_config,
                 "all_to_all_dispatch_metadata_memory_config": ttnn.DRAM_MEMORY_CONFIG,
@@ -167,8 +181,12 @@ class MoE(SharedStateAddOn, AbstractModule):
                 "mul_experts_output_with_weights": MulConfig(memory_config=memory_config),
                 "input_memory_config": input_output_memory_config,
                 "output_memory_config": input_output_memory_config,
-                "all_to_all_dispatch": AllToAllDispatchConfig(cluster_axis=0, memory_config=memory_config),
-                "all_to_all_combine": AllToAllCombineConfig(cluster_axis=0, memory_config=memory_config),
+                "all_to_all_dispatch": AllToAllDispatchConfig(
+                    cluster_axis=dispatch_cluster_axis, memory_config=memory_config
+                ),
+                "all_to_all_combine": AllToAllCombineConfig(
+                    cluster_axis=dispatch_cluster_axis, memory_config=memory_config
+                ),
                 "final_output_reduce_scatter": ReduceScatterAsyncMinimalConfig(
                     cluster_axis=1,
                     dim=3,
@@ -197,7 +215,7 @@ class MoE(SharedStateAddOn, AbstractModule):
                 "num_experts_per_device": num_experts_per_device,
                 "hidden_size": hf_config.hidden_size,
                 "num_experts_per_tok": hf_config.num_experts_per_tok,
-                "num_dispatch_devices": mesh_device.shape[0],
+                "num_dispatch_devices": mesh_device.shape[dispatch_cluster_axis],
                 "moe_gate": MoEGate.model_config(hf_config, mesh_device, mode, topk_fallback=topk_fallback),
                 "all_to_all_dispatch_output_memory_config": memory_config,
                 "all_to_all_dispatch_metadata_memory_config": ttnn.DRAM_MEMORY_CONFIG,
@@ -209,8 +227,12 @@ class MoE(SharedStateAddOn, AbstractModule):
                 "mul_experts_output_with_weights": MulConfig(memory_config=memory_config),
                 "input_memory_config": memory_config,
                 "output_memory_config": memory_config,
-                "all_to_all_dispatch": AllToAllDispatchConfig(cluster_axis=0, memory_config=memory_config),
-                "all_to_all_combine": AllToAllCombineConfig(cluster_axis=0, memory_config=memory_config),
+                "all_to_all_dispatch": AllToAllDispatchConfig(
+                    cluster_axis=dispatch_cluster_axis, memory_config=memory_config
+                ),
+                "all_to_all_combine": AllToAllCombineConfig(
+                    cluster_axis=dispatch_cluster_axis, memory_config=memory_config
+                ),
                 "final_output_reduce_scatter": ReduceScatterAsyncMinimalConfig(
                     cluster_axis=1,
                     dim=3,
@@ -252,7 +274,7 @@ class MoE(SharedStateAddOn, AbstractModule):
         ### All Gather ###
         ##################
 
-        x = ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["revert_tp"]))
+        x = ccl.maybe_all_gather_async(x, cfg["revert_tp"])
 
         ################
         ### MoE Gate ###
@@ -341,8 +363,8 @@ class MoE(SharedStateAddOn, AbstractModule):
         ### Reduce Scatter ###
         ######################
 
-        post_combine_output_tensor = ttnn.experimental.reduce_scatter_minimal_async(
-            post_combine_output_tensor, **ccl.populate_reduce_scatter_runtime_args(cfg["final_output_reduce_scatter"])
+        post_combine_output_tensor = ccl.maybe_reduce_scatter_async(
+            post_combine_output_tensor, cfg["final_output_reduce_scatter"]
         )
 
         return post_combine_output_tensor

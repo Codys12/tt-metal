@@ -254,22 +254,60 @@ class SamplingGenerator:
         return tt_out
 
     def reset_seed(self, seed):
-        for i, s in enumerate(seed):
-            if s is None:
-                # set to default seed value which is 0
-                seed[i] = 0
-        seed = torch.tensor(seed)
-        user_ids = torch.arange(seed.shape[0])
+        # None means "use default seed", which is 0.
+        if isinstance(seed, (int, type(None))):
+            seed_values = [0 if seed is None else int(seed)]
+        else:
+            seed_values = [0 if s is None else int(s) for s in seed]
+        if not seed_values:
+            seed_values = [0]
 
-        user_ids_tt = ttnn.from_torch(
-            user_ids, device=self.mesh_device, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
-        )
-        seeds_tt = ttnn.from_torch(seed, device=self.mesh_device, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
+        host_seed = seed_values[0]
 
-        # reset seed for each user_id
-        ttnn.manual_seed(seeds=seeds_tt, user_ids=user_ids_tt, sub_core_grids=self.sub_core_grids)
-        seeds_tt.deallocate()
-        user_ids_tt.deallocate()
+        def _seed_host_rng(reason=None):
+            reason_suffix = f" ({reason})" if reason else ""
+            if any(s != host_seed for s in seed_values):
+                logger.warning(
+                    "ttnn.manual_seed is unavailable%s; per-user TT seeds are unsupported. "
+                    "Falling back to torch.manual_seed(%s) using the first user seed.",
+                    reason_suffix,
+                    host_seed,
+                )
+            else:
+                logger.warning(
+                    "ttnn.manual_seed is unavailable%s; falling back to torch.manual_seed(%s). "
+                    "TT sampling RNG may not be fully deterministic.",
+                    reason_suffix,
+                    host_seed,
+                )
+            torch.manual_seed(host_seed)
+
+        manual_seed_op = getattr(ttnn, "manual_seed", None)
+        if manual_seed_op is None:
+            reduction_ops = getattr(getattr(getattr(ttnn, "_ttnn", None), "operations", None), "reduction", None)
+            manual_seed_op = getattr(reduction_ops, "manual_seed", None)
+
+        if callable(manual_seed_op):
+            seed_tensor = torch.tensor(seed_values)
+            user_ids = torch.arange(seed_tensor.shape[0])
+            user_ids_tt = ttnn.from_torch(
+                user_ids, device=self.mesh_device, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
+            seeds_tt = ttnn.from_torch(
+                seed_tensor, device=self.mesh_device, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
+            try:
+                # Reset seed for each user_id when supported by runtime.
+                manual_seed_op(seeds=seeds_tt, user_ids=user_ids_tt, sub_core_grids=self.sub_core_grids)
+                return
+            except (AttributeError, TypeError, RuntimeError) as error:
+                _seed_host_rng(reason=f"incompatible TT seed op: {error}")
+                return
+            finally:
+                seeds_tt.deallocate()
+                user_ids_tt.deallocate()
+
+        _seed_host_rng()
 
 
 def clamp(value, min_value, max_value):

@@ -6,12 +6,34 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from glob import glob
 from pathlib import Path
 
 from loguru import logger
 
+DEMO_ROOT = Path(__file__).resolve()
+REPO_ROOT = str(DEMO_ROOT.parents[4])
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import ttnn
+
+if not hasattr(ttnn, "manual_seed"):
+    logger.warning("Runtime TT-NN build does not expose ttnn.manual_seed. Patching to no-op for demo compatibility.")
+
+    def _manual_seed_noop(*args, **kwargs):
+        return None
+
+    ttnn.manual_seed = _manual_seed_noop
+
+    if hasattr(ttnn, "_ttnn"):
+        reduction = getattr(getattr(ttnn._ttnn, "operations", None), "reduction", None)
+        if hasattr(reduction, "manual_seed"):
+            reduction.manual_seed = _manual_seed_noop
+else:
+    logger.debug("ttnn.manual_seed is available; using runtime implementation.")
+
 from models.demos.deepseek_v3.tt.generator import DeepseekGenerator as DeepseekGeneratorDP
 from models.demos.deepseek_v3.tt.generator_pp import DeepseekGenerator as DeepseekGeneratorPP
 from models.demos.deepseek_v3.utils.hf_model_utils import load_tokenizer

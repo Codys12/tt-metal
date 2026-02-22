@@ -407,9 +407,7 @@ class RowPipelinedModel(SharedStateAddOn, AbstractModule):
         # CCL runtime initialization in execution order
         ccl = cfg["lm_head"]["ccl"]
 
-        x_ag = ttnn.experimental.all_gather_async(
-            x_norm, **ccl.populate_all_gather_runtime_args(cfg["lm_head"]["all_gather"])
-        )
+        x_ag = ccl.maybe_all_gather_async(x_norm, cfg["lm_head"]["all_gather"])
         ttnn.deallocate(x_norm)
 
         x_resharded = ttnn.to_memory_config(x_ag, cfg["lm_head"]["input_memory_config"])
@@ -468,9 +466,7 @@ class RowPipelinedModel(SharedStateAddOn, AbstractModule):
         # CCL runtime initialization in execution order
         ccl = cfg["lm_head"]["ccl"]
 
-        x_ag = ttnn.experimental.all_gather_async(
-            x_norm, **ccl.populate_all_gather_runtime_args(cfg["lm_head"]["all_gather"])
-        )
+        x_ag = ccl.maybe_all_gather_async(x_norm, cfg["lm_head"]["all_gather"])
         ttnn.deallocate(x_norm)
 
         # LM Head

@@ -165,7 +165,11 @@ target_link_libraries(
 )
 
 add_compile_options(
-    "$<$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},x86_64>:-march=x86-64-v3>"
+    "$<$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},x86_64>:-march=x86-64-v2>"
+    # SIMDE can use 256-bit vector types even without AVX ISA enabled, which triggers -Wpsabi.
+    # Keep -Werror globally, but suppress this ABI warning on x86_64 C++ builds.
+    "$<$<AND:$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},x86_64>,$<COMPILE_LANG_AND_ID:CXX,Clang>>:-Wno-psabi>"
+    "$<$<AND:$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},x86_64>,$<COMPILE_LANG_AND_ID:CXX,GNU>>:-Wno-psabi>"
     -fPIC
     -pipe # use pipes instead of tmp files
     -fvisibility-inlines-hidden

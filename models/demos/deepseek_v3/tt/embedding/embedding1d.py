@@ -192,10 +192,10 @@ class Embedding1D(AbstractModule):
         # CCL runtime initialization in execution order
         ccl = cfg["ccl"]
 
-        embeddings_ag = ttnn.experimental.all_gather_async(
-            embeddings_tc, **ccl.populate_all_gather_runtime_args(cfg["all_gather"])
-        )
-        ttnn.deallocate(embeddings_tc)
+        embeddings_ag = ccl.maybe_all_gather_async(embeddings_tc, cfg["all_gather"])
+        if embeddings_ag is not embeddings_tc:
+            # maybe_all_gather_async is a no-op when the mesh row count is 1, so avoid deallocating the live buffer
+            ttnn.deallocate(embeddings_tc)
 
         assert len(embeddings_ag.shape) == 4
         if embeddings_ag.shape[-2] == original_seq_len:

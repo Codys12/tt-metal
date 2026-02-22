@@ -426,7 +426,16 @@ class DeepseekGenerator:
     def _reset_sampling_state(self, sampling: SamplingParams) -> SamplingParams:
         sampling = format_sampling_params(sampling, self.batch_size_per_row)
         self.sampling.reset_sampling_params(sampling)
-        self.sampling.reset_seed(sampling.seed)
+        try:
+            self.sampling.reset_seed(sampling.seed)
+        except (AttributeError, TypeError, RuntimeError) as error:
+            # Some TT-NN builds (or older internal implementations) don't expose manual_seed
+            # on the top-level ttnn module. Fall back to torch RNG seeding for demo stability.
+            host_seed = sampling.seed[0] if isinstance(sampling.seed, list) and sampling.seed else 0
+            logger.warning(
+                "TT sampling seed reset not available (%s); falling back to torch.manual_seed(%s).", error, host_seed
+            )
+            torch.manual_seed(host_seed)
         return sampling
 
     def _sample_tokens_device(

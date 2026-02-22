@@ -187,7 +187,7 @@ class MoEDecoderBlock1D(DecoderBlock1DBase):
         """Revert data parallelism by gathering partitioned tensor back to original form."""
         # Gather tensor along specified dimension across mesh cluster axis
         ccl = cfg["ccl"]
-        tt_out_tensor = ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["revert_dp"]))
+        tt_out_tensor = ccl.maybe_all_gather_async(x, cfg["revert_dp"])
         return tt_out_tensor
 
     @classmethod

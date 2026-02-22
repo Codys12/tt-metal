@@ -164,6 +164,20 @@ class CCL:
         # Merge static config with runtime CCL parameters
         return {**ccl_config, **ccl_params}
 
+    def maybe_all_gather_async(self, tensor: ttnn.Tensor, ccl_config: dict) -> ttnn.Tensor:
+        """Run all_gather_async unless the target axis has a single participant.
+
+        The TT runtime asserts if an all-gather is enqueued along an axis whose length
+        is one (no forward/backward neighbors). Return the original tensor in that case.
+        """
+        cluster_axis = ccl_config.get("cluster_axis")
+        assert cluster_axis is not None, "cluster_axis must be present in CCL config"
+
+        if self.mesh_device.shape[cluster_axis] <= 1:
+            return tensor
+
+        return ttnn.experimental.all_gather_async(tensor, **self.populate_all_gather_runtime_args(ccl_config))
+
     def populate_reduce_scatter_runtime_args(self, ccl_config: dict) -> dict:
         """Populate reduce_scatter runtime arguments (semaphores, num_links) into the config.
 
@@ -187,6 +201,18 @@ class CCL:
 
         # Merge static config with runtime CCL parameters
         return {**ccl_config, **ccl_params}
+
+    def maybe_reduce_scatter_async(self, tensor: ttnn.Tensor, ccl_config: dict) -> ttnn.Tensor:
+        """Run reduce_scatter_minimal_async unless the axis has a single participant."""
+        cluster_axis = ccl_config.get("cluster_axis")
+        assert cluster_axis is not None, "cluster_axis must be present in CCL config"
+
+        if self.mesh_device.shape[cluster_axis] <= 1:
+            return tensor
+
+        return ttnn.experimental.reduce_scatter_minimal_async(
+            tensor, **self.populate_reduce_scatter_runtime_args(ccl_config)
+        )
 
     def reset_sem_counters(self):
         """Reset the semaphore counters for all axes."""

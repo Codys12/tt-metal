@@ -859,8 +859,8 @@ class MLA1D(AbstractModule):
         # 1,1,32,2112 (q_lora_rank + kv_lora_rank + qk_rope_head_dim = 1536 + 512 + 64)
 
         # AR using AG + local reduce (since sub-tile RS not supported for new shapes)
-        tt_q_kv = ttnn.experimental.all_gather_async(
-            tt_q_kv, **ccl.populate_all_gather_runtime_args(cfg["wq_kv_a_ag_decode"])
+        tt_q_kv = ccl.maybe_all_gather_async(
+            tt_q_kv, cfg["wq_kv_a_ag_decode"]
         )  # [1, num_devices, bsz, q_lora_rank + kv_lora_rank + qk_rope_head_dim]
         tt_q_kv = ttnn.experimental.fast_reduce_nc(
             tt_q_kv,
@@ -997,8 +997,10 @@ class MLA1D(AbstractModule):
 
         # Concat Q Nope and Q Rope
         # 1,132,16,512 L1 interleaved | # 32,1,16,64 L1 interleaved
-        tt_q = ttnn.concat([tt_q_nope, tt_q_rope], **cfg["q_concat"])
-        # 1,32,16,576 L1 interleaved
+        q_concat_cfg = dict(cfg["q_concat"])
+        q_concat_cfg["memory_config"] = ttnn.DRAM_MEMORY_CONFIG
+        tt_q = ttnn.concat([tt_q_nope, tt_q_rope], **q_concat_cfg)
+        # 1,32,16,576 DRAM interleaved
 
         ###################################
         ### All To All before FlashMLA ###
@@ -1048,7 +1050,7 @@ class MLA1D(AbstractModule):
         ####################
 
         # 1,4,128,128 L1 interleaved
-        v_out = ttnn.experimental.all_gather_async(v_out, **ccl.populate_all_gather_runtime_args(cfg["wo_ag_decode"]))
+        v_out = ccl.maybe_all_gather_async(v_out, cfg["wo_ag_decode"])
         # 1,32,128,128 L1 interleaved = [1, bsz, num_heads, v_head_dim]
         v_out = ttnn.reshape(v_out, (1, 1, bsz, num_heads * v_head_dim))
         # 1,1,32,16384 L1 interleaved
@@ -1113,8 +1115,8 @@ class MLA1D(AbstractModule):
         tt_q_kv = ttnn.linear(x, **cfg["wq_kv_a"])
 
         # AR using AG + local reduce (since sub-tile RS not supported for new shapes)
-        tt_q_kv = ttnn.experimental.all_gather_async(
-            tt_q_kv, **ccl.populate_all_gather_runtime_args(cfg["wq_kv_a_ag_prefill"])
+        tt_q_kv = ccl.maybe_all_gather_async(
+            tt_q_kv, cfg["wq_kv_a_ag_prefill"]
         )  # [1, num_devices, seq_len, q_lora_rank + kv_lora_rank + qk_rope_head_dim]
         tt_q_kv = ttnn.experimental.fast_reduce_nc(
             tt_q_kv, **cfg["wq_kv_a_r_prefill"]
@@ -1196,8 +1198,8 @@ class MLA1D(AbstractModule):
         ttnn.deallocate(tt_q)
 
         # DP wkv_b2 to match decode weights
-        v_out = ttnn.experimental.all_gather_async(
-            attn_out, **ccl.populate_all_gather_runtime_args(cfg["wo_ag_prefill"])
+        v_out = ccl.maybe_all_gather_async(
+            attn_out, cfg["wo_ag_prefill"]
         )  # [1, num_heads, seq_len, v_head_dim] # wkv_b2_ag_prefill
 
         # wkv_b2
