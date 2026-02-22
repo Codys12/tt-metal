@@ -274,6 +274,13 @@ if [ -z "$PYTHON_ENV_DIR" ]; then
     PYTHON_ENV_DIR=$(pwd)/python_env
 fi
 
+python_executable=""
+if [ -x "$PYTHON_ENV_DIR/bin/python3" ]; then
+    python_executable="$PYTHON_ENV_DIR/bin/python3"
+elif [ -x "$PYTHON_ENV_DIR/bin/python" ]; then
+    python_executable="$PYTHON_ENV_DIR/bin/python"
+fi
+
 # Debug output to verify parsed options
 echo "INFO: Export compile commands: $export_compile_commands"
 echo "INFO: Enable ccache: $enable_ccache"
@@ -295,6 +302,11 @@ cmake_args+=("-B" "$build_dir")
 cmake_args+=("-G" "Ninja")
 cmake_args+=("-DCMAKE_BUILD_TYPE=$build_type")
 cmake_args+=("-DCMAKE_INSTALL_PREFIX=$cmake_install_prefix")
+cmake_args+=("-DTT_METAL_ENABLE_AVX=$enable_avx")
+if [ "$python_executable" != "" ]; then
+    echo "INFO: Python executable: $python_executable"
+    cmake_args+=("-DPYTHON_EXECUTABLE=$python_executable")
+fi
 
 if [ "$cxx_compiler_path" != "" ]; then
     echo "INFO: C++ compiler: $cxx_compiler_path"

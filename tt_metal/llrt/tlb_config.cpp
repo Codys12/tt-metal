@@ -81,15 +81,21 @@ void configure_static_tlbs(
         device_driver.configure_tlb(mmio_device_id, core, get_static_tlb_size(), address, tt::umd::tlb_data::Strict);
     }
 
-    if (arch == tt::ARCH::BLACKHOLE) {
-        // Setup static 4GB tlbs for DRAM cores.
-        uint32_t dram_addr = 0;
-        for (std::uint32_t dram_channel = 0; dram_channel < blackhole::NUM_DRAM_CHANNELS; dram_channel++) {
-            tt::umd::CoreCoord dram_core =
-                tt::umd::CoreCoord(blackhole::ddr_to_noc0(dram_channel), tt::CoreType::DRAM, tt::CoordSystem::NOC0);
-            device_driver.configure_tlb(mmio_device_id, dram_core, 4ULL * (1ULL << 30), dram_addr, tt::umd::tlb_data::Posted);
-        }
-    }
+    // if (arch == tt::ARCH::BLACKHOLE) {
+    //     // Setup static 4GB tlbs for DRAM cores.
+    //     uint32_t dram_addr = 0;
+    //     for (std::uint32_t dram_channel = 0; dram_channel < blackhole::NUM_DRAM_CHANNELS; dram_channel++) {
+    //         tt::umd::CoreCoord dram_core =
+    //             tt::umd::CoreCoord(
+    //                 blackhole::ddr_to_noc0(dram_channel), tt::CoreType::DRAM, tt::CoordSystem::NOC0);
+    //         device_driver.configure_tlb(
+    //             mmio_device_id,
+    //             dram_core,
+    //             4ULL * (1ULL << 30),
+    //             dram_addr,
+    //             tt::umd::tlb_data::Posted);
+    //     }
+    // }
 }
 
 }  // namespace ll_api
