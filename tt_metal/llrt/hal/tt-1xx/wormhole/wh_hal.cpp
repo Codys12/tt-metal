@@ -19,6 +19,7 @@
 #include "impl/context/metal_context.hpp"
 #include "hal_1xx_common.hpp"
 #include "impl/dispatch/dispatch_settings.hpp"
+#include "umd/device/hugepage.hpp"
 
 namespace {
 
@@ -383,7 +384,7 @@ void Hal::initialize_wh(bool is_base_routing_fw_enabled, std::uint32_t profiler_
 
     this->max_pinned_memory_count_ = 12;
     this->total_pinned_memory_size_ =
-        4ULL * 1024ULL * 1024ULL * 1024ULL - static_cast<uint64_t>(tt::tt_metal::DispatchSettings::MAX_HUGEPAGE_SIZE);
+        4ULL * 1024ULL * 1024ULL * 1024ULL - static_cast<uint64_t>(tt::umd::HUGEPAGE_REGION_SIZE);
 }
 
 }  // namespace tt::tt_metal
