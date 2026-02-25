@@ -184,6 +184,8 @@ target_include_directories(
         ${CMAKE_CURRENT_SOURCE_DIR}/profiler
         ${PROJECT_SOURCE_DIR}/tt_metal/include
         ${CMAKE_CURRENT_BINARY_DIR}
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/tt_metal/lite_fabric
 )
 target_include_directories(impl SYSTEM PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/flatbuffers)
 

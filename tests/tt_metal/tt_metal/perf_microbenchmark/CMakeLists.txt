@@ -33,12 +33,21 @@ set(X86_64_ONLY_TESTS
     dispatch/test_prefetcher.cpp
     dispatch/test_bw_and_latency.cpp
     dispatch/test_dispatcher.cpp
-    3_pcie_transfer/test_pull_from_pcie.cpp
 )
+
+# These tests require AVX support in the host toolchain/target.
+set(X86_64_AVX_ONLY_TESTS 3_pcie_transfer/test_pull_from_pcie.cpp)
+
+option(TT_METAL_BUILD_AVX_TESTS "Build perf_microbenchmark tests that require AVX intrinsics." OFF)
 
 # Add x86_64 tests only on appropriate platforms.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
     list(APPEND PERF_MICROBENCH_TESTS_SRCS ${X86_64_ONLY_TESTS})
+    if(TT_METAL_BUILD_AVX_TESTS)
+        list(APPEND PERF_MICROBENCH_TESTS_SRCS ${X86_64_AVX_ONLY_TESTS})
+    else()
+        message(STATUS "Skipping AVX-only perf microbenchmark tests (TT_METAL_BUILD_AVX_TESTS=OFF)")
+    endif()
 endif()
 
 foreach(TEST_SRC ${PERF_MICROBENCH_TESTS_SRCS})

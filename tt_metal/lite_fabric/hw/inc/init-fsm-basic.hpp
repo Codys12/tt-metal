@@ -27,6 +27,12 @@ namespace lite_fabric {
 
 static_assert(sizeof(uint32_t) == sizeof(uintptr_t));
 
+// TX queue for data transfers over ethernet.
+// TXQ0 is the only queue guaranteed to be configured for packet mode by the base firmware.
+// TXQ1/TXQ2 require explicit packet mode setup (eth_enable_packet_mode) which we don't do.
+// ETH_TXQ_CMD_START_REG (register writes) is also TXQ0-only.
+static constexpr uint32_t k_DataTxq = 0;
+
 inline void wait_val(uint32_t addr, uint32_t val) {
     do {
         invalidate_l1_cache();
@@ -43,14 +49,17 @@ inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) 
     // Send the binary over ethernet to the connected core
     const auto eth_send_binary = [=]() {
         internal_::eth_send_packet<false>(
-            0, LITE_FABRIC_DATA_START >> 4, LITE_FABRIC_DATA_START >> 4, LITE_FABRIC_DATA_SIZE >> 4);
+            k_DataTxq, LITE_FABRIC_DATA_START >> 4, LITE_FABRIC_DATA_START >> 4, LITE_FABRIC_DATA_SIZE >> 4);
         internal_::eth_send_packet<false>(
-            0, config_struct->binary_addr >> 4, config_struct->binary_addr >> 4, config_struct->binary_size >> 4);
+            k_DataTxq,
+            config_struct->binary_addr >> 4,
+            config_struct->binary_addr >> 4,
+            config_struct->binary_size >> 4);
     };
 
     const auto eth_send_config = [=]() {
         internal_::eth_send_packet<false>(
-            0,
+            k_DataTxq,
             (uintptr_t)config_struct >> 4,
             (uintptr_t)config_struct >> 4,
             sizeof(lite_fabric::FabricLiteConfig) >> 4);
@@ -80,21 +89,21 @@ inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) 
                     wait_val(handshake_addr, 1);
                     // Safe to modify config_struct now
                     config_struct->primary_local_handshake = 2;
-                    internal_::eth_send_packet(0, local_handshake_addr >> 4, handshake_addr >> 4, 1);
+                    internal_::eth_send_packet(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
 
                     // Wait for ack
                     wait_val(handshake_addr, 3);
                 } else {
                     // Send first signal to mmio to indicate we have started
                     config_struct->primary_local_handshake = 1;
-                    internal_::eth_send_packet(0, local_handshake_addr >> 4, handshake_addr >> 4, 1);
+                    internal_::eth_send_packet(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
 
                     // wait for signal from mmio
                     wait_val(handshake_addr, 2);
 
                     // send ack to mmio
                     config_struct->primary_local_handshake = 3;
-                    internal_::eth_send_packet(0, local_handshake_addr >> 4, handshake_addr >> 4, 1);
+                    internal_::eth_send_packet(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
                 }
                 config_struct->current_state = lite_fabric::InitState::READY;
                 break;
@@ -102,16 +111,30 @@ inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) 
             case lite_fabric::InitState::ETH_INIT_NEIGHBOUR: {
                 ASSERT(is_primary);
                 ASSERT(is_mmio);
+                // Breadcrumb 0x10: entering ETH_INIT_NEIGHBOUR
+                config_struct->primary_local_handshake = 0x10;
                 config_struct->is_primary = false;
                 config_struct->is_mmio = false;
                 config_struct->routing_enabled = lite_fabric::RoutingEnabledState::ENABLED;
                 config_struct->current_state = lite_fabric::InitState::ETH_HANDSHAKE_NEIGHBOUR;
                 config_struct->initial_state = lite_fabric::InitState::ETH_HANDSHAKE_NEIGHBOUR;
+                // Breadcrumb 0x11: about to assert remote reset
+                config_struct->primary_local_handshake = 0x11;
                 ConnectedRiscInterface::assert_connected_dm1_reset();
+                // Breadcrumb 0x12: about to set remote PC
+                config_struct->primary_local_handshake = 0x12;
                 ConnectedRiscInterface::set_pc(LITE_FABRIC_TEXT_START);
+                // Breadcrumb 0x13: about to send config
+                config_struct->primary_local_handshake = 0x13;
                 eth_send_config();
+                // Breadcrumb 0x14: about to send binary (DATA section)
+                config_struct->primary_local_handshake = 0x14;
                 eth_send_binary();
+                // Breadcrumb 0x15: about to deassert remote reset
+                config_struct->primary_local_handshake = 0x15;
                 ConnectedRiscInterface::deassert_connected_dm1_reset();
+                // Breadcrumb 0x16: ETH_INIT_NEIGHBOUR complete, entering handshake
+                config_struct->primary_local_handshake = 0x16;
                 break;
             }
             case lite_fabric::InitState::ETH_HANDSHAKE_LOCAL: {

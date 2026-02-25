@@ -399,8 +399,7 @@ void ControlPlane::initialize_distributed_contexts() {
     }
 }
 
-FabricNodeId ControlPlane::get_fabric_node_id_from_asic_id(uint64_t asic_id) const {
-    // Check cache first for faster lookup
+std::optional<FabricNodeId> ControlPlane::find_fabric_node_id_from_asic_id(uint64_t asic_id) const {
     auto cache_it = asic_id_to_fabric_node_cache_.find(asic_id);
     if (cache_it != asic_id_to_fabric_node_cache_.end()) {
         return cache_it->second;
@@ -411,15 +410,27 @@ FabricNodeId ControlPlane::get_fabric_node_id_from_asic_id(uint64_t asic_id) con
 
     for (const auto& [physical_chip_id, unique_id] : chip_unique_ids) {
         if (unique_id == asic_id) {
-            FabricNodeId fabric_node_id = this->get_fabric_node_id_from_physical_chip_id(physical_chip_id);
-            // Cache the result for future lookups
-            asic_id_to_fabric_node_cache_.emplace(asic_id, fabric_node_id);
-            return fabric_node_id;
+            for (const auto& [fabric_node_id, mapped_physical_chip_id] :
+                 logical_mesh_chip_id_to_physical_chip_id_mapping_) {
+                if (mapped_physical_chip_id == physical_chip_id) {
+                    asic_id_to_fabric_node_cache_.emplace(asic_id, fabric_node_id);
+                    return fabric_node_id;
+                }
+            }
+            return std::nullopt;  // Physical chip exists but is not in the fabric mapping.
         }
     }
+    return std::nullopt;
+}
 
-    TT_FATAL(false, "FabricNodeId not found for ASIC ID {}", asic_id);
-    return FabricNodeId(MeshId{0}, 0);
+FabricNodeId ControlPlane::get_fabric_node_id_from_asic_id(uint64_t asic_id) const {
+    auto result = find_fabric_node_id_from_asic_id(asic_id);
+    TT_FATAL(
+        result.has_value(),
+        "FabricNodeId not found for ASIC ID {}. You are calling for a chip outside of the fabric "
+        "cluster. Check that your mesh graph descriptor specifies the correct topology",
+        asic_id);
+    return *result;
 }
 
 void ControlPlane::init_control_plane(
@@ -2870,7 +2881,12 @@ AnnotatedIntermeshConnections ControlPlane::generate_intermesh_connections_on_lo
                     continue;
                 }
 
-                auto neighbor_node = this->get_fabric_node_id_from_asic_id(*asic_neighbor);
+                auto neighbor_node_opt = this->find_fabric_node_id_from_asic_id(*asic_neighbor);
+                if (!neighbor_node_opt.has_value()) {
+                    // Neighbor is not in the fabric mapping (e.g. remote chip accessed via lite fabric).
+                    continue;
+                }
+                auto neighbor_node = *neighbor_node_opt;
                 if (neighbor_node.mesh_id == local_mesh_id ||
                     processed_neighbors.contains({*neighbor_node.mesh_id, *local_mesh_id})) {
                     continue;

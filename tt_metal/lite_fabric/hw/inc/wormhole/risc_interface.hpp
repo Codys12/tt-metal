@@ -6,7 +6,7 @@
 
 #include <cstdint>
 #include "noc_nonblocking_api.h"
-#include "hw/inc/ethernet/tunneling.h"
+#include "internal/ethernet/tunneling.h"
 #include "risc_common.h"
 #include "lf_dev_mem_map.hpp"
 

@@ -20,9 +20,13 @@ void WormholeLiteFabricHal::wait_for_state(tt_cxy_pair /*virtual_core*/, lite_fa
 
 std::vector<std::filesystem::path> WormholeLiteFabricHal::build_includes(const std::filesystem::path& root_dir) {
     return {
-        root_dir / "tt_metal/hw/inc/tt-1xx/wormhole",
-        root_dir / "tt_metal/hw/inc/tt-1xx/wormhole/wormhole_b0_defines",
-        root_dir / "tt_metal/hw/inc/tt-1xx/wormhole/noc",
+        root_dir / "tt_metal/hw/inc/internal/tt-1xx/wormhole",
+        root_dir / "tt_metal/hw/inc/internal/tt-1xx/wormhole/wormhole_b0_defines",
+        root_dir / "tt_metal/hw/inc/internal/tt-1xx/wormhole/noc",
+        root_dir / "tt_metal/hw/inc/internal/tt-1xx",
+        root_dir / "tt_metal/hw/inc/internal",
+        root_dir / "tt_metal/hw/inc/internal/dataflow",
+        root_dir / "tt_metal/hw/inc/internal/ethernet",
         root_dir / "tt_metal/hw/ckernels/wormhole/metal/common",
         root_dir / "tt_metal/hw/ckernels/wormhole/metal/llk_io",
         root_dir / "tt_metal/third_party/tt_llk/tt_llk_wormhole_b0/common/inc",

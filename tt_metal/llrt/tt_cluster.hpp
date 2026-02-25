@@ -84,6 +84,10 @@ public:
 
     std::set<ChipId> mmio_chip_ids() const { return this->driver_->get_target_mmio_device_ids(); }
 
+    // Upgrade a Blackhole remote chip's FirmwareInfoProvider, SocDescriptor, and ClusterDescriptor
+    // entries after lite fabric is running.  See umd::Cluster::upgrade_remote_bh_chip_info().
+    void upgrade_remote_bh_chip_info(ChipId device_id) const { this->driver_->upgrade_remote_bh_chip_info(device_id); }
+
     size_t number_of_pci_devices() const { return this->driver_->get_target_mmio_device_ids().size(); }
 
     std::set<ChipId> all_pci_chip_ids() const { return this->driver_->get_target_mmio_device_ids(); }

@@ -48,6 +48,7 @@ std::string GetCommonOptions() {
         "Wno-error=unused-but-set-variable",
         "Wno-unused-variable",
         "Wno-unused-function",
+        "Wno-error=template-body",
         "fno-tree-loop-distribute-patterns",
     };
 
@@ -85,10 +86,7 @@ int CompileFabricLite(
         root_dir / "tt_metal",
         root_dir / "tt_metal/include",
         root_dir / "tt_metal/hw/inc",
-        root_dir / "tt_metal/hw/inc/ethernet",
         root_dir / "tt_metal/hostdevcommon/api",
-        root_dir / "tt_metal/hw/inc/debug",
-        root_dir / "tt_metal/hw/inc/tt-1xx/",
         root_dir / "tt_metal/api/",
         root_dir / "tt_metal/api/tt-metalium/",
     };

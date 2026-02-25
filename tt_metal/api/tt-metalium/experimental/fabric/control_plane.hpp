@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <optional>
 #include <unordered_set>
 
 #include <tt_stl/span.hpp>
@@ -101,6 +102,8 @@ public:
     ChipId get_physical_chip_id_from_fabric_node_id(const FabricNodeId& fabric_node_id) const;
     // Return fabric node id from ASIC id
     FabricNodeId get_fabric_node_id_from_asic_id(uint64_t asic_id) const;
+    // Return fabric node id from ASIC id, or nullopt if the ASIC is not in the fabric mapping.
+    std::optional<FabricNodeId> find_fabric_node_id_from_asic_id(uint64_t asic_id) const;
     // Return user physical mesh ids
     std::vector<MeshId> get_user_physical_mesh_ids() const;
 

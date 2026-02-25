@@ -7,6 +7,9 @@
 #include <utility>
 
 #include "tt_metal/api/tt-metalium/hal_types.hpp"
+// Forward-declare invalidate_l1_cache so noc_nonblocking_api.h templates compile
+// (full definition comes later via risc_common.h from init-fsm-basic.hpp)
+inline __attribute__((always_inline)) void invalidate_l1_cache();
 #include "noc_nonblocking_api.h"
 #include "dataflow_api.h"
 #include "eth_chan_noc_mapping.h"
@@ -19,7 +22,7 @@
 #include "tt_metal/lite_fabric/hw/inc/header.hpp"
 #include "tt_metal/lite_fabric/hw/inc/types.hpp"
 #include "tt_metal/fabric/hw/inc/edm_fabric/fabric_stream_regs.hpp"
-#include "hw/inc/ethernet/tunneling.h"
+#include "internal/ethernet/tunneling.h"
 #include "risc_interface.hpp"
 
 #if !defined(tt_l1_ptr)
@@ -97,7 +100,8 @@ __attribute__((noinline)) void service_lite_fabric() {
             ConnectedRiscInterface::assert_connected_dm1_reset();
             constexpr uint32_t routing_enabled_address =
                 LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteConfig, routing_enabled);
-            internal_::eth_send_packet<false>(0, routing_enabled_address >> 4, routing_enabled_address >> 4, 1);
+            internal_::eth_send_packet<false>(
+                lite_fabric::k_DataTxq, routing_enabled_address >> 4, routing_enabled_address >> 4, 1);
             return;
     }
     lite_fabric::run_sender_channel_step<0>();

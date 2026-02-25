@@ -39,6 +39,8 @@
 
 #include <tt_metal.hpp>
 #include <umd/device/types/cluster_descriptor_types.hpp>
+#include "lite_fabric/hal/lite_fabric_hal.hpp"
+#include "lite_fabric/host_util.hpp"
 #include "dispatch/data_collector.hpp"
 
 #include <dispatch/dispatch_query_manager.hpp>
@@ -237,40 +239,65 @@ void MetalContext::initialize(
     // Clear state, build FW
     auto all_devices = cluster_->all_chip_ids();
 
+    // For Blackhole multi-chip clusters, lite fabric must be running on the local MMIO chip's
+    // ERISC1 before we can write to any remote chip registers.  Split initialization into:
+    //   Phase 1 – FW build + device init + resets + FW launch for MMIO chips only
+    //   Phase 2 – Start lite fabric (programs ERISC1, waits for READY)
+    //   Phase 2b – Upgrade remote chip info (now reachable via lite fabric)
+    //   Phase 3 – FW build + device init + resets + FW launch for remote chips
+    // For all other cluster configurations we keep the original single-phase parallel init.
+    const bool needs_lite_fabric =
+        (cluster_->arch() == tt::ARCH::BLACKHOLE && cluster_->all_chip_ids().size() > cluster_->mmio_chip_ids().size());
+
+    std::set<ChipId> remote_devices;
+    if (needs_lite_fabric) {
+        for (ChipId id : all_devices) {
+            if (!cluster_->mmio_chip_ids().count(id)) {
+                remote_devices.insert(id);
+            }
+        }
+    }
+
+    // Determine which devices to initialize before lite fabric is up.
+    // Remote BH chips are not reachable yet, so defer them.
+    const std::set<ChipId> initial_devices =
+        needs_lite_fabric ? cluster_->mmio_chip_ids() : std::set<ChipId>(all_devices.begin(), all_devices.end());
+
     std::vector<std::shared_future<void>> futures;
-    {
-        ZoneScopedN("FW builds and Device Inits");
 
-        futures.reserve(all_devices.size());
-
-        // Launch async tasks for each device
-        for (ChipId device_id : all_devices) {
+    // Lambda: run FW builds and device init for a set of devices
+    auto build_and_init_devices = [&](const auto& device_set) {
+        futures.clear();
+        for (ChipId device_id : device_set) {
             futures.emplace_back(detail::async([this, device_id, fw_compile_hash]() {
+                log_info(tt::LogMetal, "build_and_init device {}: start", device_id);
                 // Clear L1/DRAM if requested
                 if (rtoptions_.get_clear_l1()) {
+                    log_info(tt::LogMetal, "build_and_init device {}: clear_l1_state", device_id);
                     clear_l1_state(device_id);
                 }
                 if (rtoptions_.get_clear_dram()) {
+                    log_info(tt::LogMetal, "build_and_init device {}: clear_dram_state", device_id);
                     clear_dram_state(device_id);
                 }
+                log_info(tt::LogMetal, "build_and_init device {}: get_device_aiclk", device_id);
                 [[maybe_unused]] int ai_clk = cluster_->get_device_aiclk(device_id);
-                log_debug(tt::LogMetal, "AI CLK for device {} is:   {} MHz", device_id, ai_clk);
+                log_info(tt::LogMetal, "AI CLK for device {} is:   {} MHz", device_id, ai_clk);
+                log_info(tt::LogMetal, "build_and_init device {}: generate_device_bank_to_noc_tables", device_id);
                 generate_device_bank_to_noc_tables(device_id);
+                log_info(tt::LogMetal, "build_and_init device {}: generate_worker_logical_to_virtual_map", device_id);
                 generate_worker_logical_to_virtual_map(device_id);
 
                 // Create build env for this device, and build FW if it's not built already
+                log_info(tt::LogMetal, "build_and_init device {}: add_build_env", device_id);
                 BuildEnvManager::get_instance().add_build_env(device_id, num_hw_cqs_);
-                // fw_build_key is a combination of build_key and fw_compile_hash
-                // If fw_compile_hash changes, the fw_build_key will change and FW will be rebuilt
-                // if it's not already in firmware_built_keys_
-                // Combine build_key and fw_compile_hash using XOR to create unique firmware build key
-                // Uses full 64-bit fw_compile_hash for proper change detection
                 uint64_t fw_build_key =
                     BuildEnvManager::get_instance().get_device_build_env(device_id).build_key() ^ fw_compile_hash;
 
                 {
                     std::lock_guard<std::mutex> lock(firmware_built_keys_mutex_);
                     if (!firmware_built_keys_.contains(fw_build_key)) {
+                        log_info(tt::LogMetal, "build_and_init device {}: build_firmware", device_id);
                         BuildEnvManager::get_instance().build_firmware(device_id);
                         firmware_built_keys_.insert(fw_build_key);
                     }
@@ -281,14 +308,20 @@ void MetalContext::initialize(
                 // firmware. If ERISC application firmware is activated before the launch messages are cleared, it can
                 // enter an undefined state by reading a corrupted launch message. Routing firmware will never run in
                 // this case, causing UMD issued transactions to hang.
+                log_info(tt::LogMetal, "build_and_init device {}: clear_launch_messages_on_eth_cores", device_id);
                 clear_launch_messages_on_eth_cores(device_id);
+                log_info(tt::LogMetal, "build_and_init device {}: complete", device_id);
             }));
         }
-
-        // Wait for all async tasks to complete
         for (auto& fut : futures) {
             fut.wait();
         }
+    };
+
+    {
+        ZoneScopedN("FW builds and Device Inits");
+        futures.reserve(all_devices.size());
+        build_and_init_devices(initial_devices);
     }
 
     // Populate FD topology across all devices
@@ -309,27 +342,71 @@ void MetalContext::initialize(
     }
     watcher_server_->init_devices();
 
+    // Lambda: reset cores and launch FW for a set of devices
+    auto launch_fw_for_devices = [&](const auto& device_set) {
+        futures.clear();
+        for (ChipId device_id : device_set) {
+            futures.emplace_back(detail::async([this, device_id]() {
+                log_info(tt::LogMetal, "launch_fw device {}: ClearNocData", device_id);
+                ClearNocData(device_id);
+                log_info(tt::LogMetal, "launch_fw device {}: reset_cores", device_id);
+                reset_cores(device_id);
+                log_info(tt::LogMetal, "launch_fw device {}: initialize_and_launch_firmware", device_id);
+                initialize_and_launch_firmware(device_id);
+                log_info(tt::LogMetal, "launch_fw device {}: complete", device_id);
+            }));
+        }
+        for (auto& fut : futures) {
+            fut.wait();
+        }
+    };
+
     // Parallelize device initialization
     {
         ZoneScopedN("Resets and FW Launch");
 
-        // Clear and reuse existing task group vectors
-        futures.clear();
+        if (needs_lite_fabric) {
+            // Phase 1: MMIO chips
+            {
+                ZoneScopedN("MMIO FW Launch");
+                launch_fw_for_devices(cluster_->mmio_chip_ids());
+            }
 
-        // Launch async tasks for each device
-        for (ChipId device_id : all_devices) {
-            futures.emplace_back(detail::async([this, device_id]() {
-                ClearNocData(device_id);
+            // Phase 2: Initialize lite fabric (ERISC1 on MMIO chip talks to remote chip)
+            {
+                ZoneScopedN("Lite Fabric Init");
+                lite_fabric_hal_ = lite_fabric::LiteFabricHal::create();
+                lite_fabric::InitializeLiteFabric(lite_fabric_hal_);
+            }
 
-                reset_cores(device_id);
+            // Phase 2b: Upgrade remote BH chip firmware info providers now that lite fabric
+            // is running and the remote ARC is accessible.  This replaces the proxy providers
+            // (borrowed from the local gateway chip during topology discovery) with real ones
+            // that read the actual harvesting masks, DRAM training status, and other chip
+            // metadata from each remote chip.  Also refreshes the SocDescriptor and
+            // ClusterDescriptor entries, then polls DRAM training to completion.
+            {
+                ZoneScopedN("Remote Chip Info Upgrade");
+                for (ChipId id : remote_devices) {
+                    log_info(tt::LogMetal, "Phase 2b: upgrade_remote_bh_chip_info for device {}", id);
+                    cluster_->upgrade_remote_bh_chip_info(id);
+                    log_info(tt::LogMetal, "Phase 2b: upgrade complete for device {}", id);
+                }
+            }
 
-                initialize_and_launch_firmware(device_id);
-            }));
-        }
-
-        // Wait for all async tasks to complete
-        for (auto& fut : futures) {
-            fut.wait();
+            // Phase 3: FW builds, device init, resets, and FW launch for remote chips
+            // (now reachable via lite fabric)
+            {
+                ZoneScopedN("Remote Device Init and FW Launch");
+                log_info(
+                    tt::LogMetal, "Phase 3: build_and_init_devices for {} remote device(s)", remote_devices.size());
+                build_and_init_devices(remote_devices);
+                log_info(tt::LogMetal, "Phase 3: build_and_init_devices complete, launching FW for remote devices");
+                launch_fw_for_devices(remote_devices);
+                log_info(tt::LogMetal, "Phase 3: remote FW launch complete");
+            }
+        } else {
+            launch_fw_for_devices(initial_devices);
         }
     }
     // Watcher needs to init before FW since FW needs watcher mailboxes to be set up, and needs to attach after FW
@@ -367,6 +444,12 @@ void MetalContext::teardown() {
                 }
             }
         }
+    }
+
+    // Terminate lite fabric (stops ERISC1 on MMIO chip) before resetting ETH cores
+    if (lite_fabric_hal_) {
+        lite_fabric_hal_->terminate();
+        lite_fabric_hal_.reset();
     }
 
     // Set internal routing to false to exit active ethernet FW & go back to base FW

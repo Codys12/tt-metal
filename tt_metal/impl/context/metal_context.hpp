@@ -15,6 +15,10 @@ namespace tt::tt_fabric {
 class ControlPlane;
 }  // namespace tt::tt_fabric
 
+namespace lite_fabric {
+class LiteFabricHal;
+}  // namespace lite_fabric
+
 namespace tt {
 class Cluster;
 }  // namespace tt
@@ -221,6 +225,7 @@ private:
 
     std::array<std::unique_ptr<DispatchMemMap>, static_cast<size_t>(CoreType::COUNT)> dispatch_mem_map_;
     std::unique_ptr<tt::tt_fabric::ControlPlane> control_plane_;
+    std::shared_ptr<lite_fabric::LiteFabricHal> lite_fabric_hal_;
     tt_fabric::FabricConfig fabric_config_ = tt_fabric::FabricConfig::DISABLED;
     tt_fabric::FabricTensixConfig fabric_tensix_config_ = tt_fabric::FabricTensixConfig::DISABLED;
     tt_fabric::FabricUDMMode fabric_udm_mode_ = tt_fabric::FabricUDMMode::DISABLED;

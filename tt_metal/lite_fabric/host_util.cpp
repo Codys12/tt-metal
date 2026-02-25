@@ -12,7 +12,11 @@
 namespace lite_fabric {
 
 void InitializeLiteFabric(std::shared_ptr<lite_fabric::LiteFabricHal>& lite_fabric_hal) {
-    auto home_directory = std::filesystem::path(std::getenv("TT_METAL_HOME"));
+    const char* tt_metal_home = std::getenv("TT_METAL_HOME");
+    if (tt_metal_home == nullptr) {
+        throw std::runtime_error("TT_METAL_HOME environment variable is not set; required for lite fabric compilation");
+    }
+    auto home_directory = std::filesystem::path(tt_metal_home);
     auto output_directory = home_directory / "lite_fabric";
 
     if (lite_fabric::CompileFabricLite(lite_fabric_hal, home_directory, output_directory)) {

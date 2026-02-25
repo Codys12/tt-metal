@@ -202,7 +202,27 @@ tt::tt_metal::ClusterType Cluster::get_cluster_type_from_cluster_desc(
             } else if (num_chips == 8) {
                 cluster_type = tt::tt_metal::ClusterType::P150_X8;
             } else {
-                TT_THROW("Unknown cluster type for P150 board with {} chips", num_chips);
+                // Total chip count doesn't match a standard P150_XN configuration.  This can
+                // happen when remote chips are tethered to MMIO P150 chips via lite fabric.
+                // Base the cluster type on the number of MMIO (PCIe-attached) chips only.
+                size_t num_mmio_chips = 0;
+                for (const auto& cid : cluster_desc->get_all_chips()) {
+                    if (cluster_desc->is_chip_mmio_capable(cid)) {
+                        num_mmio_chips++;
+                    }
+                }
+                if (num_mmio_chips == 1) {
+                    cluster_type = tt::tt_metal::ClusterType::P150;
+                } else if (num_mmio_chips == 2) {
+                    cluster_type = tt::tt_metal::ClusterType::P150_X2;
+                } else if (num_mmio_chips == 4) {
+                    cluster_type = tt::tt_metal::ClusterType::P150_X4;
+                } else if (num_mmio_chips == 8) {
+                    cluster_type = tt::tt_metal::ClusterType::P150_X8;
+                } else {
+                    TT_THROW(
+                        "Unknown P150 cluster configuration: {} total chips, {} MMIO chips", num_chips, num_mmio_chips);
+                }
             }
         } else if (board_type == BoardType::P300) {
             // PCIe is enabled to both chips on the P300 board
