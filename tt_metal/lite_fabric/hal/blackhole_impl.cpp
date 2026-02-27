@@ -24,14 +24,23 @@ uint32_t GetConfigAddress() { return LITE_FABRIC_CONFIG_START + offsetof(lite_fa
 namespace lite_fabric {
 
 void BlackholeLiteFabricHal::set_reset_state(tt_cxy_pair virtual_core, bool assert_reset) {
-    // We run on ERISC1. Don't touch ERISC0. It is running base firmware
     auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
     if (assert_reset) {
-        // Assert all cores except ERISC0.
-        tt::umd::RiscType reset_val = tt::umd::RiscType::ALL_TENSIX & ~tt::umd::RiscType::ERISC0;
-        cluster.assert_risc_reset_at_core(virtual_core, reset_val);
+        // Assert ALL cores including ERISC0.  Phase 1 loads base firmware on
+        // ERISC0 and deasserts it, so ERISC0 is running when we get here.
+        // ERISC0 and ERISC1 share the ethernet TX queue on the same ETH core;
+        // if ERISC0 is left running, its base firmware can:
+        //   - Send heartbeats / mailbox responses that stall ERISC1's
+        //     eth_txq_is_busy() loops, blocking lite fabric packet sends.
+        //   - Assert ERISC1's reset as part of a context-switch, killing
+        //     the lite fabric link mid-operation.
+        // Putting ERISC0 in reset for the duration of lite fabric avoids
+        // both issues.  ERISC0 is restored when Metal re-initializes
+        // (Phase 1 of the next init cycle).
+        cluster.assert_risc_reset_at_core(virtual_core, tt::umd::RiscType::ALL_TENSIX);
     } else {
-        // Deassert only ERISC1.
+        // Deassert only ERISC1.  ERISC0 stays in reset to avoid TX queue
+        // contention for the entire lite fabric lifetime.
         tt::umd::RiscType reset_val = tt::umd::RiscType::ERISC1;
         cluster.deassert_risc_reset_at_core(virtual_core, reset_val);
     }
@@ -110,8 +119,12 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
         set_reset_state(tunnel_1x.mmio_cxy_virtual(), false);
     }
 
-    // Wait for MMIO side to reach READY (firmware sends binary to remote and handshakes)
-    for (auto tunnel_1x : system_descriptor_.tunnels_from_mmio) {
+    // Wait for MMIO side to reach READY (firmware sends binary to remote and handshakes).
+    // Tunnels that fail to come up are reset and removed so the system can proceed with
+    // whatever connectivity is available.
+    auto it = system_descriptor_.tunnels_from_mmio.begin();
+    while (it != system_descriptor_.tunnels_from_mmio.end()) {
+        const auto& tunnel_1x = *it;
         log_info(
             tt::LogMetal,
             "Waiting for lite fabric: mmio chip={} core={} (virtual={}) -> remote chip={} core={} (virtual={})",
@@ -133,15 +146,17 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
                     tunnel_1x.connected_cxy_virtual(),
                     GetConfigAddress());
                 auto* rcfg = reinterpret_cast<lite_fabric::FabricLiteConfig*>(remote_readback.data());
-                log_error(
+                log_warning(
                     tt::LogMetal,
-                    "Remote chip {} core {} (virtual={}) config: current_state={}, initial_state={}, "
+                    "Lite fabric tunnel mmio chip={} core={} -> remote chip={} core={} failed to reach READY, "
+                    "skipping. Remote config: current_state={}, initial_state={}, "
                     "is_mmio={}, is_primary={}, routing_enabled={}, eth_chans_mask=0x{:x}, "
                     "binary_addr=0x{:x}, binary_size={}, "
                     "primary_local_handshake=0x{:x}, neighbour_handshake=0x{:x}",
+                    tunnel_1x.mmio_id,
+                    tunnel_1x.mmio_core_logical.str(),
                     tunnel_1x.connected_id,
                     tunnel_1x.connected_core_logical.str(),
-                    tunnel_1x.connected_core_virtual.str(),
                     static_cast<uint32_t>(rcfg->current_state),
                     static_cast<uint32_t>(rcfg->initial_state),
                     rcfg->is_mmio,
@@ -153,15 +168,30 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
                     rcfg->primary_local_handshake,
                     rcfg->neighbour_handshake);
             } catch (const std::exception& e) {
-                log_error(tt::LogMetal, "Failed to read remote chip {} config: {}", tunnel_1x.connected_id, e.what());
+                log_warning(
+                    tt::LogMetal,
+                    "Lite fabric tunnel mmio chip={} core={} -> remote chip={} failed to reach READY and "
+                    "could not read remote config: {}. Skipping tunnel.",
+                    tunnel_1x.mmio_id,
+                    tunnel_1x.mmio_core_logical.str(),
+                    tunnel_1x.connected_id,
+                    e.what());
             }
-            throw;
+            // Reset the failed MMIO-side core and remove the tunnel
+            set_reset_state(tunnel_1x.mmio_cxy_virtual(), true);
+            it = system_descriptor_.tunnels_from_mmio.erase(it);
+            continue;
         }
         log_info(
             tt::LogMetal,
             "Lite Fabric {} (virtual={}) is ready",
             tunnel_1x.mmio_core_logical.str(),
             tunnel_1x.mmio_core_virtual.str());
+        ++it;
+    }
+
+    if (system_descriptor_.tunnels_from_mmio.empty()) {
+        TT_THROW("All lite fabric tunnels failed to initialize. No remote devices are reachable.");
     }
 }
 
@@ -189,9 +219,11 @@ void BlackholeLiteFabricHal::terminate() {
 void BlackholeLiteFabricHal::wait_for_state(tt_cxy_pair virtual_core, lite_fabric::InitState state) {
     auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
     std::vector<uint32_t> readback{static_cast<uint32_t>(lite_fabric::InitState::UNKNOWN)};
+    constexpr int k_MaxPolls = 20;  // 2 seconds – handshake is near-instant on a healthy link
+    constexpr int k_PollIntervalMs = 100;
     int poll_count = 0;
     while (static_cast<lite_fabric::InitState>(readback[0]) != state) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(k_PollIntervalMs));
         cluster.read_core(readback, sizeof(uint32_t), virtual_core, GetStateAddress());
         poll_count++;
         if (poll_count % 10 == 0) {
@@ -203,7 +235,7 @@ void BlackholeLiteFabricHal::wait_for_state(tt_cxy_pair virtual_core, lite_fabri
                 static_cast<uint32_t>(state),
                 poll_count);
         }
-        if (poll_count >= 100) {
+        if (poll_count >= k_MaxPolls) {
             // Read the full config struct for diagnostics
             std::vector<uint32_t> config_readback(sizeof(lite_fabric::FabricLiteConfig) / sizeof(uint32_t));
             cluster.read_core(config_readback, sizeof(lite_fabric::FabricLiteConfig), virtual_core, GetConfigAddress());
@@ -260,7 +292,10 @@ std::vector<std::string> BlackholeLiteFabricHal::build_defines() {
         "ERISC",
         "RISC_B0_HW",
         "FW_BUILD",
-        "NOC_INDEX=1",
+        // Must be NOC 0 to match the noc_index in the packet header (set by UMD) and
+        // edm_to_local_chip_noc in constants.hpp.  UMD uses TRANSLATED coordinates which
+        // are NOC 0 coordinates on Blackhole; NOC 1 has a mirrored coordinate system.
+        "NOC_INDEX=0",
         "DISPATCH_MESSAGE_ADDR=0",
         "COMPILE_FOR_LITE_FABRIC=1",
         "ROUTING_FW_ENABLED",

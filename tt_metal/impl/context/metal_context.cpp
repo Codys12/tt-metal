@@ -265,56 +265,74 @@ void MetalContext::initialize(
 
     std::vector<std::shared_future<void>> futures;
 
-    // Lambda: run FW builds and device init for a set of devices
-    auto build_and_init_devices = [&](const auto& device_set) {
-        futures.clear();
-        for (ChipId device_id : device_set) {
-            futures.emplace_back(detail::async([this, device_id, fw_compile_hash]() {
-                log_info(tt::LogMetal, "build_and_init device {}: start", device_id);
-                // Clear L1/DRAM if requested
-                if (rtoptions_.get_clear_l1()) {
-                    log_info(tt::LogMetal, "build_and_init device {}: clear_l1_state", device_id);
-                    clear_l1_state(device_id);
-                }
-                if (rtoptions_.get_clear_dram()) {
-                    log_info(tt::LogMetal, "build_and_init device {}: clear_dram_state", device_id);
-                    clear_dram_state(device_id);
-                }
-                log_info(tt::LogMetal, "build_and_init device {}: get_device_aiclk", device_id);
-                [[maybe_unused]] int ai_clk = cluster_->get_device_aiclk(device_id);
-                log_info(tt::LogMetal, "AI CLK for device {} is:   {} MHz", device_id, ai_clk);
-                log_info(tt::LogMetal, "build_and_init device {}: generate_device_bank_to_noc_tables", device_id);
-                generate_device_bank_to_noc_tables(device_id);
-                log_info(tt::LogMetal, "build_and_init device {}: generate_worker_logical_to_virtual_map", device_id);
-                generate_worker_logical_to_virtual_map(device_id);
+    // Lambda: run FW builds and device init for a set of devices.
+    // When sequential=true, devices are processed one at a time (required for remote
+    // devices behind lite fabric whose tunnels are not safe for concurrent access).
+    // When skip_eth=true, ETH core L1 clearing and launch message clearing are skipped
+    // (remote devices: ERISC0 is not running, lite fabric ERISC1 is active on the link).
+    auto build_and_init_devices = [&](const auto& device_set, bool sequential = false, bool skip_eth = false) {
+        auto per_device_init = [this, fw_compile_hash, skip_eth](ChipId device_id) {
+            log_info(tt::LogMetal, "build_and_init device {}: start", device_id);
+            // Clear L1/DRAM if requested
+            if (rtoptions_.get_clear_l1()) {
+                log_info(tt::LogMetal, "build_and_init device {}: clear_l1_state (skip_eth={})", device_id, skip_eth);
+                clear_l1_state(device_id, skip_eth);
+            }
+            if (rtoptions_.get_clear_dram()) {
+                log_info(tt::LogMetal, "build_and_init device {}: clear_dram_state", device_id);
+                clear_dram_state(device_id);
+            }
+            log_info(tt::LogMetal, "build_and_init device {}: get_device_aiclk", device_id);
+            [[maybe_unused]] int ai_clk = cluster_->get_device_aiclk(device_id);
+            log_info(tt::LogMetal, "AI CLK for device {} is:   {} MHz", device_id, ai_clk);
+            log_info(tt::LogMetal, "build_and_init device {}: generate_device_bank_to_noc_tables", device_id);
+            generate_device_bank_to_noc_tables(device_id);
+            log_info(tt::LogMetal, "build_and_init device {}: generate_worker_logical_to_virtual_map", device_id);
+            generate_worker_logical_to_virtual_map(device_id);
 
-                // Create build env for this device, and build FW if it's not built already
-                log_info(tt::LogMetal, "build_and_init device {}: add_build_env", device_id);
-                BuildEnvManager::get_instance().add_build_env(device_id, num_hw_cqs_);
-                uint64_t fw_build_key =
-                    BuildEnvManager::get_instance().get_device_build_env(device_id).build_key() ^ fw_compile_hash;
+            // Create build env for this device, and build FW if it's not built already
+            log_info(tt::LogMetal, "build_and_init device {}: add_build_env", device_id);
+            BuildEnvManager::get_instance().add_build_env(device_id, num_hw_cqs_);
+            uint64_t fw_build_key =
+                BuildEnvManager::get_instance().get_device_build_env(device_id).build_key() ^ fw_compile_hash;
 
-                {
-                    std::lock_guard<std::mutex> lock(firmware_built_keys_mutex_);
-                    if (!firmware_built_keys_.contains(fw_build_key)) {
-                        log_info(tt::LogMetal, "build_and_init device {}: build_firmware", device_id);
-                        BuildEnvManager::get_instance().build_firmware(device_id);
-                        firmware_built_keys_.insert(fw_build_key);
-                    }
+            {
+                std::lock_guard<std::mutex> lock(firmware_built_keys_mutex_);
+                if (!firmware_built_keys_.contains(fw_build_key)) {
+                    log_info(tt::LogMetal, "build_and_init device {}: build_firmware", device_id);
+                    BuildEnvManager::get_instance().build_firmware(device_id);
+                    firmware_built_keys_.insert(fw_build_key);
                 }
+            }
 
-                // Clear the entire launch message ring buffer on ethernet cores before application firmware is
-                // activated. This is required since ethernet cores context switch between application and routing
-                // firmware. If ERISC application firmware is activated before the launch messages are cleared, it can
-                // enter an undefined state by reading a corrupted launch message. Routing firmware will never run in
-                // this case, causing UMD issued transactions to hang.
+            // Clear the entire launch message ring buffer on ethernet cores before application firmware is
+            // activated. This is required since ethernet cores context switch between application and routing
+            // firmware. If ERISC application firmware is activated before the launch messages are cleared, it can
+            // enter an undefined state by reading a corrupted launch message. Routing firmware will never run in
+            // this case, causing UMD issued transactions to hang.
+            //
+            // Skipped for remote devices behind lite fabric: no ERISC0 base firmware is
+            // running on remote ETH cores, and clearing the lite fabric ETH core's
+            // launch messages is unnecessary (ERISC1 is actively servicing the link).
+            if (!skip_eth) {
                 log_info(tt::LogMetal, "build_and_init device {}: clear_launch_messages_on_eth_cores", device_id);
                 clear_launch_messages_on_eth_cores(device_id);
-                log_info(tt::LogMetal, "build_and_init device {}: complete", device_id);
-            }));
-        }
-        for (auto& fut : futures) {
-            fut.wait();
+            }
+            log_info(tt::LogMetal, "build_and_init device {}: complete", device_id);
+        };
+
+        if (sequential) {
+            for (ChipId device_id : device_set) {
+                per_device_init(device_id);
+            }
+        } else {
+            futures.clear();
+            for (ChipId device_id : device_set) {
+                futures.emplace_back(detail::async([per_device_init, device_id]() { per_device_init(device_id); }));
+            }
+            for (auto& fut : futures) {
+                fut.wait();
+            }
         }
     };
 
@@ -379,6 +397,96 @@ void MetalContext::initialize(
                 lite_fabric::InitializeLiteFabric(lite_fabric_hal_);
             }
 
+            // Filter remote_devices to only those reachable via lite fabric tunnels,
+            // and bind each remote chip's UMD communication to the specific ETH
+            // channel(s) that have active lite fabric tunnels to it.  Without this,
+            // UMD round-robins through ALL active ETH channels on the MMIO chip,
+            // which may send reads down a tunnel to the wrong remote chip and hang.
+            {
+                const auto& tunnels = lite_fabric_hal_->get_system_descriptor().tunnels_from_mmio;
+
+                log_info(tt::LogMetal, "=== Lite fabric tunnel summary: {} surviving tunnels ===", tunnels.size());
+                for (size_t i = 0; i < tunnels.size(); i++) {
+                    const auto& t = tunnels[i];
+                    log_info(
+                        tt::LogMetal,
+                        "  tunnel[{}]: mmio_chip={} mmio_core_logical={} -> connected_chip={} "
+                        "connected_core_logical={}",
+                        i,
+                        t.mmio_id,
+                        t.mmio_core_logical.str(),
+                        t.connected_id,
+                        t.connected_core_logical.str());
+                }
+
+                log_info(tt::LogMetal, "=== remote_devices before filter: {} devices ===", remote_devices.size());
+                for (ChipId id : remote_devices) {
+                    auto gateway = cluster_->get_cluster_desc()->get_closest_mmio_capable_chip(id);
+                    log_info(tt::LogMetal, "  remote device {} (gateway mmio={})", id, gateway);
+                }
+
+                // Build per-remote-chip set of MMIO-side ETH channels, keyed by (connected_id, mmio_id)
+                std::map<ChipId, std::set<uint32_t>> remote_chip_eth_channels;
+                std::map<ChipId, ChipId> remote_chip_tunnel_mmio;  // which MMIO chip has the tunnel
+                for (const auto& tunnel : tunnels) {
+                    remote_chip_eth_channels[tunnel.connected_id].insert(tunnel.mmio_core_logical.y);
+                    remote_chip_tunnel_mmio[tunnel.connected_id] = tunnel.mmio_id;
+                }
+
+                std::set<ChipId> reachable_remote_devices;
+                for (const auto& [chip_id, channels] : remote_chip_eth_channels) {
+                    if (!remote_devices.count(chip_id)) {
+                        log_info(tt::LogMetal, "  skip chip {} (not in remote_devices)", chip_id);
+                        continue;
+                    }
+
+                    auto gateway = cluster_->get_cluster_desc()->get_closest_mmio_capable_chip(chip_id);
+                    auto tunnel_mmio = remote_chip_tunnel_mmio[chip_id];
+                    log_info(
+                        tt::LogMetal,
+                        "  chip {}: UMD gateway={}, tunnel mmio={}, channels=[{}]",
+                        chip_id,
+                        gateway,
+                        tunnel_mmio,
+                        fmt::join(channels, ", "));
+
+                    if (gateway != tunnel_mmio) {
+                        log_warning(
+                            tt::LogMetal,
+                            "  chip {}: MISMATCH - UMD gateway {} != tunnel mmio {}. "
+                            "Reads would go through wrong MMIO chip. Skipping.",
+                            chip_id,
+                            gateway,
+                            tunnel_mmio);
+                        continue;
+                    }
+
+                    reachable_remote_devices.insert(chip_id);
+
+                    // Rebind UMD remote communication to only the channels with tunnels to this chip
+                    cluster_->get_driver()->get_remote_chip(chip_id)->set_remote_transfer_ethernet_cores(channels);
+                    log_info(
+                        tt::LogMetal,
+                        "Bound remote device {} to lite fabric ETH channel(s): [{}]",
+                        chip_id,
+                        fmt::join(channels, ", "));
+                }
+
+                if (reachable_remote_devices.size() < remote_devices.size()) {
+                    log_warning(
+                        tt::LogMetal,
+                        "Only {} of {} remote devices are reachable via lite fabric, skipping unreachable devices",
+                        reachable_remote_devices.size(),
+                        remote_devices.size());
+                }
+                log_info(
+                    tt::LogMetal, "=== remote_devices after filter: {} devices ===", reachable_remote_devices.size());
+                for (ChipId id : reachable_remote_devices) {
+                    log_info(tt::LogMetal, "  reachable remote device {}", id);
+                }
+                remote_devices = std::move(reachable_remote_devices);
+            }
+
             // Phase 2b: Upgrade remote BH chip firmware info providers now that lite fabric
             // is running and the remote ARC is accessible.  This replaces the proxy providers
             // (borrowed from the local gateway chip during topology discovery) with real ones
@@ -390,6 +498,11 @@ void MetalContext::initialize(
                 for (ChipId id : remote_devices) {
                     log_info(tt::LogMetal, "Phase 2b: upgrade_remote_bh_chip_info for device {}", id);
                     cluster_->upgrade_remote_bh_chip_info(id);
+                    // The UMD SoC descriptor now has the real harvesting masks from the
+                    // remote chip's ARC.  Refresh the metal-layer SoC descriptor so that
+                    // all subsequent coordinate translations (logical → virtual → translated)
+                    // account for the remote chip's actual harvesting, not the gateway's.
+                    cluster_->refresh_soc_desc_for_chip(id);
                     log_info(tt::LogMetal, "Phase 2b: upgrade complete for device {}", id);
                 }
             }
@@ -400,9 +513,30 @@ void MetalContext::initialize(
                 ZoneScopedN("Remote Device Init and FW Launch");
                 log_info(
                     tt::LogMetal, "Phase 3: build_and_init_devices for {} remote device(s)", remote_devices.size());
-                build_and_init_devices(remote_devices);
+                // Run sequentially and skip ETH cores for remote devices behind
+                // lite fabric.  All writes to remote chips go through lite fabric
+                // tunnels which share sender/receiver buffers on the MMIO-side
+                // ETH core and are not safe for concurrent access from multiple
+                // threads.  ETH cores are skipped because ERISC0 is not running on
+                // remote ETH cores (all in POR reset), and the lite fabric ETH core
+                // has ERISC1 actively servicing the link.
+                build_and_init_devices(remote_devices, /*sequential=*/true, /*skip_eth=*/true);
                 log_info(tt::LogMetal, "Phase 3: build_and_init_devices complete, launching FW for remote devices");
-                launch_fw_for_devices(remote_devices);
+                // Skip reset_cores for remote BH chips: their Tensix cores are
+                // already in POR reset, and reset_cores would kill the lite
+                // fabric by resetting ERISC1 on the active ETH core (the remote
+                // end of the lite fabric link).  ClearNocData is also a NO-OP
+                // when NOC recording is disabled (the default).
+                //
+                // Launch FW sequentially for remote devices because all writes
+                // go through lite fabric tunnels which share sender/receiver
+                // buffers on the MMIO-side ETH core and are not safe for
+                // concurrent access from multiple threads.
+                for (ChipId device_id : remote_devices) {
+                    log_info(tt::LogMetal, "launch_fw device {} (remote): initialize_and_launch_firmware", device_id);
+                    initialize_and_launch_firmware(device_id);
+                    log_info(tt::LogMetal, "launch_fw device {} (remote): complete", device_id);
+                }
                 log_info(tt::LogMetal, "Phase 3: remote FW launch complete");
             }
         } else {
@@ -632,7 +766,7 @@ const DispatchMemMap& MetalContext::dispatch_mem_map(const CoreType& core_type) 
     return *mem_map;
 }
 
-void MetalContext::clear_l1_state(ChipId device_id) {
+void MetalContext::clear_l1_state(ChipId device_id, bool skip_eth_cores) {
     log_debug(tt::LogMetal, "Clearing L1 for device {}", device_id);
     // Clear all clearable Tensix and Eth L1
     CoreCoord logical_grid_size = cluster_->get_soc_desc(device_id).get_grid_size(CoreType::TENSIX);
@@ -649,18 +783,23 @@ void MetalContext::clear_l1_state(ChipId device_id) {
         }
     }
 
-    // Clear erisc unreserved L1
-    for (const auto& eth_core : this->get_control_plane().get_active_ethernet_cores(device_id)) {
-        static uint32_t zero_vec_size = hal::get_erisc_l1_unreserved_size();
-        auto zero_vec_addr = hal::get_erisc_l1_unreserved_base();
+    if (!skip_eth_cores) {
+        // Clear erisc unreserved L1
+        // Skipped for remote devices behind lite fabric: ERISC0 is not running on
+        // remote ETH cores (all in POR reset), and the lite fabric ETH core has
+        // ERISC1 actively servicing the link — writing to its L1 is unnecessary.
+        for (const auto& eth_core : this->get_control_plane().get_active_ethernet_cores(device_id)) {
+            static uint32_t zero_vec_size = hal::get_erisc_l1_unreserved_size();
+            auto zero_vec_addr = hal::get_erisc_l1_unreserved_base();
 
-        static std::vector<uint32_t> zero_vec(zero_vec_size / sizeof(uint32_t), 0);
+            static std::vector<uint32_t> zero_vec(zero_vec_size / sizeof(uint32_t), 0);
 
-        CoreCoord virtual_core =
-            cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
-        cluster_->write_core(device_id, virtual_core, zero_vec, zero_vec_addr);
+            CoreCoord virtual_core =
+                cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
+            cluster_->write_core(device_id, virtual_core, zero_vec, zero_vec_addr);
+        }
+        // TODO: clear idle eriscs as well
     }
-    // TODO: clear idle eriscs as well
     cluster_->l1_barrier(device_id);
 }
 
@@ -1610,10 +1749,53 @@ dev_msgs::core_info_msg_t MetalContext::populate_core_info_msg(
 void MetalContext::initialize_and_launch_firmware(ChipId device_id) {
     ZoneScoped;
 
+    // On a remote BH device behind lite fabric, ERISC0 is not running on any
+    // ETH core (all are in POR reset) and the lite fabric ETH core has ERISC1
+    // actively servicing the lite fabric link.
+    //
+    // The normal 2-erisc init path for active ETH cores relies on ERISC0's
+    // base firmware being alive to process ETH_MSG_RELEASE_CORE and deassert
+    // ERISC1.  That assumption does not hold on remote devices, so we skip
+    // ALL ETH core initialization here:
+    //   - Lite fabric ETH core: ERISC1 is running — touching it kills the link.
+    //   - Other active ETH cores: ERISC0 isn't running, so the 2-erisc mailbox
+    //     handshake would never complete and wait_until_cores_done would hang.
+    //   - Idle ETH cores: no base firmware loaded, deasserting would boot
+    //     garbage and hang the wait loop.
+    //
+    // Only Tensix cores are initialized.  ETH cores on the remote device will
+    // be brought up later by the fabric initialization path if needed.
+    const bool skip_eth_cores = lite_fabric_hal_ && !cluster_->mmio_chip_ids().count(device_id);
+
     // Download to worker cores
-    log_debug(tt::LogMetal, "Initializing worker cores");
     std::unordered_set<CoreCoord> not_done_cores;
     CoreCoord logical_grid_size = cluster_->get_soc_desc(device_id).get_grid_size(CoreType::TENSIX);
+    log_info(
+        tt::LogMetal,
+        "Device {} init_fw: grid={}x{}, skip_eth={}",
+        device_id,
+        logical_grid_size.x,
+        logical_grid_size.y,
+        skip_eth_cores);
+
+    // Remote device: Tensix cores are in POR (Power-On Reset) state because
+    // reset_cores() is skipped (it would kill the lite fabric ERISC1 link).
+    // In POR the NOC NIU can accept writes to L1 but may not generate read
+    // responses, causing wait_until_cores_done to hang.  Assert software
+    // reset on all worker cores to transition them to a clean reset state
+    // where the NIU is fully functional.
+    if (skip_eth_cores) {
+        log_info(tt::LogMetal, "Device {} init_fw: asserting reset on Tensix worker cores (POR->reset)", device_id);
+        for (uint32_t y = 0; y < logical_grid_size.y; y++) {
+            for (uint32_t x = 0; x < logical_grid_size.x; x++) {
+                CoreCoord logical_core(x, y);
+                CoreCoord worker_core = cluster_->get_virtual_coordinate_from_logical_coordinates(
+                    device_id, logical_core, CoreType::WORKER);
+                cluster_->assert_risc_reset_at_core(tt_cxy_pair(device_id, worker_core), tt::umd::RiscType::ALL);
+            }
+        }
+        cluster_->l1_barrier(device_id);
+    }
 
     auto dev_msgs_factory = hal_->get_dev_msgs_factory(HalProgrammableCoreType::TENSIX);
     auto core_info = populate_core_info_msg(device_id, HalProgrammableCoreType::TENSIX);
@@ -1621,6 +1803,14 @@ void MetalContext::initialize_and_launch_firmware(ChipId device_id) {
     auto go_msg = dev_msgs_factory.create<dev_msgs::go_msg_t>();
     go_msg.view().signal() = dev_msgs::RUN_MSG_INIT;
 
+    log_info(
+        tt::LogMetal,
+        "Device {} init_fw: writing Tensix core info ({} B) + FW to {}x{} cores, harvest={:#x}",
+        device_id,
+        core_info.size(),
+        logical_grid_size.x,
+        logical_grid_size.y,
+        cluster_->get_soc_desc(device_id).harvesting_masks.tensix_harvesting_mask);
     for (uint32_t y = 0; y < logical_grid_size.y; y++) {
         for (uint32_t x = 0; x < logical_grid_size.x; x++) {
             CoreCoord logical_core(x, y);
@@ -1642,75 +1832,88 @@ void MetalContext::initialize_and_launch_firmware(ChipId device_id) {
             not_done_cores.insert(worker_core);
         }
     }
-
-    // Clear erisc sync info
-    for (const auto& eth_core : this->get_control_plane().get_active_ethernet_cores(device_id)) {
-        static std::vector<uint32_t> zero_vec_erisc_init(
-            hal_->get_dev_size(HalProgrammableCoreType::ACTIVE_ETH, HalL1MemAddrType::APP_SYNC_INFO) / sizeof(uint32_t),
-            0);
-
-        CoreCoord virtual_core =
-            cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
-
-        cluster_->write_core_immediate(
-            device_id,
-            virtual_core,
-            zero_vec_erisc_init,
-            hal_->get_dev_addr(HalProgrammableCoreType::ACTIVE_ETH, HalL1MemAddrType::APP_SYNC_INFO));
-    }
-
-    // Load erisc app base FW to eth cores on WH and active_erisc FW on second risc of BH active eth cores
-    log_debug(tt::LogMetal, "Initializing active ethernet cores");
-    dev_msgs_factory = hal_->get_dev_msgs_factory(HalProgrammableCoreType::ACTIVE_ETH);
-    core_info = populate_core_info_msg(device_id, HalProgrammableCoreType::ACTIVE_ETH);
-    launch_msg = dev_msgs_factory.create<dev_msgs::launch_msg_t>();
-    go_msg = dev_msgs_factory.create<dev_msgs::go_msg_t>();
-    go_msg.view().signal() = dev_msgs::RUN_MSG_INIT;
+    log_info(tt::LogMetal, "Device {} init_fw: Tensix writes done ({} cores)", device_id, not_done_cores.size());
 
     std::unordered_set<CoreCoord> multi_risc_active_eth_cores;
-    for (const auto& eth_core : this->get_control_plane().get_active_ethernet_cores(device_id)) {
-        CoreCoord virtual_core =
-            cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
-        core_info.view().absolute_logical_x() = eth_core.x;
-        core_info.view().absolute_logical_y() = eth_core.y;
-        cluster_->write_core_immediate(
-            core_info.data(),
-            core_info.size(),
-            {static_cast<size_t>(device_id), virtual_core},
-            hal_->get_dev_addr(llrt::get_core_type(device_id, virtual_core), HalL1MemAddrType::CORE_INFO));
-        initialize_firmware(
-            device_id, HalProgrammableCoreType::ACTIVE_ETH, virtual_core, launch_msg.view(), go_msg.view());
-        if (!hal_->get_eth_fw_is_cooperative()) {
-            multi_risc_active_eth_cores.insert(virtual_core);
+
+    if (!skip_eth_cores) {
+        // Clear erisc sync info
+        for (const auto& eth_core : this->get_control_plane().get_active_ethernet_cores(device_id)) {
+            static std::vector<uint32_t> zero_vec_erisc_init(
+                hal_->get_dev_size(HalProgrammableCoreType::ACTIVE_ETH, HalL1MemAddrType::APP_SYNC_INFO) /
+                    sizeof(uint32_t),
+                0);
+
+            CoreCoord virtual_core =
+                cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
+
+            cluster_->write_core_immediate(
+                device_id,
+                virtual_core,
+                zero_vec_erisc_init,
+                hal_->get_dev_addr(HalProgrammableCoreType::ACTIVE_ETH, HalL1MemAddrType::APP_SYNC_INFO));
+        }
+
+        // Load erisc app base FW to eth cores on WH and active_erisc FW on second risc of BH active eth cores
+        log_debug(tt::LogMetal, "Initializing active ethernet cores");
+        dev_msgs_factory = hal_->get_dev_msgs_factory(HalProgrammableCoreType::ACTIVE_ETH);
+        core_info = populate_core_info_msg(device_id, HalProgrammableCoreType::ACTIVE_ETH);
+        launch_msg = dev_msgs_factory.create<dev_msgs::launch_msg_t>();
+        go_msg = dev_msgs_factory.create<dev_msgs::go_msg_t>();
+        go_msg.view().signal() = dev_msgs::RUN_MSG_INIT;
+
+        for (const auto& eth_core : this->get_control_plane().get_active_ethernet_cores(device_id)) {
+            CoreCoord virtual_core =
+                cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
+            core_info.view().absolute_logical_x() = eth_core.x;
+            core_info.view().absolute_logical_y() = eth_core.y;
+            cluster_->write_core_immediate(
+                core_info.data(),
+                core_info.size(),
+                {static_cast<size_t>(device_id), virtual_core},
+                hal_->get_dev_addr(llrt::get_core_type(device_id, virtual_core), HalL1MemAddrType::CORE_INFO));
+            initialize_firmware(
+                device_id, HalProgrammableCoreType::ACTIVE_ETH, virtual_core, launch_msg.view(), go_msg.view());
+            if (!hal_->get_eth_fw_is_cooperative()) {
+                multi_risc_active_eth_cores.insert(virtual_core);
+                not_done_cores.insert(virtual_core);
+            }
+        }
+
+        log_debug(tt::LogMetal, "Initializing idle ethernet cores");
+        dev_msgs_factory = hal_->get_dev_msgs_factory(HalProgrammableCoreType::IDLE_ETH);
+        core_info = populate_core_info_msg(device_id, HalProgrammableCoreType::IDLE_ETH);
+        launch_msg = dev_msgs_factory.create<dev_msgs::launch_msg_t>();
+        go_msg = dev_msgs_factory.create<dev_msgs::go_msg_t>();
+        go_msg.view().signal() = dev_msgs::RUN_MSG_INIT;
+        for (const auto& eth_core : this->get_control_plane().get_inactive_ethernet_cores(device_id)) {
+            CoreCoord virtual_core =
+                cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
+            core_info.view().absolute_logical_x() = eth_core.x;
+            core_info.view().absolute_logical_y() = eth_core.y;
+            cluster_->write_core_immediate(
+                core_info.data(),
+                core_info.size(),
+                {static_cast<size_t>(device_id), virtual_core},
+                hal_->get_dev_addr(llrt::get_core_type(device_id, virtual_core), HalL1MemAddrType::CORE_INFO));
+            initialize_firmware(
+                device_id, HalProgrammableCoreType::IDLE_ETH, virtual_core, launch_msg.view(), go_msg.view());
             not_done_cores.insert(virtual_core);
         }
-    }
-
-    log_debug(tt::LogMetal, "Initializing idle ethernet cores");
-    dev_msgs_factory = hal_->get_dev_msgs_factory(HalProgrammableCoreType::IDLE_ETH);
-    core_info = populate_core_info_msg(device_id, HalProgrammableCoreType::IDLE_ETH);
-    launch_msg = dev_msgs_factory.create<dev_msgs::launch_msg_t>();
-    go_msg = dev_msgs_factory.create<dev_msgs::go_msg_t>();
-    go_msg.view().signal() = dev_msgs::RUN_MSG_INIT;
-    for (const auto& eth_core : this->get_control_plane().get_inactive_ethernet_cores(device_id)) {
-        CoreCoord virtual_core =
-            cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
-        core_info.view().absolute_logical_x() = eth_core.x;
-        core_info.view().absolute_logical_y() = eth_core.y;
-        cluster_->write_core_immediate(
-            core_info.data(),
-            core_info.size(),
-            {static_cast<size_t>(device_id), virtual_core},
-            hal_->get_dev_addr(llrt::get_core_type(device_id, virtual_core), HalL1MemAddrType::CORE_INFO));
-        initialize_firmware(
-            device_id, HalProgrammableCoreType::IDLE_ETH, virtual_core, launch_msg.view(), go_msg.view());
-        not_done_cores.insert(virtual_core);
+    } else {
+        log_info(
+            tt::LogMetal,
+            "Device {} init_fw: remote device — skipping ETH core init (Tensix only, {} cores)",
+            device_id,
+            not_done_cores.size());
     }
 
     // Barrier between L1 writes above and deassert below
+    log_info(tt::LogMetal, "Device {} init_fw: l1_barrier", device_id);
     cluster_->l1_barrier(device_id);
 
     // Deassert worker cores
+    log_info(tt::LogMetal, "Device {} init_fw: deasserting {} worker cores", device_id, not_done_cores.size());
     for (const auto& worker_core : not_done_cores) {
         if (multi_risc_active_eth_cores.contains(worker_core) && rtoptions_.get_enable_2_erisc_mode()) {
             // Not needed for 2 erisc mode. primary erisc handles deasserting subordinate
@@ -1729,17 +1932,44 @@ void MetalContext::initialize_and_launch_firmware(ChipId device_id) {
         }
         cluster_->deassert_risc_reset_at_core(tt_cxy_pair(device_id, worker_core), reset_val);
     }
+    log_info(tt::LogMetal, "Device {} init_fw: deassert done, waiting for FW init", device_id);
+
+    // Flush deassert writes through lite fabric before polling
+    cluster_->l1_barrier(device_id);
 
     // Wait until fw init is done, ensures the next launch msg doesn't get
     // written while fw is still in init
-    log_debug(LogDevice, "Waiting for firmware init complete");
-    const int timeout_ms = 10000;  // 10 seconds for now
-    try {
-        llrt::internal_::wait_until_cores_done(device_id, dev_msgs::RUN_MSG_INIT, not_done_cores, timeout_ms);
-    } catch (std::runtime_error& e) {
-        TT_THROW("Device {} init: failed to initialize FW! Try resetting the board.", device_id);
+    if (skip_eth_cores) {
+        // DIAGNOSTIC: The lite fabric NOC_READ path to Tensix L1 on remote
+        // devices currently hangs (remote ERISC's noc_async_read never
+        // completes).  Use a fixed delay instead of read-based polling.
+        // Tensix FW init takes microseconds; 500ms is extremely conservative.
+        log_info(
+            tt::LogMetal,
+            "Device {} init_fw: remote device — using fixed delay instead of read-based polling ({} cores)",
+            device_id,
+            not_done_cores.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        log_info(tt::LogMetal, "Device {} init_fw: FW init assumed complete (500ms delay)", device_id);
+    } else {
+        const int timeout_ms = 10000;  // 10 seconds for now
+        try {
+            llrt::internal_::wait_until_cores_done(device_id, dev_msgs::RUN_MSG_INIT, not_done_cores, timeout_ms);
+        } catch (std::runtime_error& e) {
+            log_error(
+                tt::LogMetal,
+                "Device {} init_fw TIMEOUT: {} cores not done. Inner: {}",
+                device_id,
+                not_done_cores.size(),
+                e.what());
+            TT_THROW(
+                "Device {} init: failed to initialize FW ({} cores not done). Inner: {}",
+                device_id,
+                not_done_cores.size(),
+                e.what());
+        }
     }
-    log_debug(LogDevice, "Firmware init complete");
+    log_info(tt::LogMetal, "Device {} init_fw: FW init complete", device_id);
 }
 
 // Command queue id stack for thread

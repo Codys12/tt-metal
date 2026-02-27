@@ -294,6 +294,7 @@ void wait_until_cores_done(
                 .count();
     }
     while (!not_done_phys_cores.empty()) {
+        int reads_this_pass = 0;
         if (timeout_ms > 0) {
             auto now = std::chrono::high_resolution_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
@@ -327,7 +328,19 @@ void wait_until_cores_done(
         for (auto it = not_done_phys_cores.begin(); it != not_done_phys_cores.end(); ) {
             const auto &phys_core = *it;
 
-            bool is_done = llrt::internal_::check_if_riscs_on_specified_core_done(device_id, phys_core, run_state);
+            bool is_done;
+            try {
+                is_done = llrt::internal_::check_if_riscs_on_specified_core_done(device_id, phys_core, run_state);
+            } catch (std::exception& e) {
+                TT_THROW(
+                    "Device {}: read from core {} failed (read #{} this pass, {} cores remaining): {}",
+                    device_id,
+                    phys_core.str(),
+                    reads_this_pass,
+                    not_done_phys_cores.size(),
+                    e.what());
+            }
+            reads_this_pass++;
             if (is_done) {
                 log_debug(tt::LogMetal, "Device {}: Phys cores just done: {}", device_id, phys_core.str());
                 it = not_done_phys_cores.erase(it);

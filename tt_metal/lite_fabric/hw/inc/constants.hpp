@@ -75,6 +75,8 @@ constexpr uint8_t local_chip_data_cmd_buf = BRISC_WR_CMD_BUF;
 #endif
 
 // Default NoC to use for Reads/Writes
+// Must match the noc_index set in the packet header by UMD (NOC0, since UMD uses
+// TRANSLATED coordinates which are NOC0 coordinates on Blackhole).
 constexpr uint8_t edm_to_local_chip_noc = 0;
 constexpr uint8_t forward_and_local_write_noc_vc = 2;  // FabricEriscDatamoverConfig::DEFAULT_NOC_VC
 constexpr uint8_t edm_to_downstream_noc = 0;

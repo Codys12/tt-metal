@@ -87,16 +87,22 @@ OutboundReceiverChannelPointersTupleImpl outbound_to_receiver_channel_pointers_t
 
 ReceiverChannelPointersTupleImpl receiver_channel_pointers_tuple __attribute__((used));
 
+uint32_t diag_loop_counter __attribute__((used));
+
 // object_init and routing_init are expected to be called before this
 __attribute__((noinline)) void service_lite_fabric() {
     invalidate_l1_cache();
-    switch (reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(LITE_FABRIC_CONFIG_START)
-                ->config.routing_enabled) {
+    // Compiler memory barrier: invalidate_l1_cache() is asm("fence") which provides
+    // hardware ordering but does NOT clobber "memory", so the compiler may keep C/C++
+    // variables (like num_free_slots) in registers across iterations.  Force a full
+    // reload so that values written in main() or by previous iterations are visible.
+    asm volatile("" ::: "memory");
+    auto* mem_map = reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(LITE_FABRIC_CONFIG_START);
+    switch (mem_map->config.routing_enabled) {
         case lite_fabric::RoutingEnabledState::ENABLED: break;
         case lite_fabric::RoutingEnabledState::STOPPED: return;
         case lite_fabric::RoutingEnabledState::STOP:
-            reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(LITE_FABRIC_CONFIG_START)
-                ->config.routing_enabled = lite_fabric::RoutingEnabledState::STOPPED;
+            mem_map->config.routing_enabled = lite_fabric::RoutingEnabledState::STOPPED;
             ConnectedRiscInterface::assert_connected_dm1_reset();
             constexpr uint32_t routing_enabled_address =
                 LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteConfig, routing_enabled);
@@ -104,8 +110,51 @@ __attribute__((noinline)) void service_lite_fabric() {
                 lite_fabric::k_DataTxq, routing_enabled_address >> 4, routing_enabled_address >> 4, 1);
             return;
     }
+    // Self-healing: if num_free_slots is 0 but we haven't sent any packets (d2h=0),
+    // force-init to RECEIVER_NUM_BUFFERS.  This catches cases where the template-based
+    // init or the explicit reinit in main() was elided/corrupted by the compiler/LTO.
+    // Use volatile to prevent the compiler from optimizing away this safety net.
+    {
+        volatile uint32_t* nfs_ptr = &outbound_to_receiver_channel_pointers_tuple.template get<0>().num_free_slots;
+        if (*nfs_ptr == 0 && host_interface->d2h.fabric_sender_channel_index == 0) {
+            *nfs_ptr = RECEIVER_NUM_BUFFERS_ARRAY[0];
+        }
+    }
+
     lite_fabric::run_sender_channel_step<0>();
     lite_fabric::run_receiver_channel_step<0>();
+
+    // Diagnostic: write sender flow-control state so the host can read it
+    // primary_local_handshake layout:
+    //   bits 31-24: num_free_slots (capped at 0xFF)
+    //   bits 23-16: raw completion stream register value (capped at 0xFF)
+    //   bit 8:      has_unsent_packet
+    //   bit 0:      can_send
+    {
+        auto& optr = outbound_to_receiver_channel_pointers_tuple.template get<0>();
+        bool has_unsent =
+            host_interface->h2d.sender_host_write_index != host_interface->d2h.fabric_sender_channel_index;
+        int32_t completion_reg = get_ptr_val(to_sender_pkts_completed_ids[0]);
+        mem_map->config.primary_local_handshake = (static_cast<uint32_t>(optr.num_free_slots & 0xFF) << 24) |
+                                                  (static_cast<uint32_t>(completion_reg & 0xFF) << 16) |
+                                                  (static_cast<uint32_t>(has_unsent) << 8) |
+                                                  static_cast<uint32_t>(optr.num_free_slots > 0 && has_unsent);
+    }
+    // Diagnostic: write receiver flow-control state to padding1[0]
+    // padding1[0] layout:
+    //   bits 31-24: receiver wr_sent_counter (low byte)
+    //   bits 23-16: receiver completion_counter (low byte)
+    //   bits 15-8:  d2h.fabric_receiver_channel_index
+    //   bits 7-0:   h2d.receiver_host_read_index
+    {
+        auto& rptr = receiver_channel_pointers_tuple.template get<0>();
+        mem_map->config.padding1[0] = (static_cast<uint32_t>(rptr.wr_sent_counter.counter & 0xFF) << 24) |
+                                      (static_cast<uint32_t>(rptr.completion_counter.counter & 0xFF) << 16) |
+                                      (static_cast<uint32_t>(host_interface->d2h.fabric_receiver_channel_index) << 8) |
+                                      static_cast<uint32_t>(host_interface->h2d.receiver_host_read_index);
+    }
+    // Loop counter so the host can verify firmware is alive
+    mem_map->config.neighbour_handshake = ++diag_loop_counter;
 }
 
 inline void object_init(volatile lite_fabric::FabricLiteMemoryMap* mem_map) {
@@ -190,6 +239,18 @@ int main() {
     auto structs = reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(LITE_FABRIC_CONFIG_START);
     lite_fabric::object_init(structs);
     lite_fabric::routing_init(&structs->config);
+
+    // Explicitly reinitialize sender flow control after routing handshake.
+    // The template-based OutboundReceiverChannelPointersTuple::make() init may
+    // silently fail on the embedded RISC-V target (std::apply + fold expressions).
+    lite_fabric::outbound_to_receiver_channel_pointers_tuple.template get<0>().num_free_slots =
+        lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[0];
+    lite_fabric::outbound_to_receiver_channel_pointers_tuple.template get<0>().remote_receiver_buffer_index =
+        tt::tt_fabric::BufferIndex{0};
+    // Re-init stream registers to ensure clean state after handshake ethernet traffic
+    init_ptr_val<lite_fabric::to_receiver_0_pkts_sent_id>(0);
+    init_ptr_val<lite_fabric::to_sender_0_pkts_acked_id>(0);
+    init_ptr_val<lite_fabric::to_sender_0_pkts_completed_id>(0);
 
     invalidate_l1_cache();
     while (true) {

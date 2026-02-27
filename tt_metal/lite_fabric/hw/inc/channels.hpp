@@ -128,6 +128,12 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
 
             const auto dest_address = header.command_fields.noc_unicast.noc_address;
 
+            // Non-posted writes (with ACK) are required here because
+            // transaction_flushed() checks NIU_MST_WRITE_REQS_OUTGOING_ID(trid),
+            // which only tracks non-posted writes.  Posted writes would cause the
+            // counter to be untracked, leading to premature buffer reuse (the
+            // sender refills the receiver buffer before the NOC finishes reading
+            // the previous payload) or a deadlocked completion path.
             noc_async_write_one_packet_with_trid<true, false>(
                 payload_start_address,
                 dest_address,
@@ -176,14 +182,42 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
                 // Store the offset for the host to know where the actual data starts
                 packet_header_in_sender_ch->unaligned_offset = alignment_offset;
 
-                noc_async_read(src_address, payload_dst_address, payload_size_bytes, noc_index);
-                noc_async_read_barrier(noc_index);
+                // Diagnostic: record the NOC read target address for debugging
+                auto* diag_map = reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(LITE_FABRIC_CONFIG_START);
+                diag_map->config.padding1[1] = static_cast<uint32_t>(src_address);
+                diag_map->config.padding1[2] = static_cast<uint32_t>(src_address >> 32);
 
-                // Tell ourselves there is data to send
-                // NOTE: sender_buffer_channel index will be incremented in send_next_data
-                host_interface->h2d.sender_host_write_index =
-                    tt::tt_fabric::wrap_increment<SENDER_NUM_BUFFERS_ARRAY[CHANNEL_INDEX]>(
-                        host_interface->h2d.sender_host_write_index);
+                noc_async_read(src_address, payload_dst_address, payload_size_bytes, noc_index);
+
+                // Timed barrier: if the NOC read doesn't complete within ~1s,
+                // skip the response to prevent a permanent firmware hang.
+                // NOC_STATUS_READ_REG is an uncached MMIO read (~100-200 cycles),
+                // so keep the iteration count low enough to fire within a few seconds.
+                bool read_completed = false;
+                {
+                    constexpr uint32_t k_MaxBarrierIters = 5000000;
+                    for (uint32_t i = 0; i < k_MaxBarrierIters; i++) {
+                        if (ncrisc_noc_reads_flushed(noc_index)) {
+                            read_completed = true;
+                            break;
+                        }
+                    }
+                    invalidate_l1_cache();
+                }
+
+                if (read_completed) {
+                    // Tell ourselves there is data to send
+                    // NOTE: sender_buffer_channel index will be incremented in send_next_data
+                    host_interface->h2d.sender_host_write_index =
+                        tt::tt_fabric::wrap_increment<SENDER_NUM_BUFFERS_ARRAY[CHANNEL_INDEX]>(
+                            host_interface->h2d.sender_host_write_index);
+                } else {
+                    // Read timed out. Resync the software counter with the hardware
+                    // so that subsequent reads don't also hang waiting for this one.
+                    noc_reads_num_issued[noc_index] = NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_RESP_RECEIVED);
+                    // Don't update sender_host_write_index — no response is sent back.
+                    // The host-side wait_for_read_event will time out and report the error.
+                }
             }
         } break;
 

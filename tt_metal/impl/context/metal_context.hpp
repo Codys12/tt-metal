@@ -143,7 +143,7 @@ private:
     MetalContext();
     ~MetalContext();
 
-    void clear_l1_state(ChipId device_id);
+    void clear_l1_state(ChipId device_id, bool skip_eth_cores = false);
     void clear_dram_state(ChipId device_id);
     void clear_launch_messages_on_eth_cores(ChipId device_id);
     void construct_control_plane(const std::filesystem::path& mesh_graph_desc_path);

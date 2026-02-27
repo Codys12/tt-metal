@@ -414,6 +414,68 @@ void Cluster::get_metal_desc_from_tt_desc() {
     }
 }
 
+void Cluster::refresh_soc_desc_for_chip(ChipId chip_id) {
+    // Replace the metal-layer SoC descriptor with the current UMD SoC descriptor.
+    // This is needed after upgrade_remote_bh_chip_info() replaces the proxy descriptor
+    // (which had the gateway chip's harvesting masks) with the real one (from the
+    // remote chip's ARC telemetry).  Without this refresh, coordinate translations
+    // target physical rows based on the gateway's harvesting, which may differ from
+    // the remote chip's actual harvesting, causing NOC writes to non-existent cores.
+    //
+    // The UMD SoC descriptor created after lite fabric upgrade (SocDescriptor(arch, chip_info))
+    // does not set device_descriptor_file_path because it was constructed without a YAML file.
+    // But metal_SocDescriptor's constructor calls load_dram_metadata_from_device_descriptor()
+    // which needs this path.  Preserve the path from the existing descriptor and patch the
+    // UMD copy before constructing the metal descriptor.
+    auto old_desc_file_path = this->sdesc_per_chip_.at(chip_id).device_descriptor_file_path;
+    this->sdesc_per_chip_.erase(chip_id);
+
+    tt::umd::SocDescriptor umd_desc_copy(this->driver_->get_soc_descriptor(chip_id));
+    if (umd_desc_copy.device_descriptor_file_path.empty()) {
+        umd_desc_copy.device_descriptor_file_path = old_desc_file_path;
+    }
+    this->sdesc_per_chip_.emplace(
+        chip_id, metal_SocDescriptor(umd_desc_copy, this->cluster_desc_->get_board_type(chip_id)));
+
+    // Refresh the virtual coordinate caches used by the watcher for this chip.
+    this->virtual_worker_cores_[chip_id].clear();
+    for (const tt::umd::CoreCoord& core : get_soc_desc(chip_id).get_cores(CoreType::TENSIX, CoordSystem::TRANSLATED)) {
+        this->virtual_worker_cores_[chip_id].insert({core.x, core.y});
+    }
+    this->virtual_eth_cores_[chip_id].clear();
+    for (const tt::umd::CoreCoord& core : get_soc_desc(chip_id).get_cores(CoreType::ETH, CoordSystem::TRANSLATED)) {
+        this->virtual_eth_cores_[chip_id].insert({core.x, core.y});
+    }
+    this->virtual_pcie_cores_[chip_id].clear();
+    this->virtual_dram_cores_[chip_id].clear();
+    if (this->arch_ == ARCH::BLACKHOLE) {
+        for (const tt::umd::CoreCoord& core :
+             get_soc_desc(chip_id).get_cores(CoreType::PCIE, CoordSystem::TRANSLATED)) {
+            this->virtual_pcie_cores_[chip_id].insert({core.x, core.y});
+        }
+        for (uint32_t noc = 0; noc < hal_.get_num_nocs(); noc++) {
+            for (auto dram_channel = 0; dram_channel < this->get_soc_desc(chip_id).get_num_dram_views();
+                 dram_channel++) {
+                auto worker_dram_ep =
+                    this->get_soc_desc(chip_id).get_preferred_worker_core_for_dram_view(dram_channel, noc);
+                auto eth_dram_ep = this->get_soc_desc(chip_id).get_preferred_eth_core_for_dram_view(dram_channel, noc);
+                this->virtual_dram_cores_[chip_id].insert({worker_dram_ep.x, worker_dram_ep.y});
+                if (worker_dram_ep != eth_dram_ep) {
+                    this->virtual_dram_cores_[chip_id].insert({eth_dram_ep.x, eth_dram_ep.y});
+                }
+            }
+        }
+    }
+
+    log_info(
+        tt::LogMetal,
+        "Refreshed SoC descriptor for chip {}: tensix_harvest={:#x}, grid={}x{}",
+        chip_id,
+        get_soc_desc(chip_id).harvesting_masks.tensix_harvesting_mask,
+        get_soc_desc(chip_id).get_grid_size(CoreType::TENSIX).x,
+        get_soc_desc(chip_id).get_grid_size(CoreType::TENSIX).y);
+}
+
 const std::unordered_map<CoreCoord, int32_t>& Cluster::get_virtual_routing_to_profiler_flat_id(ChipId chip_id) const {
     return this->virtual_routing_to_profiler_flat_id_.at(this->get_board_type(chip_id));
 }

@@ -1364,8 +1364,12 @@ namespace {
  * @return The maximum number of local Ethernet connections per direction between any two ASICs.
  */
 std::uint32_t get_num_connections_per_direction(const tt::tt_metal::PhysicalSystemDescriptor& psd) {
-    // Check the number of connections per direction for each asic
-    std::uint32_t num_connections_per_direction = 1;  // Default to 1 connection per direction
+    // Check the number of connections per direction for each asic.
+    // Use the minimum across all neighbor pairs so the generated MGD reflects
+    // the worst-case physical connectivity.  This allows the system to proceed
+    // when some ETH links are still being brought up (e.g. during lite fabric
+    // initialization on remote cores).
+    std::uint32_t num_connections_per_direction = std::numeric_limits<std::uint32_t>::max();
     const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
     for (const auto& [asic_id, asic_descriptor] : psd.get_asic_descriptors()) {
         auto neighbors = psd.get_asic_neighbors(asic_id);
@@ -1385,8 +1389,14 @@ std::uint32_t get_num_connections_per_direction(const tt::tt_metal::PhysicalSyst
                     num_local_connections++;
                 }
             }
-            num_connections_per_direction = std::max(num_connections_per_direction, num_local_connections);
+            if (num_local_connections > 0) {
+                num_connections_per_direction = std::min(num_connections_per_direction, num_local_connections);
+            }
         }
+    }
+    // If no local connections were found at all, default to 1
+    if (num_connections_per_direction == std::numeric_limits<std::uint32_t>::max()) {
+        num_connections_per_direction = 1;
     }
     return num_connections_per_direction;
 }

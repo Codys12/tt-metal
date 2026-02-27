@@ -88,6 +88,15 @@ public:
     // entries after lite fabric is running.  See umd::Cluster::upgrade_remote_bh_chip_info().
     void upgrade_remote_bh_chip_info(ChipId device_id) const { this->driver_->upgrade_remote_bh_chip_info(device_id); }
 
+    // Refresh the metal-layer SoC descriptor and virtual coordinate caches for a chip.
+    // Must be called after upgrade_remote_bh_chip_info() so that the UMD SoC descriptor
+    // (with real harvesting masks) propagates to the metal layer's sdesc_per_chip_ map
+    // and the watcher's coordinate validation sets.  Without this, coordinate translations
+    // use the stale proxy descriptor (borrowed from the gateway chip) which may have
+    // different harvesting, causing writes to target non-existent physical rows on the
+    // remote chip and hanging the NOC.
+    void refresh_soc_desc_for_chip(ChipId chip_id);
+
     size_t number_of_pci_devices() const { return this->driver_->get_target_mmio_device_ids().size(); }
 
     std::set<ChipId> all_pci_chip_ids() const { return this->driver_->get_target_mmio_device_ids(); }
