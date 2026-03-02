@@ -96,8 +96,11 @@ public:
     void write_routing_tables_to_all_chips() const;
     void write_fabric_telemetry_to_all_chips(const FabricNodeId& fabric_node_id) const;
 
-    // Return mesh_id, chip_id from physical chip id
+    // Return mesh_id, chip_id from physical chip id (optional version returns nullopt if not mapped)
+    std::optional<FabricNodeId> find_fabric_node_id_from_physical_chip_id(ChipId physical_chip_id) const;
     FabricNodeId get_fabric_node_id_from_physical_chip_id(ChipId physical_chip_id) const;
+    // Check if a physical chip is part of the fabric mesh
+    bool is_chip_mapped(ChipId physical_chip_id) const;
     // Return physical chip id from fabric node id
     ChipId get_physical_chip_id_from_fabric_node_id(const FabricNodeId& fabric_node_id) const;
     // Return fabric node id from ASIC id

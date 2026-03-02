@@ -90,9 +90,11 @@ inline void wait_subordinate_eriscs() {
     WAYPOINT("SEW");
     do {
         invalidate_l1_cache();
-        // If the subordinate is using dynamic NOC mode, it may use NOC0 but we don't need to sync the counters
-        // as they are in a shared L1 region with base firmware
-        internal_::risc_context_switch(kg_noc_mode == DM_DYNAMIC_NOC);
+        // Skip NOC sync — ERISC0 has no pending NOC operations while waiting
+        // for subordinate, and other entities sharing NOC0 (e.g. ERISC1 lite
+        // fabric receiver) can increment HW counters asynchronously, causing
+        // ncrisc_noc_full_sync to hang on counter mismatch.
+        internal_::risc_context_switch(true);
     } while (mailboxes->subordinate_sync.all != RUN_SYNC_MSG_ALL_SUBORDINATES_DONE);
     WAYPOINT("SED");
 #endif
@@ -209,8 +211,14 @@ int __attribute__((noinline)) main(void) {
     risc_init();
 
 #if defined(ENABLE_2_ERISC_MODE)
+    // On remote devices behind lite fabric, the host sets ncrisc_halt.resume_addr
+    // to a non-zero value before boot to signal that the 2-erisc dance should be
+    // skipped (ERISC1 runs the lite fabric relay, not Metal's subordinate).
+    bool skip_2erisc_dance = (mailboxes->ncrisc_halt.resume_addr != 0);
     mailboxes->subordinate_sync.all = RUN_SYNC_MSG_ALL_SUBORDINATES_DONE;
-    mailboxes->subordinate_sync.dm1 = RUN_SYNC_MSG_INIT;
+    if (!skip_2erisc_dance) {
+        mailboxes->subordinate_sync.dm1 = RUN_SYNC_MSG_INIT;
+    }
 
     // ERISC firmware >= 1.7.2 has already done this step. But on older firmware versions we need to do it here
     // and it will write to an "unused" region in base firmware.
@@ -225,17 +233,36 @@ int __attribute__((noinline)) main(void) {
         noc_local_state_init(n);
     }
     uint8_t prev_noc_mode = DM_DEDICATED_NOC;
+#if defined(ENABLE_2_ERISC_MODE)
+    if (skip_2erisc_dance) {
+        // ERISC0 is booting fresh while ERISC1 is already running lite fabric.
+        // ERISC1's NOC0 operations have incremented HW counters beyond our
+        // freshly initialized SW counters. Re-sync to prevent hang.
+        ncrisc_noc_counters_init();
+    }
+#endif
     ncrisc_noc_full_sync();
 
 #if defined(ENABLE_2_ERISC_MODE)
-    deassert_all_reset();
+    if (!skip_2erisc_dance) {
+        deassert_all_reset();
 
-    WRITE_REG(AERISC_RESET_PC, (uint32_t)(void*)resume_from_reset);
-    enter_reset();
+        WRITE_REG(AERISC_RESET_PC, (uint32_t)(void*)resume_from_reset);
+        enter_reset();
+        // After resuming from reset, re-initialize NOC counters. Other entities
+        // sharing the NOC (e.g. ERISC1 lite fabric receiver using NOC0) may have
+        // done NOC operations while we were in reset, incrementing HW counters
+        // beyond our saved SW values. Without this, ncrisc_noc_full_sync() hangs.
+        ncrisc_noc_counters_init();
+    }
 #endif
     wait_subordinate_eriscs();
     flag_disable[0] = 1;
-    mailboxes->go_messages[0].signal = RUN_MSG_DONE;
+    // Preserve a pending go signal written by host before ERISC0 was deasserted
+    // (MMIO fabric router case: configure_fabric writes go before ERISC0 boots).
+    if (mailboxes->go_messages[0].signal != RUN_MSG_GO) {
+        mailboxes->go_messages[0].signal = RUN_MSG_DONE;
+    }
     mailboxes->launch_msg_rd_ptr = 0;  // Initialize the rdptr to 0
 
     // Add an invalidate before the first read of mailboxes->go_messages[0].signal
@@ -270,7 +297,11 @@ int __attribute__((noinline)) main(void) {
                     internal_::notify_dispatch_core_done(dispatch_addr);
                 }
             } else {
-                internal_::risc_context_switch();
+                // Skip NOC sync — ERISC0 has no pending NOC operations in the
+                // go-wait loop, and other entities sharing NOC0 (e.g. ERISC1
+                // lite fabric receiver) can increment HW counters asynchronously,
+                // causing ncrisc_noc_full_sync to hang on counter mismatch.
+                internal_::risc_context_switch(true);
             }
         }
         WAYPOINT("GD");

@@ -26,6 +26,25 @@ tt::tt_metal::DispatchCoreConfig dispatch_core_config() {
 tt_cxy_pair dispatch_core(uint8_t cq_id) {
     tt_cxy_pair dispatch_core = tt_cxy_pair(0, 0, 0);
     std::optional<tt_cxy_pair> first_dispatch_core = std::nullopt;
+
+    // Check if any remote (non-MMIO) devices have dispatch_d cores allocated.
+    // When remote devices run distributed dispatch, the MMIO dispatcher_core and remote
+    // dispatcher_d_core are at different logical positions (different allocation order).
+    // In this case, skip MMIO devices — same pattern as TG galaxy clusters where MMIO
+    // devices are gateways and only remote device dispatch positions matter.
+    bool has_remote_dispatch = false;
+    for (tt::ChipId device_id : tt::tt_metal::MetalContext::instance().get_cluster().all_chip_ids()) {
+        if (tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device_id) != device_id) {
+            uint16_t channel =
+                tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device_id);
+            if (tt::tt_metal::MetalContext::instance().get_dispatch_core_manager().is_dispatcher_d_core_allocated(
+                    device_id, channel, cq_id)) {
+                has_remote_dispatch = true;
+                break;
+            }
+        }
+    }
+
     for (tt::ChipId device_id : tt::tt_metal::MetalContext::instance().get_cluster().all_chip_ids()) {
         uint16_t channel =
             tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device_id);
@@ -34,10 +53,12 @@ tt_cxy_pair dispatch_core(uint8_t cq_id) {
             // On TG, local dispatch cores are allocated on MMIO devices, but are not used
             // since programs are not run on these devices. The placement of these cores is
             // irrelevant for the runtime layer, since these are not used. Hence, these are
-            // skipped.
+            // skipped. Similarly, when remote devices have distributed dispatch, MMIO devices
+            // act as gateways and their dispatch core position differs from the remote
+            // dispatcher_d position.
             if (not tt::tt_metal::MetalContext::instance().get_dispatch_core_manager().is_dispatcher_core_allocated(
                     device_id, channel, cq_id) or
-                tt::tt_metal::MetalContext::instance().get_cluster().is_galaxy_cluster()) {
+                tt::tt_metal::MetalContext::instance().get_cluster().is_galaxy_cluster() or has_remote_dispatch) {
                 continue;
             }
             dispatch_core = tt::tt_metal::MetalContext::instance().get_dispatch_core_manager().dispatcher_core(
@@ -53,14 +74,18 @@ tt_cxy_pair dispatch_core(uint8_t cq_id) {
         }
         if (not first_dispatch_core.has_value()) {
             first_dispatch_core = dispatch_core;
-        } else {
-            TT_FATAL(
-                dispatch_core.x == first_dispatch_core.value().x and dispatch_core.y == first_dispatch_core.value().y,
-                "Expected the Dispatch Cores to be consistent across physical devices");
+        } else if (
+            dispatch_core.x != first_dispatch_core.value().x or dispatch_core.y != first_dispatch_core.value().y) {
+            // In systems with asymmetric remote devices (e.g., BH lite fabric with
+            // multiple gateway paths), dispatch_d cores may be at different logical
+            // positions because different ETH cores are active on each device.
+            // Use the first found position — the caller converts to per-device
+            // virtual coordinates via virtual_core_from_logical_core.
+            continue;
         }
     }
     TT_FATAL(first_dispatch_core.has_value(), "Could not find the dispatch core for {}", cq_id);
-    return dispatch_core;
+    return first_dispatch_core.value();
 }
 
 template <typename F>

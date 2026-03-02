@@ -425,41 +425,51 @@ void MetalContext::initialize(
                     log_info(tt::LogMetal, "  remote device {} (gateway mmio={})", id, gateway);
                 }
 
-                // Build per-remote-chip set of MMIO-side ETH channels, keyed by (connected_id, mmio_id)
-                std::map<ChipId, std::set<uint32_t>> remote_chip_eth_channels;
-                std::map<ChipId, ChipId> remote_chip_tunnel_mmio;  // which MMIO chip has the tunnel
+                // Build per-remote-chip, per-mmio-chip set of MMIO-side ETH channels.
+                // A remote chip may have tunnels from multiple MMIO chips; we only use
+                // the channels from the MMIO chip that matches UMD's gateway for that
+                // remote chip.
+                // Key: (connected_id, mmio_id) -> set of ETH channel Y-coordinates
+                std::map<std::pair<ChipId, ChipId>, std::set<uint32_t>> remote_chip_eth_channels;
                 for (const auto& tunnel : tunnels) {
-                    remote_chip_eth_channels[tunnel.connected_id].insert(tunnel.mmio_core_logical.y);
-                    remote_chip_tunnel_mmio[tunnel.connected_id] = tunnel.mmio_id;
+                    remote_chip_eth_channels[{tunnel.connected_id, tunnel.mmio_id}].insert(tunnel.mmio_core_logical.y);
                 }
 
                 std::set<ChipId> reachable_remote_devices;
-                for (const auto& [chip_id, channels] : remote_chip_eth_channels) {
-                    if (!remote_devices.count(chip_id)) {
-                        log_info(tt::LogMetal, "  skip chip {} (not in remote_devices)", chip_id);
+                for (ChipId chip_id : remote_devices) {
+                    auto gateway = cluster_->get_cluster_desc()->get_closest_mmio_capable_chip(chip_id);
+                    auto key = std::make_pair(chip_id, gateway);
+                    auto it = remote_chip_eth_channels.find(key);
+
+                    if (it == remote_chip_eth_channels.end()) {
+                        // No tunnels from the matching MMIO chip for this remote device.
+                        // Log which MMIO chips DO have tunnels (if any) for diagnostics.
+                        std::vector<ChipId> other_mmios;
+                        for (const auto& [k, v] : remote_chip_eth_channels) {
+                            if (k.first == chip_id) {
+                                other_mmios.push_back(k.second);
+                            }
+                        }
+                        if (other_mmios.empty()) {
+                            log_warning(tt::LogMetal, "  chip {}: no lite fabric tunnels found, skipping", chip_id);
+                        } else {
+                            log_warning(
+                                tt::LogMetal,
+                                "  chip {}: UMD gateway={} but tunnels only from mmio=[{}], skipping",
+                                chip_id,
+                                gateway,
+                                fmt::join(other_mmios, ", "));
+                        }
                         continue;
                     }
 
-                    auto gateway = cluster_->get_cluster_desc()->get_closest_mmio_capable_chip(chip_id);
-                    auto tunnel_mmio = remote_chip_tunnel_mmio[chip_id];
+                    const auto& channels = it->second;
                     log_info(
                         tt::LogMetal,
-                        "  chip {}: UMD gateway={}, tunnel mmio={}, channels=[{}]",
+                        "  chip {}: UMD gateway={}, channels=[{}]",
                         chip_id,
                         gateway,
-                        tunnel_mmio,
                         fmt::join(channels, ", "));
-
-                    if (gateway != tunnel_mmio) {
-                        log_warning(
-                            tt::LogMetal,
-                            "  chip {}: MISMATCH - UMD gateway {} != tunnel mmio {}. "
-                            "Reads would go through wrong MMIO chip. Skipping.",
-                            chip_id,
-                            gateway,
-                            tunnel_mmio);
-                        continue;
-                    }
 
                     reachable_remote_devices.insert(chip_id);
 
@@ -505,6 +515,9 @@ void MetalContext::initialize(
                     cluster_->refresh_soc_desc_for_chip(id);
                     log_info(tt::LogMetal, "Phase 2b: upgrade complete for device {}", id);
                 }
+                // SOC descriptors changed — channel-to-logical-core mappings may differ.
+                // Refresh the routing info so it uses the correct logical coordinates.
+                cluster_->refresh_remote_ethernet_routing_info();
             }
 
             // Phase 3: FW builds, device init, resets, and FW launch for remote chips
@@ -538,6 +551,21 @@ void MetalContext::initialize(
                     log_info(tt::LogMetal, "launch_fw device {} (remote): complete", device_id);
                 }
                 log_info(tt::LogMetal, "Phase 3: remote FW launch complete");
+            }
+
+            // Phase 3b: Ensure build environments exist for unreachable remote
+            // devices.  These chips were skipped in Phase 3 because their lite
+            // fabric tunnels failed, but the DeviceManager will still create
+            // Device objects for them (fabric requires all devices to be
+            // active), and fabric compilation needs build environments.
+            for (ChipId id : all_devices) {
+                if (initial_devices.count(id) || remote_devices.count(id)) {
+                    continue;  // Already initialized in Phase 1 or 3
+                }
+                log_info(tt::LogMetal, "Phase 3b: adding build env for unreachable device {}", id);
+                generate_device_bank_to_noc_tables(id);
+                generate_worker_logical_to_virtual_map(id);
+                BuildEnvManager::get_instance().add_build_env(id, num_hw_cqs_);
             }
         } else {
             launch_fw_for_devices(initial_devices);
@@ -580,14 +608,15 @@ void MetalContext::teardown() {
         }
     }
 
-    // Terminate lite fabric (stops ERISC1 on MMIO chip) before resetting ETH cores
+    // Set internal routing to false to exit active ethernet FW & go back to base FW
+    // Must happen before lite fabric termination since writes to remote ETH cores go through lite fabric
+    cluster_->set_internal_routing_info_for_ethernet_cores(false);
+
+    // Terminate lite fabric (stops ERISC1 on MMIO chip) after routing info is cleared on remote devices
     if (lite_fabric_hal_) {
         lite_fabric_hal_->terminate();
         lite_fabric_hal_.reset();
     }
-
-    // Set internal routing to false to exit active ethernet FW & go back to base FW
-    cluster_->set_internal_routing_info_for_ethernet_cores(false);
 
     if (data_collector_) {
         data_collector_->DumpData();
@@ -974,14 +1003,75 @@ void MetalContext::initialize_fabric_config() {
         return;
     }
 
+    log_info(tt::LogMetal, "DEBUG: initialize_fabric_config: configuring eth cores for fabric routers");
     this->cluster_->configure_ethernet_cores_for_fabric_routers(
         this->fabric_config_, this->num_fabric_active_routing_planes_);
+    log_info(tt::LogMetal, "DEBUG: initialize_fabric_config: getting control plane");
     auto& control_plane = this->get_control_plane();
+    log_info(tt::LogMetal, "DEBUG: initialize_fabric_config: control plane created");
     if (tt::tt_fabric::is_tt_fabric_config(this->fabric_config_)) {
+        log_info(tt::LogMetal, "DEBUG: initialize_fabric_config: initializing fabric context");
         control_plane.initialize_fabric_context(this->fabric_config_);
     }
+    log_info(tt::LogMetal, "DEBUG: initialize_fabric_config: configuring routing tables");
     control_plane.configure_routing_tables_for_fabric_ethernet_channels(
         this->fabric_config_, this->fabric_reliability_mode_);
+    log_info(tt::LogMetal, "DEBUG: initialize_fabric_config: done");
+}
+
+void MetalContext::update_lite_fabric_bindings_for_fabric_routers() {
+    if (!lite_fabric_hal_) {
+        return;
+    }
+
+    const auto& tunnels = lite_fabric_hal_->get_system_descriptor().tunnels_from_mmio;
+    if (tunnels.empty()) {
+        return;
+    }
+
+    // Group remaining (non-fabric-router) channels by remote chip.
+    // Exclude channels on the MMIO side that are now reserved for fabric routing,
+    // since the fabric router firmware will overwrite the lite fabric relay on those cores.
+    std::map<ChipId, std::set<uint32_t>> remaining_channels_per_remote;
+    std::set<ChipId> all_remote_chips;
+    for (const auto& t : tunnels) {
+        all_remote_chips.insert(t.connected_id);
+        const auto& routing_info = cluster_->get_eth_routing_info(t.mmio_id);
+        auto it = routing_info.find(t.mmio_core_logical);
+        if (it != routing_info.end() && it->second == EthRouterMode::FABRIC_ROUTER) {
+            log_info(
+                tt::LogMetal,
+                "Excluding lite fabric channel y={} (mmio={}, core={}) from UMD binding - reserved for fabric router",
+                t.mmio_core_logical.y,
+                t.mmio_id,
+                t.mmio_core_logical.str());
+            continue;
+        }
+        remaining_channels_per_remote[t.connected_id].insert(t.mmio_core_logical.y);
+    }
+
+    for (auto chip_id : all_remote_chips) {
+        auto it = remaining_channels_per_remote.find(chip_id);
+        if (it == remaining_channels_per_remote.end() || it->second.empty()) {
+            // All channels for this remote chip are fabric routers.
+            // Clear UMD bindings so wait_for_non_mmio_flush returns immediately
+            // (no lite fabric relay is running, and all future data movement goes
+            // through the fabric).
+            log_warning(
+                tt::LogMetal,
+                "Remote device {} has no remaining lite fabric channels after fabric router reservation - "
+                "clearing UMD bindings (l1_membar/dram_membar will be no-ops)",
+                chip_id);
+            cluster_->get_driver()->get_remote_chip(chip_id)->set_remote_transfer_ethernet_cores(std::set<uint32_t>{});
+            continue;
+        }
+        cluster_->get_driver()->get_remote_chip(chip_id)->set_remote_transfer_ethernet_cores(it->second);
+        log_info(
+            tt::LogMetal,
+            "Updated UMD binding for remote device {}: lite fabric channels=[{}]",
+            chip_id,
+            fmt::join(it->second, ", "));
+    }
 }
 
 void MetalContext::initialize_fabric_tensix_datamover_config() {
@@ -1383,7 +1473,8 @@ void MetalContext::initialize_firmware(
     const HalProgrammableCoreType& core_type,
     CoreCoord virtual_core,
     dev_msgs::launch_msg_t::View launch_msg,
-    dev_msgs::go_msg_t::ConstView go_msg) {
+    dev_msgs::go_msg_t::ConstView go_msg,
+    bool assert_reset) {
     ZoneScoped;
 
     initialize_device_bank_to_noc_tables(device_id, core_type, virtual_core);
@@ -1496,16 +1587,36 @@ void MetalContext::initialize_firmware(
         case HalProgrammableCoreType::ACTIVE_ETH:
         case HalProgrammableCoreType::IDLE_ETH: {
             if (!has_flag(MetalContext::instance().get_fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
+                log_info(
+                    tt::LogMetal,
+                    "Device {} init_fw ETH {}: INIT_FABRIC not set, skipping",
+                    device_id,
+                    virtual_core.str());
                 break;
             }
             const bool is_idle_eth = core_type == HalProgrammableCoreType::IDLE_ETH;
             const bool is_active_eth = !is_idle_eth;
+            log_info(
+                tt::LogMetal,
+                "Device {} init_fw ETH {}: is_active={}, assert_reset={}, cooperative={}, 2erisc={}",
+                device_id,
+                virtual_core.str(),
+                is_active_eth,
+                assert_reset,
+                hal_->get_eth_fw_is_cooperative(),
+                rtoptions_.get_enable_2_erisc_mode());
             tt::umd::RiscType reset_val = tt::umd::RiscType::ALL_TENSIX;
             if (is_active_eth) {
                 // On active eth, don't assert ERISC0, which is running base firmware.
                 reset_val &= ~tt::umd::RiscType::ERISC0;
             }
-            if (is_idle_eth or !hal_->get_eth_fw_is_cooperative()) {
+            if (assert_reset && (is_idle_eth or !hal_->get_eth_fw_is_cooperative())) {
+                log_info(
+                    tt::LogMetal,
+                    "Device {} init_fw ETH {}: asserting reset (reset_val=0x{:x})",
+                    device_id,
+                    virtual_core.str(),
+                    static_cast<uint64_t>(reset_val));
                 cluster_->assert_risc_reset_at_core(tt_cxy_pair(device_id, virtual_core), reset_val);
             }
             if (not rtoptions_.get_skip_loading_fw()) {
@@ -1554,6 +1665,13 @@ void MetalContext::initialize_firmware(
             if (hal_->get_eth_fw_is_cooperative() || core_type != HalProgrammableCoreType::ACTIVE_ETH ||
                 !rtoptions_.get_enable_2_erisc_mode()) {
                 // PC
+                log_info(
+                    tt::LogMetal,
+                    "Device {} init_fw ETH {}: writing PC directly (fw_launch_addr={:#x}, fw_launch_addr_value={:#x})",
+                    device_id,
+                    virtual_core.str(),
+                    jit_build_config.fw_launch_addr,
+                    jit_build_config.fw_launch_addr_value);
                 cluster_->write_core(
                     &jit_build_config.fw_launch_addr_value,
                     sizeof(uint32_t),
@@ -1563,6 +1681,12 @@ void MetalContext::initialize_firmware(
                 // Active ethernet firmware launched immediately. Set the enable flag to 1 so FW doesn't exit
                 // immediately.
                 // Wait for ack not required because we wait for the done message
+                log_info(
+                    tt::LogMetal,
+                    "Device {} init_fw ETH {}: sending ETH_MSG_RELEASE_CORE via mailbox (fw_launch_addr_value={:#x})",
+                    device_id,
+                    virtual_core.str(),
+                    jit_build_config.fw_launch_addr_value);
                 constexpr uint32_t mailbox_index = 0;
                 tt::llrt::internal_::send_msg_to_eth_mailbox(
                     device_id,
@@ -1571,6 +1695,8 @@ void MetalContext::initialize_firmware(
                     mailbox_index,
                     {/*l1 addr to exec*/ jit_build_config.fw_launch_addr_value},
                     false);
+                log_info(
+                    tt::LogMetal, "Device {} init_fw ETH {}: ETH_MSG_RELEASE_CORE sent", device_id, virtual_core.str());
             }
 
             break;
@@ -1744,6 +1870,246 @@ dev_msgs::core_info_msg_t MetalContext::populate_core_info_msg(
     core_info.worker_grid_size_y() = logical_grid_size.y;
 
     return buffer;
+}
+
+void MetalContext::initialize_remote_eth_cores_for_fabric(
+    ChipId device_id, const std::vector<CoreCoord>& logical_eth_cores) {
+    if (logical_eth_cores.empty()) {
+        return;
+    }
+
+    log_info(
+        tt::LogMetal,
+        "Device {} init remote ETH: initializing {} ETH core(s) for fabric",
+        device_id,
+        logical_eth_cores.size());
+
+    auto core_type = HalProgrammableCoreType::ACTIVE_ETH;
+    auto core_info = populate_core_info_msg(device_id, core_type);
+    auto dev_msgs_factory = hal_->get_dev_msgs_factory(core_type);
+    auto launch_msg = dev_msgs_factory.create<dev_msgs::launch_msg_t>();
+    auto go_msg = dev_msgs_factory.create<dev_msgs::go_msg_t>();
+    go_msg.view().signal() = dev_msgs::RUN_MSG_INIT;
+
+    static std::vector<uint32_t> zero_vec_erisc_init(
+        hal_->get_dev_size(core_type, HalL1MemAddrType::APP_SYNC_INFO) / sizeof(uint32_t), 0);
+
+    // Soft reset register values for BH ETH tiles.  Bits 13, 14, 18 control
+    // internal ETH tile subsystems and must always remain set.
+    // Bit 11 = ERISC0 reset, bit 12 = ERISC1 reset.
+    // These values match the lite fabric FW (risc_interface.hpp).
+    constexpr uint32_t SOFT_RESET_REG_ADDR = 0xFFB121B0;
+    // Use the same assert/deassert values as the MMIO subordinate_erisc:
+    //   assert  = RISCV_SOFT_RESET_0_BRISC (0x00800) — only bit 11 (ERISC0 in reset)
+    //   deassert = RISCV_SOFT_RESET_0_NONE  (0x00000) — all cores running
+    // The previous values (0x46800 / 0x46000) also set bits 13, 14, 18 (TRISC/NCRISC
+    // positions).  When ERISC0's firmware clears all reset bits via deassert_all_reset()
+    // and then the host re-asserts with 0x46800, the 0→1 transition on bits 13/14/18
+    // resets the AERISC_RESET_PC debug register, causing ERISC0 to boot from 0x0
+    // (trampoline) instead of resume_from_reset and re-enter the spin loop permanently.
+    constexpr uint32_t SOFT_RESET_ERISC0_RUNNING = 0x00000;  // all out of reset
+    constexpr uint32_t AERISC_RESET_PC_ADDR = 0xFFB14000;    // debug reg: ERISC0 boot PC
+
+    for (const auto& logical_core : logical_eth_cores) {
+        CoreCoord virtual_core =
+            cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, logical_core, CoreType::ETH);
+
+        // Look up the MMIO-side ETH core that connects to this remote core.
+        // write_remote_eth_debug_reg needs the sender's NOC0 coordinates.
+        auto [mmio_chip, mmio_logical] = cluster_->get_connected_ethernet_core({device_id, logical_core});
+        CoreCoord mmio_virtual =
+            cluster_->get_virtual_coordinate_from_logical_coordinates(mmio_chip, mmio_logical, CoreType::ETH);
+        tt_xy_pair sender_noc0(mmio_virtual.x, mmio_virtual.y);
+
+        log_info(
+            tt::LogMetal,
+            "Device {} init remote ETH: core {} (virtual {}) via MMIO chip {} core {}",
+            device_id,
+            logical_core.str(),
+            virtual_core.str(),
+            mmio_chip,
+            mmio_virtual.str());
+
+        // Clear erisc app sync info
+        cluster_->write_core(
+            zero_vec_erisc_init.data(),
+            zero_vec_erisc_init.size() * sizeof(uint32_t),
+            tt_cxy_pair(device_id, virtual_core),
+            hal_->get_dev_addr(core_type, HalL1MemAddrType::APP_SYNC_INFO));
+
+        // Write core info
+        core_info.view().absolute_logical_x() = logical_core.x;
+        core_info.view().absolute_logical_y() = logical_core.y;
+        cluster_->write_core_immediate(
+            core_info.data(),
+            core_info.size(),
+            {static_cast<size_t>(device_id), virtual_core},
+            hal_->get_dev_addr(llrt::get_core_type(device_id, virtual_core), HalL1MemAddrType::CORE_INFO));
+
+        // On remote BH devices behind lite fabric, ERISC0 is held in POR
+        // reset — syseng base FW was never loaded or run.  The standard
+        // ETH_MSG_RELEASE_CORE mechanism (used on MMIO devices) therefore
+        // does not work.
+        //
+        // Instead we load Metal's FW binaries and messages into L1 while
+        // ERISC0 is in reset, write the boot PC to AERISC_RESET_PC, and
+        // deassert ERISC0 via the soft reset register so it boots directly
+        // into Metal's active erisc FW.
+        //
+        // Debug registers (0xFFBxxxxx) including the soft reset register
+        // are NOT reachable via NOC unicast writes on remote devices.
+        // Use write_remote_eth_debug_reg which sends a WRITE_REG command
+        // through the lite fabric relay's eth_write_remote_reg() path.
+
+        // 1. ERISC0 is already held in reset by the lite fabric setup
+        //    (deassert_connected_dm1_reset wrote 0x46800: bit 11 set = ERISC0
+        //    in reset, bit 12 clear = ERISC1 running the lite fabric receiver).
+        //    Do NOT send an assert WRITE_REG here — the lite fabric sender has
+        //    limited receiver buffer slots (RECEIVER_NUM_BUFFERS), and each
+        //    WRITE_REG forwarded to the dead receiver consumes one slot permanently.
+        //    We need to conserve slots for the deassert and 2-erisc dance WRITE_REGs.
+
+        // 2. Clear the syseng FW mailbox so that send_msg_to_eth_mailbox
+        //    (called inside initialize_firmware) doesn't timeout on the
+        //    residual POR/CALL marker.
+        {
+            constexpr uint32_t mailbox_index = 0;
+            auto mailbox_addr = hal_->get_eth_fw_mailbox_address(mailbox_index);
+            uint32_t zero = 0;
+            cluster_->write_core(&zero, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), mailbox_addr);
+        }
+
+        // 3. Load FW binaries and write go/launch messages via initialize_firmware.
+        //    Pass assert_reset=false since we already set the soft reset state.
+        initialize_firmware(
+            device_id, core_type, virtual_core, launch_msg.view(), go_msg.view(), /*assert_reset=*/false);
+
+        // 3b. Populate the syseng base FW API table at MEM_SYSENG_ETH_API_TABLE
+        //     (0x7CF00) with a no-op stub.  The active erisc FW calls
+        //     service_eth_msg() on every main-loop iteration, which reads a
+        //     function pointer from this table and calls it.  On MMIO devices
+        //     the syseng base FW initializes the table; on remote devices
+        //     behind lite fabric the base FW was never loaded, so the table
+        //     contains zeros/garbage.  Calling a NULL pointer crashes ERISC0.
+        //     Fix: write a RISC-V `ret` instruction at 0x7CF10 (right after
+        //     the API table) and point all entries there.  Do NOT use L1[0xC]
+        //     — that address is MEM_L1_BARRIER and gets overwritten with 0
+        //     by l1_barrier(), destroying the ret and crashing service_eth_msg.
+        {
+            constexpr uint32_t API_TABLE_ADDR = 0x7CF00;  // MEM_SYSENG_ETH_API_TABLE
+            constexpr uint32_t API_TABLE_ENTRIES = 4;     // send, service, link_status, dynamic_noc
+            constexpr uint32_t RET_STUB_ADDR = API_TABLE_ADDR + API_TABLE_ENTRIES * sizeof(uint32_t);  // 0x7CF10
+            constexpr uint32_t RISCV_RET_INSN = 0x00008067;  // jalr x0, ra, 0  (ret)
+            // Write ret instruction right after the API table
+            uint32_t ret_insn = RISCV_RET_INSN;
+            cluster_->write_core(&ret_insn, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), RET_STUB_ADDR);
+            uint32_t api_table[API_TABLE_ENTRIES];
+            for (uint32_t i = 0; i < API_TABLE_ENTRIES; i++) {
+                api_table[i] = RET_STUB_ADDR;
+            }
+            cluster_->write_core(api_table, sizeof(api_table), tt_cxy_pair(device_id, virtual_core), API_TABLE_ADDR);
+            log_info(
+                tt::LogMetal,
+                "Device {} init remote ETH: wrote syseng API table stubs at {:#x} -> ret@{:#x} on core {}",
+                device_id,
+                API_TABLE_ADDR,
+                RET_STUB_ADDR,
+                virtual_core.str());
+        }
+
+        // 4. Write a boot trampoline at L1 address 0x0 that initializes SP
+        //    then jumps to the FW entry point.  ERISC0 boots from the
+        //    address in AERISC_RESET_PC after soft reset deassert.  On MMIO
+        //    devices, syseng FW has
+        //    already initialized SP, but on remote devices behind lite fabric,
+        //    ERISC0 was never running (POR state) so SP is uninitialized.
+        //    The FW entry starts with `addi sp, sp, -16` which crashes if
+        //    SP=0.  We write: LUI sp + ADDI sp + JAL to fw_base.
+        //    Set AERISC_RESET_PC (0xFFB14000) to 0x0 so ERISC0 boots from
+        //    the trampoline, not from fw_base directly.
+        uint32_t core_type_idx = hal_->get_programmable_core_type_index(core_type);
+        auto jit_build_config = hal_->get_jit_build_config(core_type_idx, 0, 0);
+        uint32_t fw_base = jit_build_config.fw_launch_addr_value;  // MEM_AERISC_FIRMWARE_BASE
+        // Boot trampoline: 3 words at L1[0x0..0xB]
+        //   [0x0] lui  sp, 0xFFB02      # sp = 0xFFB02000
+        //   [0x4] addi sp, sp, -16      # sp = 0xFFB01FF0 (matches crt0 __stack_top - 16)
+        //   [0x8] jal  x0, fw_base      # jump to FW entry (offset from PC=0x8)
+        // Note: L1[0xC] is MEM_L1_BARRIER — do not place code there.
+        uint32_t trampoline[3];
+        trampoline[0] = 0xFFB02137;  // lui sp, 0xFFB02
+        trampoline[1] = 0xFF010113;  // addi sp, sp, -16
+        TT_FATAL(fw_base > 0x8, "fw_base must be > 0x8 for trampoline JAL offset");
+        trampoline[2] = generate_risc_startup_addr(fw_base - 0x8);  // jal x0, (fw_base - 0x8) from PC=0x8
+        log_info(
+            tt::LogMetal,
+            "Device {} init remote ETH: writing SP-init trampoline to L1[0x0..0xB] on core {}: "
+            "lui={:#010x} addi={:#010x} jal({:#x})={:#010x}",
+            device_id,
+            virtual_core.str(),
+            trampoline[0],
+            trampoline[1],
+            fw_base,
+            trampoline[2]);
+        cluster_->write_core(trampoline, sizeof(trampoline), tt_cxy_pair(device_id, virtual_core), 0x0);
+        // Set AERISC_RESET_PC to 0x0 (trampoline address) so ERISC0 boots from
+        // the trampoline which initializes SP before jumping to fw_base.
+        // On remote devices ERISC0 was never running (POR state), so SP=0;
+        // booting directly at fw_base would crash on the first stack access.
+        cluster_->write_remote_eth_debug_reg(device_id, AERISC_RESET_PC_ADDR, 0x0, sender_noc0);
+
+        // Verify writes by reading back key addresses.
+        cluster_->l1_barrier(device_id);
+        {
+            uint32_t readback_tramp[3] = {};
+            cluster_->read_core(readback_tramp, sizeof(readback_tramp), tt_cxy_pair(device_id, virtual_core), 0x0);
+            uint32_t readback_fw = 0;
+            cluster_->read_core(&readback_fw, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), fw_base);
+            log_info(
+                tt::LogMetal,
+                "Device {} init remote ETH: readback trampoline L1[0x0]={:#010x} [0x4]={:#010x} [0x8]={:#010x}, "
+                "L1[{:#x}]={:#010x} (expect non-zero if FW loaded)",
+                device_id,
+                readback_tramp[0],
+                readback_tramp[1],
+                readback_tramp[2],
+                fw_base,
+                readback_fw);
+        }
+
+        // 5. Write skip-dance flag to ncrisc_halt.resume_addr (mailbox_base + 0).
+        //    On remote devices, ERISC1 runs the lite fabric relay — not Metal's
+        //    subordinate — so the 2-erisc dance cannot be completed.  The firmware
+        //    checks this flag at boot and skips deassert_all_reset()/enter_reset().
+        {
+            DeviceAddr mailbox_addr = hal_->get_dev_addr(core_type, HalL1MemAddrType::MAILBOX);
+            uint32_t skip_dance_flag = 1;
+            cluster_->write_core(
+                &skip_dance_flag, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), mailbox_addr);
+        }
+
+        // 6. Deassert ERISC0.  Write SOFT_RESET_ERISC0_RUNNING (0x00000)
+        //    to clear ERISC0's reset bit.  ERISC1 (bit 12) was already
+        //    deasserted by the lite fabric setup and remains running so
+        //    the lite fabric channel stays operational for subsequent
+        //    L1 reads/writes and barriers.
+        cluster_->l1_barrier(device_id);
+        log_info(
+            tt::LogMetal,
+            "Device {} init remote ETH: deasserting ERISC0 ({:#x}) on core {}",
+            device_id,
+            SOFT_RESET_ERISC0_RUNNING,
+            virtual_core.str());
+        cluster_->write_remote_eth_debug_reg(device_id, SOFT_RESET_REG_ADDR, SOFT_RESET_ERISC0_RUNNING, sender_noc0);
+    }
+
+    // Barrier to ensure deassert has reached the device
+    cluster_->l1_barrier(device_id);
+
+    // Wait for ERISC0 to boot, skip the 2-erisc dance (via the skip flag),
+    // pass through wait_subordinate_eriscs(), and reach the go-signal loop.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    log_info(tt::LogMetal, "Device {} init remote ETH: {} core(s) initialized", device_id, logical_eth_cores.size());
 }
 
 void MetalContext::initialize_and_launch_firmware(ChipId device_id) {

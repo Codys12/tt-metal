@@ -94,6 +94,18 @@ bool is_fabric_two_erisc_enabled() {
     // 2d dynamic fabric doesn't properly support 2-erisc yet but is being deprecated anyways so we
     // simply disable 2-erisc on it for now.
     // Issue [#32419](https://github.com/tenstorrent/tt-metal/issues/32419)
+
+    // When remote devices are behind lite fabric, ERISC1 on remote ETH cores runs
+    // the lite fabric relay (not a fabric router kernel).  The fabric router compiled
+    // with NUM_ACTIVE_ERISCS=2 would deadlock in wait_for_other_local_erisc() on
+    // those remote cores.  Since the FabricEriscDatamoverConfig is shared globally,
+    // force single-ERISC mode when any non-MMIO devices exist.
+    const auto& cluster = mc.get_cluster();
+    bool has_remote_devices = cluster.all_chip_ids().size() > cluster.mmio_chip_ids().size();
+    if (has_remote_devices) {
+        return false;
+    }
+
     return arch_bh && !tensix_extensions_enabled && !single_erisc_dispatch;
 }
 

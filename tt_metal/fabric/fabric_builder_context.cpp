@@ -119,10 +119,9 @@ void FabricBuilderContext::set_num_fabric_initialized_routers(ChipId chip_id, si
 
 uint32_t FabricBuilderContext::get_num_fabric_initialized_routers(ChipId chip_id) const {
     TT_FATAL(chip_id < num_devices_, "Device ID {} exceeds maximum supported devices {}", chip_id, num_devices_);
-    TT_FATAL(
-        num_initialized_routers_[chip_id] != UNINITIALIZED_ROUTERS,
-        "Error, querying num initialized routers for an unknown device {}",
-        chip_id);
+    if (num_initialized_routers_[chip_id] == UNINITIALIZED_ROUTERS) {
+        return 0;
+    }
     return num_initialized_routers_[chip_id];
 }
 

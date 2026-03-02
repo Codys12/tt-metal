@@ -454,7 +454,26 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<ChipId>& device_id
     } else {
         // Need to handle N300/T3000 separately from TG/TGG since they have different templates/tunnel depths
         // If using fabric, upstream would have already initalized to the proper config for dispatch
-        if (MetalContext::instance().get_cluster().is_galaxy_cluster()) {
+        // Check if the Galaxy template fits this cluster's tunnel structure.
+        // The Galaxy 9-chip template expects 4-deep tunnels (5 entries each, including
+        // MMIO) with 8 remote chips per MMIO.  Blackhole Galaxy systems using lite fabric
+        // have shallower tunnels (1 remote per tunnel) and must use the two-chip template.
+        bool use_galaxy_template = MetalContext::instance().get_cluster().is_galaxy_cluster();
+        if (use_galaxy_template) {
+            for (auto mmio_device_id : mmio_devices) {
+                auto tunnels = MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id);
+                for (const auto& tunnel : tunnels) {
+                    if (tunnel.size() != 5) {
+                        use_galaxy_template = false;
+                        break;
+                    }
+                }
+                if (!use_galaxy_template) {
+                    break;
+                }
+            }
+        }
+        if (use_galaxy_template) {
             // For Galaxy, we always init all remote devices associated with an mmio device.
             std::vector<DispatchKernelNode> nodes_for_one_mmio =
                 (num_hw_cqs == 1) ? galaxy_nine_chip_arch_1cq_fabric : galaxy_nine_chip_arch_2cq_fabric;
@@ -515,6 +534,27 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<ChipId>& device_id
                 }
                 TT_ASSERT(found_remote, "Couldn't find paired remote chip for device {}", mmio_device_id);
 
+                // Find which tunnel connects the MMIO to the paired remote.
+                // The template assumes tunnel 0 but the remote may be on a
+                // different tunnel when multiple tunnels exist.
+                int tunnel_for_remote = 0;
+                {
+                    auto tunnels = MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id);
+                    for (int t = 0; t < static_cast<int>(tunnels.size()); t++) {
+                        bool found_in_tunnel = false;
+                        for (const auto& chip : tunnels[t]) {
+                            if (chip == remote_device_id) {
+                                tunnel_for_remote = t;
+                                found_in_tunnel = true;
+                                break;
+                            }
+                        }
+                        if (found_in_tunnel) {
+                            break;
+                        }
+                    }
+                }
+
                 // Add dispatch kernels for the mmio/remote pair
                 for (DispatchKernelNode node : nodes_for_one_mmio) {
                     constexpr uint32_t k_MMIO = 0;
@@ -536,6 +576,13 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<ChipId>& device_id
                     } else if (node.servicing_device_id == k_Remote) {
                         node.servicing_device_id = remote_device_id;
                     }
+
+                    // Update tunnel index for MUX nodes to match the actual
+                    // tunnel connecting the MMIO to the paired remote device.
+                    if (node.tunnel_index >= 0) {
+                        node.tunnel_index = tunnel_for_remote;
+                    }
+
                     increment_node_ids(node, index_offset);
                     nodes.push_back(node);
                 }

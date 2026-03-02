@@ -2633,6 +2633,7 @@ void kernel_main() {
             std::make_index_sequence<NUM_SENDER_CHANNELS>{});
 
     POSTCODE(tt::tt_fabric::EDMStatus::DOWNSTREAM_EDM_SETUP_STARTED);
+    *edm_status_ptr = tt::tt_fabric::EDMStatus::DOWNSTREAM_EDM_SETUP_STARTED;
 
     // TODO: change to TMP.
     std::array<RouterToRouterSender<DOWNSTREAM_SENDER_NUM_BUFFERS_VC0>, NUM_DOWNSTREAM_SENDERS_VC0>
@@ -2809,6 +2810,7 @@ void kernel_main() {
     }
 
     POSTCODE(tt::tt_fabric::EDMStatus::EDM_VCS_SETUP_COMPLETE);
+    *edm_status_ptr = tt::tt_fabric::EDMStatus::EDM_VCS_SETUP_COMPLETE;
 
     // initialize the local receiver channel buffers
     local_receiver_channels.init<channel_pools_args>(
@@ -2876,6 +2878,8 @@ void kernel_main() {
         // time.
         wait_for_other_local_erisc();
     }
+    // Diagnostic checkpoint: about to enter ethernet handshake
+    *edm_status_ptr = static_cast<tt::tt_fabric::EDMStatus>(0xa0b0c0d1);
     if constexpr (enable_ethernet_handshake) {
         if constexpr (is_handshake_sender) {
             erisc::datamover::handshake::sender_side_handshake(

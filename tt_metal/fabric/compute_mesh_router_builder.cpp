@@ -590,10 +590,16 @@ void ComputeMeshRouterBuilder::create_kernel(tt::tt_metal::Program& program, con
 
         // Determine processor
         auto proc = static_cast<tt::tt_metal::DataMovementProcessor>(risc_id);
-        if (tt::tt_metal::MetalContext::instance().get_cluster().arch() == tt::ARCH::BLACKHOLE &&
+        const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+        bool is_remote_device = !cluster.mmio_chip_ids().count(device_id);
+        bool has_remote_devices = cluster.all_chip_ids().size() > cluster.mmio_chip_ids().size();
+        if (cluster.arch() == tt::ARCH::BLACKHOLE &&
             tt::tt_metal::MetalContext::instance().rtoptions().get_enable_2_erisc_mode() &&
-            num_enabled_risc_cores == 1) {
-            // Force fabric to run on erisc1 due to stack usage exceeded with MUX on erisc0
+            num_enabled_risc_cores == 1 && !is_remote_device && !has_remote_devices) {
+            // Force fabric to run on erisc1 due to stack usage exceeded with MUX on erisc0.
+            // Only needed when MUX is active (all-MMIO cluster).  When lite fabric is
+            // active (remote devices exist), MUX is disabled and ERISC1 is occupied by
+            // the lite fabric relay — the router must run on ERISC0.
             proc = tt::tt_metal::DataMovementProcessor::RISCV_1;
         }
 
@@ -602,17 +608,24 @@ void ComputeMeshRouterBuilder::create_kernel(tt::tt_metal::Program& program, con
         bool vc1_active = erisc_builder_->config.num_used_receiver_channels_per_vc[1] > 0;
         auto opt_level = vc1_active ? tt::tt_metal::KernelBuildOptLevel::Os : tt::tt_metal::KernelBuildOptLevel::O3;
 
+        // Determine kernel NOC assignment.
+        // The builder config may have forced NOC1 globally (single-erisc workaround for
+        // MMIO devices where ERISC0 runs base FW using NOC0).  Override NOC based on
+        // the actual processor: RISCV_0 -> NOC0, RISCV_1 -> NOC1.
+        auto noc = erisc_builder_->config.risc_configs[risc_id].get_configured_noc();
+        if (cluster.arch() == tt::ARCH::BLACKHOLE &&
+            tt::tt_metal::MetalContext::instance().rtoptions().get_enable_2_erisc_mode()) {
+            noc = (proc == tt::tt_metal::DataMovementProcessor::RISCV_0) ? tt::tt_metal::NOC::NOC_0
+                                                                         : tt::tt_metal::NOC::NOC_1;
+        }
+
         // Create the kernel
         auto kernel = tt::tt_metal::CreateKernel(
             program,
             "tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp",
             eth_logical_core,
             tt::tt_metal::EthernetConfig{
-                .noc = erisc_builder_->config.risc_configs[risc_id].get_configured_noc(),
-                .processor = proc,
-                .compile_args = ct_args,
-                .defines = defines,
-                .opt_level = opt_level});
+                .noc = noc, .processor = proc, .compile_args = ct_args, .defines = defines, .opt_level = opt_level});
 
         tt::tt_metal::SetRuntimeArgs(program, kernel, eth_logical_core, rt_args);
     }

@@ -524,15 +524,18 @@ void ControlPlane::init_control_plane_auto_discovery() {
         *distributed_context->size());
 
     // Initialize physical system descriptor
+    log_info(tt::LogFabric, "DEBUG: init_control_plane: creating physical system descriptor");
     this->physical_system_descriptor_ = std::make_unique<tt::tt_metal::PhysicalSystemDescriptor>(
         driver, distributed_context, &tt::tt_metal::MetalContext::instance().hal(), rtoptions);
 
     // Generate Mesh graph based on physical system descriptor
     // Reliability mode is obtained from MetalContext inside the function
+    log_info(tt::LogFabric, "DEBUG: init_control_plane: generating mesh graph");
     this->mesh_graph_ = std::make_unique<tt::tt_fabric::MeshGraph>(
         tt::tt_fabric::TopologyMapper::generate_mesh_graph_from_physical_system_descriptor(
             *this->physical_system_descriptor_, fabric_config));
 
+    log_info(tt::LogFabric, "DEBUG: init_control_plane: mesh graph created, initializing local mesh binding");
     this->local_mesh_binding_ = this->initialize_local_mesh_binding();
 
     std::vector<std::pair<AsicPosition, FabricNodeId>> fixed_asic_position_pinnings;
@@ -551,11 +554,13 @@ void ControlPlane::init_control_plane_auto_discovery() {
         distributed_size == 1) {  // Using full board size for UBB Galaxy
         fixed_asic_position_pinnings = get_galaxy_fixed_asic_position_pinnings(board_size);
     }
+    log_info(tt::LogFabric, "DEBUG: init_control_plane: creating topology mapper");
     this->topology_mapper_ = std::make_unique<tt::tt_fabric::TopologyMapper>(
         *this->mesh_graph_,
         *this->physical_system_descriptor_,
         this->local_mesh_binding_,
         fixed_asic_position_pinnings);
+    log_info(tt::LogFabric, "DEBUG: init_control_plane: loading physical chip mapping");
     this->load_physical_chip_mapping(topology_mapper_->get_local_logical_mesh_chip_id_to_physical_chip_id_mapping());
 
     // Automatically export physical chip mesh coordinate mapping to generated/fabric directory after topology mapper is
@@ -960,6 +965,7 @@ size_t ControlPlane::get_num_live_routing_planes(
 // fabric routers on device
 void ControlPlane::configure_routing_tables_for_fabric_ethernet_channels(
     tt::tt_fabric::FabricConfig fabric_config, tt_fabric::FabricReliabilityMode reliability_mode) {
+    log_info(tt::LogFabric, "DEBUG: configure_routing_tables start");
     this->intra_mesh_routing_tables_.clear();
     this->inter_mesh_routing_tables_.clear();
     this->router_port_directions_to_physical_eth_chan_map_.clear();
@@ -1095,26 +1101,38 @@ void ControlPlane::configure_routing_tables_for_fabric_ethernet_channels(
     // NOTE: This MUST be called after ordering ethernet channels
     this->trim_ethernet_channels_not_mapped_to_live_routing_planes();
 
+    log_info(tt::LogFabric, "DEBUG: configure_routing_tables: collecting and merging");
     this->collect_and_merge_router_port_directions_from_all_hosts();
 
+    log_info(tt::LogFabric, "DEBUG: configure_routing_tables: converting to chip routing table");
     this->convert_fabric_routing_table_to_chip_routing_table();
+    log_info(tt::LogFabric, "DEBUG: configure_routing_tables: done");
     // After this, router_port_directions_to_physical_eth_chan_map_, intra_mesh_routing_tables_,
     // inter_mesh_routing_tables_ should be populated for all hosts in BigMesh
 }
 
-FabricNodeId ControlPlane::get_fabric_node_id_from_physical_chip_id(ChipId physical_chip_id) const {
+std::optional<FabricNodeId> ControlPlane::find_fabric_node_id_from_physical_chip_id(ChipId physical_chip_id) const {
     for (const auto& [fabric_node_id, mapped_physical_chip_id] :
          this->logical_mesh_chip_id_to_physical_chip_id_mapping_) {
         if (mapped_physical_chip_id == physical_chip_id) {
             return fabric_node_id;
         }
     }
+    return std::nullopt;
+}
+
+FabricNodeId ControlPlane::get_fabric_node_id_from_physical_chip_id(ChipId physical_chip_id) const {
+    auto result = find_fabric_node_id_from_physical_chip_id(physical_chip_id);
     TT_FATAL(
-        false,
+        result.has_value(),
         "Physical chip id {} not found in control plane chip mapping. You are calling for a chip outside of the fabric "
         "cluster. Check that your mesh graph descriptor specifies the correct topology",
         physical_chip_id);
-    return FabricNodeId(MeshId{0}, 0);
+    return *result;
+}
+
+bool ControlPlane::is_chip_mapped(ChipId physical_chip_id) const {
+    return find_fabric_node_id_from_physical_chip_id(physical_chip_id).has_value();
 }
 
 ChipId ControlPlane::get_physical_chip_id_from_fabric_node_id(const FabricNodeId& fabric_node_id) const {
@@ -2020,6 +2038,19 @@ std::unordered_set<CoreCoord> ControlPlane::get_active_ethernet_cores(ChipId chi
         // without links. Only risc1 on these cores is available for Metal and should not be classified as idle
         // to ensure that Metal does not try to program both riscs.
         std::set<uint32_t> logical_active_eth_channels = cluster_desc->get_active_eth_channels(chip_id);
+        if (logical_active_eth_channels.empty()) {
+            // For remote devices, UMD's get_active_eth_channels returns empty because it only
+            // populates the MMIO side. Fall back to routing info populated during
+            // initialize_ethernet_cores_router_mode.
+            const auto& eth_routing_info = cluster.get_eth_routing_info(chip_id);
+            for (const auto& [eth_core, mode] : eth_routing_info) {
+                if (mode == EthRouterMode::FABRIC_ROUTER && skip_reserved_cores) {
+                    continue;
+                }
+                active_ethernet_cores.insert(eth_core);
+            }
+            return active_ethernet_cores;
+        }
         for (auto logical_active_eth_channel : logical_active_eth_channels) {
             tt::umd::CoreCoord logical_active_eth =
                 soc_desc.get_eth_core_for_channel(logical_active_eth_channel, CoordSystem::LOGICAL);
@@ -2029,6 +2060,20 @@ std::unordered_set<CoreCoord> ControlPlane::get_active_ethernet_cores(ChipId chi
         std::set<uint32_t> logical_active_eth_channels = cluster_desc->get_active_eth_channels(chip_id);
         const auto& freq_retrain_eth_cores = cluster.get_eth_cores_with_frequent_retraining(chip_id);
         const auto& eth_routing_info = cluster.get_eth_routing_info(chip_id);
+
+        // For remote devices, UMD's get_active_eth_channels returns empty because it only
+        // populates the MMIO side. Fall back to routing info populated during
+        // initialize_ethernet_cores_router_mode.
+        if (logical_active_eth_channels.empty() && !eth_routing_info.empty()) {
+            for (const auto& [eth_core, mode] : eth_routing_info) {
+                if (mode == EthRouterMode::FABRIC_ROUTER && skip_reserved_cores) {
+                    continue;
+                }
+                active_ethernet_cores.insert(eth_core);
+            }
+            return active_ethernet_cores;
+        }
+
         for (const auto& eth_channel : logical_active_eth_channels) {
             tt::umd::CoreCoord eth_core = soc_desc.get_eth_core_for_channel(eth_channel, CoordSystem::LOGICAL);
             const auto& routing_info = eth_routing_info.at(eth_core);

@@ -110,6 +110,7 @@ public:
         tt_fabric::FabricManagerMode fabric_manager = tt_fabric::FabricManagerMode::DEFAULT);
     void initialize_fabric_config();
     void initialize_fabric_tensix_datamover_config();
+    void update_lite_fabric_bindings_for_fabric_routers();
     tt_fabric::FabricConfig get_fabric_config() const;
     tt_fabric::FabricReliabilityMode get_fabric_reliability_mode() const;
 
@@ -137,6 +138,12 @@ public:
 
     // Hang detection
     void on_dispatch_timeout_detected();
+
+    // Initialize ETH cores on remote devices for fabric routing.
+    // Remote devices behind lite fabric have their ETH cores in POR state
+    // (skipped during init_fw). This loads base ERISC firmware and deasserts
+    // the cores so they can process fabric router kernel launch messages.
+    void initialize_remote_eth_cores_for_fabric(ChipId device_id, const std::vector<CoreCoord>& logical_eth_cores);
 
 private:
     friend class tt::stl::Indestructible<MetalContext>;
@@ -175,7 +182,8 @@ private:
         const HalProgrammableCoreType& core_type,
         CoreCoord virtual_core,
         dev_msgs::launch_msg_t::View launch_msg,
-        dev_msgs::go_msg_t::ConstView go_msg);
+        dev_msgs::go_msg_t::ConstView go_msg,
+        bool assert_reset = true);
     void initialize_and_launch_firmware(ChipId device_id);
     dev_msgs::core_info_msg_t populate_core_info_msg(
         ChipId device_id, HalProgrammableCoreType programmable_core_type) const;

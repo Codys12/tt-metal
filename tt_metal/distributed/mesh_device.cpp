@@ -340,10 +340,12 @@ std::map<int, std::shared_ptr<MeshDevice>> MeshDevice::create_unit_meshes(
     tt::stl::Span<const std::uint32_t> /*l1_bank_remap*/,
     size_t worker_l1_size) {
     // Validate all devices are on compute meshes (not switches) before creating any resources
+    log_info(tt::LogMetal, "create_unit_meshes: getting control plane");
     const auto& mesh_graph = MetalContext::instance().get_control_plane().get_mesh_graph();
     std::vector<tt::tt_fabric::FabricNodeId> fabric_node_ids;
     fabric_node_ids.reserve(device_ids.size());
     for (const auto& device_id : device_ids) {
+        log_info(tt::LogMetal, "create_unit_meshes: get_fabric_node_id_from_physical_chip_id({})", device_id);
         auto fabric_node_id =
             MetalContext::instance().get_control_plane().get_fabric_node_id_from_physical_chip_id(device_id);
         TT_FATAL(
@@ -356,6 +358,7 @@ std::map<int, std::shared_ptr<MeshDevice>> MeshDevice::create_unit_meshes(
     }
 
     // Now create ScopedDevices after validation passes
+    log_info(tt::LogMetal, "create_unit_meshes: creating ScopedDevices");
     auto mapped_devices_full_system_device_ids =
         (*MetalContext::instance().global_distributed_context().size() > 1)
             ? SystemMesh::instance().get_mapped_devices(std::nullopt).device_ids
@@ -370,12 +373,14 @@ std::map<int, std::shared_ptr<MeshDevice>> MeshDevice::create_unit_meshes(
         dispatch_core_config);
 
     // Make a copy because we std::move the scoped_devices when creating MeshDevice
+    log_info(tt::LogMetal, "create_unit_meshes: creating MeshDevice");
     const auto root_devices = scoped_devices->root_devices();
     auto mesh_device = std::make_shared<MeshDevice>(
         std::move(scoped_devices),
         std::make_unique<MeshDeviceView>(MeshShape(1, device_ids.size()), root_devices, fabric_node_ids),
         std::shared_ptr<MeshDevice>());
 
+    log_info(tt::LogMetal, "create_unit_meshes: creating submeshes");
     auto submeshes = mesh_device->create_submeshes(MeshShape(1, 1));
     TT_FATAL(
         device_ids.size() == submeshes.size(),
@@ -388,11 +393,13 @@ std::map<int, std::shared_ptr<MeshDevice>> MeshDevice::create_unit_meshes(
     }
 
     // Wait for all ranks to finish initializing the mesh device before proceeding.
+    log_info(tt::LogMetal, "create_unit_meshes: barrier + fabric init");
     mesh_device->distributed_context_->barrier();
 
     // The Device Profiler must be initialized before Fabric is loaded on the Cluster
     tt_metal::MetalContext::instance().device_manager()->init_profiler();
     tt_metal::MetalContext::instance().device_manager()->initialize_fabric_and_dispatch_fw();
+    log_info(tt::LogMetal, "create_unit_meshes: complete");
     return result;
 }
 

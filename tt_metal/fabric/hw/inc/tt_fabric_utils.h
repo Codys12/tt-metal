@@ -76,7 +76,7 @@ inline void wait_for_notification(uint32_t address, uint32_t value) {
     while (*poll_addr != value) {
         router_invalidate_l1_cache<RISC_CPU_DATA_CACHE_ENABLED>();
         // context switch while waiting to allow slow dispatch traffic to go through
-        run_routing();
+        run_routing_without_noc_sync();
     }
 }
 

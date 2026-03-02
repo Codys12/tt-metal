@@ -224,6 +224,16 @@ public:
     void write_reg(const std::uint32_t* mem_ptr, tt_cxy_pair target, uint64_t addr) const;
     void read_reg(std::uint32_t* mem_ptr, tt_cxy_pair target, uint64_t addr) const;
 
+    // Write to a debug register (0xFFBxxxxx) on a remote ETH tile via the lite
+    // fabric WRITE_REG mechanism.  NOC unicast writes cannot reach debug registers
+    // on remote Blackhole devices; WRITE_REG uses the ethernet hardware's
+    // eth_write_remote_reg() to access the register space directly.
+    //
+    // sender_noc0: the MMIO-side ETH core (in NOC0 coordinates) whose lite fabric
+    //              channel connects to the target remote ETH tile.
+    void write_remote_eth_debug_reg(
+        ChipId remote_chip, uint32_t reg_addr, uint32_t reg_value, tt_xy_pair sender_noc0) const;
+
     void write_sysmem(
         const void* vec, uint32_t size_in_bytes, uint64_t addr, ChipId src_device_id, uint16_t channel) const;
     void read_sysmem(void* vec, uint32_t size_in_bytes, uint64_t addr, ChipId src_device_id, uint16_t channel) const;
@@ -374,6 +384,12 @@ public:
         return this->device_eth_routing_info_.at(chip_id);
     }
 
+    // Re-populate routing info and link-up tracking for remote devices accessed via
+    // lite-fabric tunnels.  Must be called after refresh_soc_desc_for_chip() updates the
+    // SOC descriptor for remote chips (Phase 2b), since the channel-to-logical-core mapping
+    // may change when real harvesting masks replace proxy harvesting masks.
+    void refresh_remote_ethernet_routing_info();
+
 private:
     void detect_arch_and_target();
     void generate_cluster_descriptor();
@@ -455,6 +471,10 @@ private:
 
     // Mapping of each devices' ethernet routing mode
     std::unordered_map<ChipId, std::unordered_map<CoreCoord, EthRouterMode>> device_eth_routing_info_;
+
+    // Ethernet cores discovered from remote device connections (lite-fabric tunnels).
+    // Used by is_ethernet_link_up() as a fallback since UMD only tracks the MMIO side.
+    std::unordered_map<ChipId, std::unordered_set<CoreCoord>> remote_device_eth_cores_;
 
     std::unordered_map<ChipId, std::unordered_map<ChipId, std::vector<CoreCoord>>> ethernet_sockets_;
 

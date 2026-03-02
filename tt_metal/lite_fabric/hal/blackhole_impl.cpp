@@ -93,12 +93,28 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
         config.initial_state = lite_fabric::InitState::ETH_INIT_NEIGHBOUR;
         config.current_state = lite_fabric::InitState::ETH_INIT_NEIGHBOUR;
         config.binary_addr = LITE_FABRIC_TEXT_START;
-        config.binary_size = (LITE_FABRIC_TEXT_SIZE + 15) & ~0xF;
+        config.binary_size = (bin_size + 15) & ~0xF;
         config.eth_chans_mask = mmio_mask;
         config.routing_enabled = lite_fabric::RoutingEnabledState::ENABLED;
 
         set_reset_state(tunnel_1x.mmio_cxy_virtual(), true);
         set_pc(tunnel_1x.mmio_cxy_virtual(), k_FirmwareStart);
+
+        // Zero the host interface counters (d2h + h2d = 4 bytes) on device before
+        // starting the firmware.  Phase 1's clear_l1_state only clears the "unreserved"
+        // portion of ETH L1 which doesn't include the lite fabric memory area.
+        // Without this, the firmware starts with stale counter values from previous
+        // runs or undefined post-reset state, causing wait_for_all_writes_consumed to
+        // deadlock on a counter mismatch.
+        uint32_t host_iface_addr =
+            LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteMemoryMap, host_interface);
+        uint32_t zero_counters = 0;
+        cluster.write_core(
+            reinterpret_cast<void*>(&zero_counters),
+            sizeof(zero_counters),
+            tunnel_1x.mmio_cxy_virtual(),
+            host_iface_addr);
+
         cluster.write_core(
             (void*)&config, sizeof(lite_fabric::FabricLiteConfig), tunnel_1x.mmio_cxy_virtual(), config_addr);
         cluster.write_core(binary_data.data(), bin_size, tunnel_1x.mmio_cxy_virtual(), LITE_FABRIC_TEXT_START);

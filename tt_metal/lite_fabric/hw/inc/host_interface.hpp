@@ -135,6 +135,11 @@ struct HostToFabricLiteInterface {
         volatile uint8_t fabric_receiver_channel_index = 0;
     } __attribute((packed)) d2h;
 
+    // Padding to ensure d2h and h2d occupy separate 4-byte words.
+    // Without this, firmware byte writes to d2h (RISC-V SB -> word-level
+    // RMW on L1) can clobber concurrent host writes to h2d in the same word.
+    uint8_t _d2h_h2d_pad[2]{};
+
     // These values are updated by the host and written to the device
     struct HostToDevice {
         volatile uint8_t sender_host_write_index = 0;

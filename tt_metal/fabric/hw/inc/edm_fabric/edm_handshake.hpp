@@ -67,10 +67,10 @@ FORCE_INLINE void sender_side_handshake(
     while (handshake_info->local_value != MAGIC_HANDSHAKE_VALUE) {
         if (count == HS_CONTEXT_SWITCH_TIMEOUT) {
             count = 0;
-            run_routing();
+            run_routing_without_noc_sync();
         } else {
             count++;
-            internal_::eth_send_packet(0, scratch_addr, local_val_addr, 1);
+            internal_::eth_send_packet<false>(0, scratch_addr, local_val_addr, 1);
         }
         invalidate_l1_cache();
     }
@@ -85,13 +85,13 @@ FORCE_INLINE void receiver_side_handshake(
     while (handshake_info->local_value != MAGIC_HANDSHAKE_VALUE) {
         if (count == HS_CONTEXT_SWITCH_TIMEOUT) {
             count = 0;
-            run_routing();
+            run_routing_without_noc_sync();
         } else {
             count++;
         }
         invalidate_l1_cache();
     }
-    internal_::eth_send_packet(0, scratch_addr, local_val_addr, 1);
+    internal_::eth_send_packet<false>(0, scratch_addr, local_val_addr, 1);
 }
 
 namespace deprecated {

@@ -229,10 +229,41 @@ bool test_load_write_read_risc_binary(
 
 void write_binary_to_address(const ll_api::memory& mem, tt::ChipId chip_id, const CoreCoord& core, uint32_t address) {
     log_debug(tt::LogLLRuntime, "vec size = {}, size_in_bytes = {}", mem.size(), mem.size() * sizeof(uint32_t));
+    bool is_remote = !tt::tt_metal::MetalContext::instance().get_cluster().mmio_chip_ids().count(chip_id);
+    uint32_t total_written = 0;
+    uint32_t first_word_written = 0;
     mem.process_spans([&](std::vector<uint32_t>::const_iterator mem_ptr, uint64_t /*addr*/, uint32_t len_words) {
         tt::tt_metal::MetalContext::instance().get_cluster().write_core(
             &*mem_ptr, len_words * sizeof(uint32_t), tt_cxy_pair(chip_id, core), address);
+        if (total_written == 0 && len_words > 0) {
+            first_word_written = *mem_ptr;
+        }
+        total_written += len_words;
     });
+    if (is_remote) {
+        // Readback verify for remote devices
+        uint32_t readback[4] = {0};
+        uint32_t rb_limit = (uint32_t)sizeof(readback);
+        uint32_t tw_bytes = total_written * (uint32_t)sizeof(uint32_t);
+        uint32_t read_size = rb_limit < tw_bytes ? rb_limit : tw_bytes;
+        if (read_size > 0) {
+            tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+                readback, read_size, tt_cxy_pair(chip_id, core), address);
+        }
+        log_info(
+            tt::LogMetal,
+            "write_binary_to_address VERIFY: chip {} core {} addr=0x{:x} size={} words "
+            "first_written=0x{:08x} readback[0..3]=[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}]",
+            chip_id,
+            core.str(),
+            address,
+            total_written,
+            first_word_written,
+            readback[0],
+            readback[1],
+            readback[2],
+            readback[3]);
+    }
 }
 
 namespace internal_ {
@@ -386,9 +417,18 @@ void send_msg_to_eth_mailbox(
     const auto done_message = hal.get_eth_fw_mailbox_val(tt_metal::FWMailboxMsg::ETH_MSG_DONE);
 
     // Check mailbox is empty/ready
-    uint32_t msg_status = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
-                              device_id, virtual_core, mailbox_addr, sizeof(uint32_t))[0] &
-                          status_mask;
+    auto raw_read = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+        device_id, virtual_core, mailbox_addr, sizeof(uint32_t));
+    uint32_t msg_status = raw_read[0] & status_mask;
+    log_info(
+        tt::LogMetal,
+        "send_msg_to_eth_mailbox: device {} core {} mailbox_addr={:#x} raw={:#x} status={:#x} done={:#x}",
+        device_id,
+        virtual_core.str(),
+        mailbox_addr,
+        raw_read[0],
+        msg_status,
+        done_message);
     {
         const auto start_time = std::chrono::steady_clock::now();
         while (msg_status != done_message && msg_status != 0) {

@@ -702,7 +702,19 @@ bool EthernetKernel::configure(
             this->get_kernel_programmable_core_type(),
             HalProcessorClassType::DM,
             enchantum::to_underlying(this->config_.processor));
-        llrt::write_binary_to_address(binary_mem, device_id, ethernet_core, base_address + offsets[offset_idx]);
+        uint32_t write_addr = base_address + offsets[offset_idx];
+        log_info(
+            tt::LogMetal,
+            "EthernetKernel::configure: device {} core {} base_address=0x{:x} offset[{}]=0x{:x} "
+            "write_addr=0x{:x} binary_size={} words",
+            device_id,
+            ethernet_core.str(),
+            base_address,
+            offset_idx,
+            offsets[offset_idx],
+            write_addr,
+            binary_mem.size());
+        llrt::write_binary_to_address(binary_mem, device_id, ethernet_core, write_addr);
     } else {
         const auto erisc_core_index = hal.get_programmable_core_type_index(this->get_kernel_programmable_core_type());
         uint32_t dm_class_idx = enchantum::to_underlying(HalProcessorClassType::DM);

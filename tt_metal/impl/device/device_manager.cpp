@@ -324,12 +324,16 @@ void DeviceManager::initialize_devices(const std::vector<ChipId>& device_ids) {
     }
 
     skip_remote_devices_ = skip;
+    log_info(tt::LogMetal, "DEBUG: initialize_devices: adding devices to pool");
     add_devices_to_pool(device_ids_to_open);
 
     // Initialize fabric tensix datamover config after devices are added to the pool
+    log_info(tt::LogMetal, "DEBUG: initialize_devices: initializing fabric tensix datamover config");
     tt::tt_metal::MetalContext::instance().initialize_fabric_tensix_datamover_config();
 
+    log_info(tt::LogMetal, "DEBUG: initialize_devices: init firmware on active devices");
     init_firmware_on_active_devices();
+    log_info(tt::LogMetal, "DEBUG: initialize_devices: done");
 }
 
 void DeviceManager::initialize_fabric_and_dispatch_fw() {
@@ -362,9 +366,16 @@ void DeviceManager::initialize_host(IDevice* dev) const {
 }
 
 void DeviceManager::init_fabric(const std::vector<tt_metal::IDevice*>& active_devices) const {
+    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
+
     std::vector<std::shared_future<tt_metal::IDevice*>> events;
     events.reserve(active_devices.size());
     for (auto* dev : active_devices) {
+        // Skip devices not in the fabric mesh (e.g. when the mesh graph maps fewer
+        // chips than the full cluster because of odd chip counts).
+        if (!control_plane.is_chip_mapped(dev->id())) {
+            continue;
+        }
         events.emplace_back(detail::async([dev]() {
             if (dev->compile_fabric()) {
                 return dev;
@@ -379,11 +390,30 @@ void DeviceManager::init_fabric(const std::vector<tt_metal::IDevice*>& active_de
     if (!has_flag(MetalContext::instance().get_fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
         return;
     }
-    // Sequentially execute fabric configuration on all devices
-    // Empirically TG hung when this is also parallelized
+
+    // Collect compiled devices.
+    std::vector<tt_metal::IDevice*> compiled_devices;
     for (const auto& event : events) {
         auto* dev = event.get();
         if (dev) {
+            compiled_devices.push_back(dev);
+        }
+    }
+
+    // Configure remote devices FIRST. Remote device configure_fabric() uses
+    // WRITE_REG (through the lite fabric relay on ERISC1) to deassert ERISC0's
+    // soft reset on remote ETH cores. MMIO configure_fabric() launches fabric
+    // router kernels that overwrite the lite fabric relay on the MMIO-side ETH
+    // cores, so remote devices must complete their WRITE_REG operations while
+    // the relay is still running.
+    const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+    for (auto* dev : compiled_devices) {
+        if (!cluster.mmio_chip_ids().count(dev->id())) {
+            dev->configure_fabric();
+        }
+    }
+    for (auto* dev : compiled_devices) {
+        if (cluster.mmio_chip_ids().count(dev->id())) {
             dev->configure_fabric();
         }
     }
@@ -401,15 +431,25 @@ void DeviceManager::initialize_active_devices() {
             log_info(tt::LogMetal, "Initializing Fabric");
             tt::tt_metal::MetalContext::instance().get_control_plane().write_routing_tables_to_all_chips();
 
-            // Initialize fabric on mmio device
+            // Initialize fabric on all devices.  Remote devices are configured first
+            // (they need the lite fabric relay + UMD bindings to WRITE_REG and write L1),
+            // then MMIO devices (which overwrite the lite fabric relay with fabric routers).
             init_fabric(active_devices);
+
+            // Now that fabric routers are running on MMIO-side ETH cores, update UMD
+            // bindings to exclude channels reserved for fabric routing.  This must happen
+            // AFTER init_fabric because remote device configure_fabric() needs UMD bindings
+            // to write L1 data and perform l1_barrier through the lite fabric relay.
+            tt::tt_metal::MetalContext::instance().update_lite_fabric_bindings_for_fabric_routers();
             log_info(tt::LogMetal, "Fabric Initialized with config {}", fabric_config);
         } else if (has_flag(
                        tt::tt_metal::MetalContext::instance().get_fabric_manager(),
                        tt_fabric::FabricManagerMode::TERMINATE_FABRIC)) {
             log_info(tt::LogMetal, "Compiling fabric to setup fabric context for fabric termination");
             for (auto* dev : active_devices) {
-                dev->compile_fabric();
+                if (tt::tt_metal::MetalContext::instance().get_control_plane().is_chip_mapped(dev->id())) {
+                    dev->compile_fabric();
+                }
             }
         } else {
             log_info(tt::LogMetal, "Fabric initialized through Fabric Manager");
@@ -422,12 +462,22 @@ void DeviceManager::initialize_active_devices() {
         return;
     }
 
+    // When fabric is active, only configure dispatch for devices that are mapped in the control plane.
+    // With lite fabric, the topology mapper may map only a subset of physical chips to the fabric mesh.
+    const bool check_chip_mapped = tt_fabric::is_tt_fabric_config(fabric_config);
+    const auto* control_plane_ptr =
+        check_chip_mapped ? &tt::tt_metal::MetalContext::instance().get_control_plane() : nullptr;
+    auto is_dispatch_device = [&](ChipId id) { return !check_chip_mapped || control_plane_ptr->is_chip_mapped(id); };
+
     // Generate static args
     for (auto* dev : active_devices) {
         // For Galaxy init, we only need to loop over mmio devices
         const auto& mmio_device_id =
             tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(dev->id());
         if (mmio_device_id != dev->id()) {
+            continue;
+        }
+        if (!is_dispatch_device(dev->id())) {
             continue;
         }
 
@@ -439,6 +489,9 @@ void DeviceManager::initialize_active_devices() {
                 // Need to create devices from farthest to the closest.
                 for (uint32_t ts = tunnel.size() - 1; ts > 0; ts--) {
                     uint32_t mmio_controlled_device_id = tunnel[ts];
+                    if (!is_dispatch_device(mmio_controlled_device_id)) {
+                        continue;
+                    }
                     auto* device = get_device(mmio_controlled_device_id);
                     populate_cq_static_args(device);
                 }
@@ -454,6 +507,9 @@ void DeviceManager::initialize_active_devices() {
         if (mmio_device_id != dev->id()) {
             continue;
         }
+        if (!is_dispatch_device(dev->id())) {
+            continue;
+        }
 
         create_cq_program(dev);
         auto tunnels_from_mmio =
@@ -463,6 +519,9 @@ void DeviceManager::initialize_active_devices() {
                 // Need to create devices from farthest to the closest.
                 for (uint32_t ts = tunnel.size() - 1; ts > 0; ts--) {
                     uint32_t mmio_controlled_device_id = tunnel[ts];
+                    if (!is_dispatch_device(mmio_controlled_device_id)) {
+                        continue;
+                    }
                     auto* device = get_device(mmio_controlled_device_id);
                     create_cq_program(device);
                 }
@@ -481,6 +540,9 @@ void DeviceManager::initialize_active_devices() {
         if (mmio_device_id != dev->id()) {
             continue;
         }
+        if (!is_dispatch_device(dev->id())) {
+            continue;
+        }
 
         auto tunnels_from_mmio =
             tt::tt_metal::MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id);
@@ -491,6 +553,9 @@ void DeviceManager::initialize_active_devices() {
                 // Need to create devices from farthest to the closest.
                 for (uint32_t ts = tunnel.size() - 1; ts > 0; ts--) {
                     uint32_t mmio_controlled_device_id = tunnel[ts];
+                    if (!is_dispatch_device(mmio_controlled_device_id)) {
+                        continue;
+                    }
                     auto* device = get_device(mmio_controlled_device_id);
                     device->init_command_queue_device();
                     log_info(tt::LogMetal, "Command Queue initialized on Device {}", device->id());
@@ -626,7 +691,20 @@ void DeviceManager::add_devices_to_pool(const std::vector<ChipId>& device_ids) {
     }
 
     if (this->using_fast_dispatch_ && !devices_to_activate.empty()) {
-        populate_fd_kernels(devices_to_activate, this->num_hw_cqs_);
+        if (tt_fabric::is_tt_fabric_config(fabric_config)) {
+            // Only create FD kernels for devices that are mapped in the control plane.
+            // With lite fabric, the topology mapper may map only a subset of physical chips.
+            const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
+            std::set<ChipId> mapped_devices;
+            for (const auto& id : devices_to_activate) {
+                if (control_plane.is_chip_mapped(id)) {
+                    mapped_devices.insert(id);
+                }
+            }
+            populate_fd_kernels(mapped_devices, this->num_hw_cqs_);
+        } else {
+            populate_fd_kernels(devices_to_activate, this->num_hw_cqs_);
+        }
     }
 }
 
@@ -681,18 +759,215 @@ void DeviceManager::wait_for_fabric_router_sync(uint32_t timeout_ms) const {
             auto current_time = std::chrono::steady_clock::now();
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - start_time).count();
             if (elapsed_ms > timeout_ms) {
+                // Diagnostic reads for debugging
+                const auto& hal = tt::tt_metal::MetalContext::instance().hal();
+                auto eth_core_type = HalProgrammableCoreType::ACTIVE_ETH;
+                uint64_t go_addr = hal.get_dev_addr(eth_core_type, HalL1MemAddrType::GO_MSG);
+                uint64_t go_idx_addr = hal.get_dev_addr(eth_core_type, HalL1MemAddrType::GO_MSG_INDEX);
+                uint64_t launch_addr = hal.get_dev_addr(eth_core_type, HalL1MemAddrType::LAUNCH);
+                uint64_t mailbox_addr = hal.get_dev_addr(eth_core_type, HalL1MemAddrType::MAILBOX);
+
+                // Read go message (first 8 bytes)
+                std::vector<std::uint32_t> go_data(2, 0);
+                tt_metal::detail::ReadFromDeviceL1(dev, master_router_logical_core, go_addr, 8, go_data, CoreType::ETH);
+                // Read go_message_index
+                std::vector<std::uint32_t> go_idx_data(1, 0);
+                tt_metal::detail::ReadFromDeviceL1(
+                    dev, master_router_logical_core, go_idx_addr, 4, go_idx_data, CoreType::ETH);
+                // Read launch message first 80 bytes (enough for kernel_text_offset + enables)
+                std::vector<std::uint32_t> launch_data(20, 0);
+                tt_metal::detail::ReadFromDeviceL1(
+                    dev, master_router_logical_core, launch_addr, 80, launch_data, CoreType::ETH);
+                // Read mailbox area (ncrisc_halt + go_message_index area, 16 bytes)
+                std::vector<std::uint32_t> mailbox_data(4, 0);
+                tt_metal::detail::ReadFromDeviceL1(
+                    dev, master_router_logical_core, mailbox_addr, 16, mailbox_data, CoreType::ETH);
+                // Read first 16 bytes of L1 (trampoline area)
+                std::vector<std::uint32_t> l1_start(4, 0);
+                tt_metal::detail::ReadFromDeviceL1(dev, master_router_logical_core, 0, 16, l1_start, CoreType::ETH);
+
                 log_info(
                     tt::LogMetal,
                     "Fabric Router Sync: master chan={}, logical core={}, sync address=0x{:08x}",
                     master_router_chan,
                     master_router_logical_core.str(),
                     router_sync_address);
+                log_info(
+                    tt::LogMetal,
+                    "Fabric Router Sync DIAG: go_addr=0x{:x} go_data=[0x{:08x}, 0x{:08x}] "
+                    "go_idx_addr=0x{:x} go_message_index={}",
+                    go_addr,
+                    go_data[0],
+                    go_data[1],
+                    go_idx_addr,
+                    go_idx_data[0]);
+                // Decode launch message fields (kernel_config_msg_t layout):
+                // kernel_config_base[3] at words 0-2, kernel_text_offset[0] at word 11, enables at word 19
+                uint32_t kconfig_tensix = launch_data[0];
+                uint32_t kconfig_active_eth = launch_data[1];
+                uint32_t kconfig_idle_eth = launch_data[2];
+                uint32_t kernel_text_offset_0 = launch_data[11];  // offset 44 / 4
+                uint32_t enables = launch_data[19];               // offset 76 / 4
+                log_info(
+                    tt::LogMetal,
+                    "Fabric Router Sync DIAG: launch_addr=0x{:x} kconfig=[0x{:x}, 0x{:x}, 0x{:x}] "
+                    "kernel_text_offset[0]=0x{:x} enables=0x{:08x}",
+                    launch_addr,
+                    kconfig_tensix,
+                    kconfig_active_eth,
+                    kconfig_idle_eth,
+                    kernel_text_offset_0,
+                    enables);
+                log_info(
+                    tt::LogMetal,
+                    "Fabric Router Sync DIAG: mailbox_addr=0x{:x} mailbox_data=[0x{:08x}, 0x{:08x}, 0x{:08x}, "
+                    "0x{:08x}]",
+                    mailbox_addr,
+                    mailbox_data[0],
+                    mailbox_data[1],
+                    mailbox_data[2],
+                    mailbox_data[3]);
+                log_info(
+                    tt::LogMetal,
+                    "Fabric Router Sync DIAG: L1[0x0..0xF]=[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}]",
+                    l1_start[0],
+                    l1_start[1],
+                    l1_start[2],
+                    l1_start[3]);
+
+                // Read syseng API table (0x7CF00) and ret stub (0x7CF10)
+                std::vector<std::uint32_t> api_table(5, 0);
+                tt_metal::detail::ReadFromDeviceL1(
+                    dev, master_router_logical_core, 0x7CF00, 20, api_table, CoreType::ETH);
+                log_info(
+                    tt::LogMetal,
+                    "Fabric Router Sync DIAG: API_TABLE[0x7CF00]=[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}] "
+                    "RET_STUB[0x7CF10]=0x{:08x}",
+                    api_table[0],
+                    api_table[1],
+                    api_table[2],
+                    api_table[3],
+                    api_table[4]);
+
+                // Read kernel config buffer start (ACTIVE_ETH base)
+                if (kconfig_active_eth != 0) {
+                    std::vector<std::uint32_t> kcfg_data(4, 0);
+                    tt_metal::detail::ReadFromDeviceL1(
+                        dev, master_router_logical_core, kconfig_active_eth, 16, kcfg_data, CoreType::ETH);
+                    log_info(
+                        tt::LogMetal,
+                        "Fabric Router Sync DIAG: L1[kconfig_base=0x{:x}]=[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}]",
+                        kconfig_active_eth,
+                        kcfg_data[0],
+                        kcfg_data[1],
+                        kcfg_data[2],
+                        kcfg_data[3]);
+                }
+                // Read actual kernel entry point (kconfig_base + kernel_text_offset[0])
+                uint32_t kernel_entry = kconfig_active_eth + kernel_text_offset_0;
+                if (kconfig_active_eth != 0) {
+                    std::vector<std::uint32_t> kentry_data(4, 0);
+                    tt_metal::detail::ReadFromDeviceL1(
+                        dev, master_router_logical_core, kernel_entry, 16, kentry_data, CoreType::ETH);
+                    log_info(
+                        tt::LogMetal,
+                        "Fabric Router Sync DIAG: L1[kernel_entry=0x{:x}]=[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}]",
+                        kernel_entry,
+                        kentry_data[0],
+                        kentry_data[1],
+                        kentry_data[2],
+                        kentry_data[3]);
+                }
+
+                // Read EDM status area: check for STARTED (0xA0B0C0D0)
+                std::vector<std::uint32_t> status_area(8, 0);
+                tt_metal::detail::ReadFromDeviceL1(
+                    dev, master_router_logical_core, router_sync_address - 16, 32, status_area, CoreType::ETH);
+                log_info(
+                    tt::LogMetal,
+                    "Fabric Router Sync DIAG: status_area[sync-16..sync+15]="
+                    "[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}]",
+                    status_area[0],
+                    status_area[1],
+                    status_area[2],
+                    status_area[3],
+                    status_area[4],
+                    status_area[5],
+                    status_area[6],
+                    status_area[7]);
+
+                // Read all active router ETH cores on this device
+                auto num_routers = builder_context.get_num_fabric_initialized_routers(dev->id());
+                log_info(
+                    tt::LogMetal,
+                    "Fabric Router Sync DIAG: Device {} has {} initialized routers",
+                    dev->id(),
+                    num_routers);
+
+                // Try to read peer (MMIO) device's master router status for comparison
+                auto mmio_dev_id =
+                    tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(dev->id());
+                if (mmio_dev_id != dev->id()) {
+                    try {
+                        auto* mmio_dev = this->get_device(mmio_dev_id);
+                        if (mmio_dev && builder_context.get_num_fabric_initialized_routers(mmio_dev_id) > 0) {
+                            const auto peer_router_chan = builder_context.get_fabric_master_router_chan(mmio_dev_id);
+                            const auto peer_router_core =
+                                tt::tt_metal::MetalContext::instance()
+                                    .get_cluster()
+                                    .get_soc_desc(mmio_dev_id)
+                                    .get_eth_core_for_channel(peer_router_chan, CoordSystem::LOGICAL);
+                            std::vector<std::uint32_t> peer_status(1, 0);
+                            tt_metal::detail::ReadFromDeviceL1(
+                                mmio_dev, peer_router_core, router_sync_address, 4, peer_status, CoreType::ETH);
+                            log_info(
+                                tt::LogMetal,
+                                "Fabric Router Sync DIAG: Peer MMIO device {} master router (chan={}) status=0x{:08x}",
+                                mmio_dev_id,
+                                peer_router_chan,
+                                peer_status[0]);
+                        }
+                    } catch (...) {
+                        log_info(
+                            tt::LogMetal,
+                            "Fabric Router Sync DIAG: Failed to read peer MMIO device {} status",
+                            mmio_dev_id);
+                    }
+                }
+
+                // Read handshake area on the master router
+                std::vector<std::uint32_t> hs_data(8, 0);
+                // handshake_addr is typically right after erisc_l1_unreserved_base
+                uint32_t hs_addr = router_sync_address + 32;  // approximate; read a range
+                tt_metal::detail::ReadFromDeviceL1(
+                    dev, master_router_logical_core, hs_addr, 32, hs_data, CoreType::ETH);
+                log_info(
+                    tt::LogMetal,
+                    "Fabric Router Sync DIAG: Device {} handshake area [sync+32..sync+63]="
+                    "[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}]",
+                    dev->id(),
+                    hs_data[0],
+                    hs_data[1],
+                    hs_data[2],
+                    hs_data[3],
+                    hs_data[4],
+                    hs_data[5],
+                    hs_data[6],
+                    hs_data[7]);
+
+                // Re-read the current status right before throwing
+                std::vector<std::uint32_t> final_status(1, 0);
+                tt_metal::detail::ReadFromDeviceL1(
+                    dev, master_router_logical_core, router_sync_address, 4, final_status, CoreType::ETH);
+
                 TT_THROW(
-                    "Fabric Router Sync: Timeout after {} ms. Device {}: Expected status 0x{:08x}, got 0x{:08x}",
+                    "Fabric Router Sync: Timeout after {} ms. Device {}: Expected status 0x{:08x}, got 0x{:08x} (final "
+                    "re-read: 0x{:08x})",
                     timeout_ms,
                     dev->id(),
                     expected_status,
-                    master_router_status[0]);
+                    master_router_status[0],
+                    final_status[0]);
             }
         }
 
@@ -708,12 +983,19 @@ void DeviceManager::wait_for_fabric_router_sync(uint32_t timeout_ms) const {
         if (tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(dev->id()) != dev->id()) {
             continue;
         }
+        // Skip devices not in the fabric mesh
+        if (!control_plane.is_chip_mapped(dev->id())) {
+            continue;
+        }
 
         auto tunnels_from_mmio =
             tt::tt_metal::MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(dev->id());
         for (const auto& tunnel : tunnels_from_mmio) {
             // Need to poll on devices from farthest to the closest.
             for (auto j = tunnel.size() - 1; j > 0; j--) {
+                if (!control_plane.is_chip_mapped(tunnel[j])) {
+                    continue;
+                }
                 wait_for_handshake(get_device(tunnel[j]));
             }
         }

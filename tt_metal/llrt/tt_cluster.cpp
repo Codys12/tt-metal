@@ -41,6 +41,7 @@
 #include <umd/device/types/cluster_descriptor_types.hpp>
 #include <umd/device/types/cluster_types.hpp>
 #include <umd/device/types/xy_pair.hpp>
+#include <umd/device/chip/remote_chip.hpp>
 #include <unistd.h>
 
 static constexpr uint32_t HOST_MEM_CHANNELS = 4;
@@ -943,6 +944,15 @@ void Cluster::write_reg(const std::uint32_t *mem_ptr, tt_cxy_pair target, uint64
     }
 }
 
+void Cluster::write_remote_eth_debug_reg(
+    ChipId remote_chip, uint32_t reg_addr, uint32_t reg_value, tt_xy_pair sender_noc0) const {
+    TT_FATAL(this->cluster_desc_->is_chip_remote(remote_chip), "Chip {} is not a remote chip", remote_chip);
+    auto* chip = this->driver_->get_chip(remote_chip);
+    auto* remote_chip_ptr = dynamic_cast<tt::umd::RemoteChip*>(chip);
+    TT_FATAL(remote_chip_ptr != nullptr, "Chip {} is not a RemoteChip", remote_chip);
+    remote_chip_ptr->get_remote_communication()->write_remote_reg(reg_addr, reg_value, sender_noc0);
+}
+
 void Cluster::read_reg(std::uint32_t *mem_ptr, tt_cxy_pair target, uint64_t addr) const {
     const unsigned int size_in_bytes = sizeof(uint32_t);
     int chip_id = target.chip;
@@ -1077,30 +1087,69 @@ std::unordered_map<ChipId, std::vector<CoreCoord>> Cluster::get_ethernet_cores_g
     ChipId chip_id) const {
     std::unordered_map<ChipId, std::vector<CoreCoord>> connected_chips;
     const auto &all_eth_connections = this->cluster_desc_->get_ethernet_connections();
-    if (!all_eth_connections.contains(chip_id)) {
-        return {};
-    }
-    for (const auto &[eth_chan, connected_chip_chan] : all_eth_connections.at(chip_id)) {
-        const auto &other_chip_id = std::get<0>(connected_chip_chan);
-        if (!connected_chips.contains(other_chip_id)) {
-            std::vector<CoreCoord> active_ethernet_cores;
+    if (all_eth_connections.contains(chip_id)) {
+        for (const auto& [eth_chan, connected_chip_chan] : all_eth_connections.at(chip_id)) {
+            const auto& other_chip_id = std::get<0>(connected_chip_chan);
+            if (!connected_chips.contains(other_chip_id)) {
+                std::vector<CoreCoord> active_ethernet_cores;
 
-            for (const auto &channel_pair :
-                 this->cluster_desc_->get_directly_connected_ethernet_channels_between_chips(chip_id, other_chip_id)) {
-                EthernetChannel local_chip_chan = std::get<0>(channel_pair);
-                active_ethernet_cores.emplace_back(
-                    get_soc_desc(chip_id).get_eth_core_for_channel(local_chip_chan, CoordSystem::LOGICAL));
+                for (const auto& channel_pair :
+                     this->cluster_desc_->get_directly_connected_ethernet_channels_between_chips(
+                         chip_id, other_chip_id)) {
+                    EthernetChannel local_chip_chan = std::get<0>(channel_pair);
+                    active_ethernet_cores.emplace_back(
+                        get_soc_desc(chip_id).get_eth_core_for_channel(local_chip_chan, CoordSystem::LOGICAL));
+                }
+                connected_chips.insert({other_chip_id, active_ethernet_cores});
+            } else {
+                continue;
             }
-            connected_chips.insert({other_chip_id, active_ethernet_cores});
-        } else {
-            continue;
         }
     }
+
+    // Also include remote device connections (lite-fabric tunnels).
+    // These are stored separately in UMD with the MMIO chip as key and remote chip's
+    // unique_id as value, so we need to handle both directions.
+    const auto& remote_connections = this->cluster_desc_->get_ethernet_connections_to_remote_devices();
+    std::unordered_map<uint64_t, ChipId> uid_to_chip_id;
+    for (const auto& [cid, uid] : this->cluster_desc_->get_chip_unique_ids()) {
+        uid_to_chip_id[uid] = cid;
+    }
+
+    // Case A: chip_id is MMIO with remote device connections
+    if (remote_connections.contains(chip_id)) {
+        for (const auto& [mmio_chan, remote_info] : remote_connections.at(chip_id)) {
+            const auto& [remote_uid, remote_chan] = remote_info;
+            auto it = uid_to_chip_id.find(remote_uid);
+            if (it == uid_to_chip_id.end()) {
+                continue;
+            }
+            ChipId remote_chip_id = it->second;
+            auto eth_core = get_soc_desc(chip_id).get_eth_core_for_channel(mmio_chan, CoordSystem::LOGICAL);
+            connected_chips[remote_chip_id].push_back(eth_core);
+        }
+    }
+
+    // Case B: chip_id is a remote device connected to MMIO device(s)
+    if (this->cluster_desc_->get_chip_unique_ids().contains(chip_id)) {
+        uint64_t chip_uid = this->cluster_desc_->get_chip_unique_ids().at(chip_id);
+        for (const auto& [mmio_chip, channels] : remote_connections) {
+            for (const auto& [mmio_chan, remote_info] : channels) {
+                const auto& [remote_uid, remote_chan] = remote_info;
+                if (remote_uid == chip_uid) {
+                    auto eth_core = get_soc_desc(chip_id).get_eth_core_for_channel(remote_chan, CoordSystem::LOGICAL);
+                    connected_chips[mmio_chip].push_back(eth_core);
+                }
+            }
+        }
+    }
+
     return connected_chips;
 }
 
 // Ethernet cluster api
 void Cluster::initialize_ethernet_sockets() {
+    log_info(tt::LogDevice, "DEBUG: initialize_ethernet_sockets start");
     for (const auto& chip_id : this->driver_->get_target_device_ids()) {
         if (!this->ethernet_sockets_.contains(chip_id)) {
             this->ethernet_sockets_.insert({chip_id, {}});
@@ -1119,6 +1168,16 @@ void Cluster::initialize_ethernet_sockets() {
                 continue;
             }
             for (const auto &eth_core : eth_cores) {
+                if (!this->device_eth_routing_info_.contains(chip_id) ||
+                    !this->device_eth_routing_info_.at(chip_id).contains(eth_core)) {
+                    log_info(
+                        tt::LogDevice,
+                        "DEBUG: init_sockets: chip {} core ({},{}) NOT in routing info, skipping",
+                        chip_id,
+                        eth_core.x,
+                        eth_core.y);
+                    continue;
+                }
                 if (this->device_eth_routing_info_.at(chip_id).at(eth_core) == EthRouterMode::IDLE) {
                     this->ethernet_sockets_.at(chip_id).at(connected_chip_id).emplace_back(eth_core);
                     this->ethernet_sockets_.at(connected_chip_id)
@@ -1129,6 +1188,7 @@ void Cluster::initialize_ethernet_sockets() {
             }
         }
     }
+    log_info(tt::LogDevice, "DEBUG: initialize_ethernet_sockets done");
 }
 
 void Cluster::disable_ethernet_cores_with_retrain() {
@@ -1184,6 +1244,157 @@ void Cluster::initialize_ethernet_cores_router_mode() {
             }
         }
     }
+
+    // Second pass: populate routing info for remote devices accessed via lite-fabric tunnels.
+    // UMD only populates active_eth_channels for the MMIO side of remote connections, so remote
+    // chips end up with empty routing info. We use ethernet_connections_to_remote_devices to
+    // discover the remote chip's ethernet cores and mark them as IDLE.
+    std::unordered_map<uint64_t, ChipId> uid_to_chip_id;
+    for (const auto& [chip_id, uid] : this->cluster_desc_->get_chip_unique_ids()) {
+        uid_to_chip_id[uid] = chip_id;
+    }
+
+    const auto& remote_connections = this->cluster_desc_->get_ethernet_connections_to_remote_devices();
+    for (const auto& [mmio_chip, channels] : remote_connections) {
+        for (const auto& [mmio_chan, remote_info] : channels) {
+            const auto& [remote_uid, remote_chan] = remote_info;
+            auto it = uid_to_chip_id.find(remote_uid);
+            if (it == uid_to_chip_id.end()) {
+                continue;  // Remote chip not in this cluster
+            }
+            ChipId remote_chip_id = it->second;
+            const auto& soc_desc = get_soc_desc(remote_chip_id);
+            auto eth_core = soc_desc.get_eth_core_for_channel(remote_chan, CoordSystem::LOGICAL);
+
+            if (!this->device_eth_routing_info_.contains(remote_chip_id)) {
+                this->device_eth_routing_info_.insert({remote_chip_id, {}});
+            }
+            auto& routing_info = this->device_eth_routing_info_[remote_chip_id];
+            if (!routing_info.contains(eth_core)) {
+                routing_info.insert({eth_core, EthRouterMode::IDLE});
+            }
+
+            // Track cores discovered from remote connections for is_ethernet_link_up fallback
+            this->remote_device_eth_cores_[remote_chip_id].insert(eth_core);
+        }
+    }
+
+    // Third pass: fill routing info gaps using get_ethernet_connections().
+    // get_ethernet_connections_to_remote_devices() may not cover all links to remote chips
+    // (e.g., direct MMIO<->remote connections that UMD classifies as normal ethernet).
+    const auto& all_eth_connections = this->cluster_desc_->get_ethernet_connections();
+    for (const auto& [chip_id, connections] : all_eth_connections) {
+        for (const auto& [eth_chan, connected_chip_chan] : connections) {
+            ChipId other_chip_id = std::get<0>(connected_chip_chan);
+            EthernetChannel other_chan = std::get<1>(connected_chip_chan);
+            auto fill_if_missing = [&](ChipId cid, EthernetChannel chan) {
+                auto it = this->device_eth_routing_info_.find(cid);
+                if (it == this->device_eth_routing_info_.end()) {
+                    return;
+                }
+                auto eth_core = get_soc_desc(cid).get_eth_core_for_channel(chan, CoordSystem::LOGICAL);
+                if (!it->second.contains(eth_core)) {
+                    it->second.insert({eth_core, EthRouterMode::IDLE});
+                }
+            };
+            fill_if_missing(chip_id, eth_chan);
+            fill_if_missing(other_chip_id, other_chan);
+        }
+    }
+}
+
+void Cluster::refresh_remote_ethernet_routing_info() {
+    // Clear stale remote device routing info and link-up tracking, then re-populate
+    // using the current (post-upgrade) SOC descriptors.  This is necessary because
+    // Phase 2b replaces the proxy SOC descriptors for remote chips with real ones
+    // (from ARC telemetry), which may have different eth harvesting masks and thus
+    // different channel-to-logical-core mappings.
+    std::unordered_map<uint64_t, ChipId> uid_to_chip_id;
+    for (const auto& [chip_id, uid] : this->cluster_desc_->get_chip_unique_ids()) {
+        uid_to_chip_id[uid] = chip_id;
+    }
+
+    const auto& remote_connections = this->cluster_desc_->get_ethernet_connections_to_remote_devices();
+
+    // Collect all remote chip IDs from both remote_connections and ethernet_connections
+    std::unordered_set<ChipId> remote_chip_ids;
+    for (const auto& [mmio_chip, channels] : remote_connections) {
+        for (const auto& [mmio_chan, remote_info] : channels) {
+            const auto& [remote_uid, remote_chan] = remote_info;
+            auto it = uid_to_chip_id.find(remote_uid);
+            if (it != uid_to_chip_id.end()) {
+                remote_chip_ids.insert(it->second);
+            }
+        }
+    }
+    // Also discover remote chips from get_ethernet_connections() that may not appear
+    // in get_ethernet_connections_to_remote_devices().
+    const auto& all_eth_connections = this->cluster_desc_->get_ethernet_connections();
+    for (const auto& [chip_id, connections] : all_eth_connections) {
+        for (const auto& [eth_chan, connected_chip_chan] : connections) {
+            ChipId other_chip_id = std::get<0>(connected_chip_chan);
+            if (!this->cluster_desc_->is_chip_mmio_capable(other_chip_id) &&
+                this->device_eth_routing_info_.contains(other_chip_id)) {
+                remote_chip_ids.insert(other_chip_id);
+            }
+        }
+    }
+
+    // Clear old entries for remote devices
+    for (ChipId remote_chip_id : remote_chip_ids) {
+        this->device_eth_routing_info_[remote_chip_id].clear();
+        this->remote_device_eth_cores_[remote_chip_id].clear();
+    }
+
+    // Re-populate using current SOC descriptors from remote_connections
+    for (const auto& [mmio_chip, channels] : remote_connections) {
+        for (const auto& [mmio_chan, remote_info] : channels) {
+            const auto& [remote_uid, remote_chan] = remote_info;
+            auto it = uid_to_chip_id.find(remote_uid);
+            if (it == uid_to_chip_id.end()) {
+                continue;
+            }
+            ChipId remote_chip_id = it->second;
+            const auto& soc_desc = get_soc_desc(remote_chip_id);
+            auto eth_core = soc_desc.get_eth_core_for_channel(remote_chan, CoordSystem::LOGICAL);
+
+            log_info(
+                tt::LogDevice,
+                "refresh_remote_eth_routing: chip {} chan {} -> core ({},{})",
+                remote_chip_id,
+                remote_chan,
+                eth_core.x,
+                eth_core.y);
+
+            auto& routing_info = this->device_eth_routing_info_[remote_chip_id];
+            if (!routing_info.contains(eth_core)) {
+                routing_info.insert({eth_core, EthRouterMode::IDLE});
+            }
+
+            this->remote_device_eth_cores_[remote_chip_id].insert(eth_core);
+        }
+    }
+
+    // Also fill from get_ethernet_connections() for remote chips not fully covered above
+    for (const auto& [chip_id, connections] : all_eth_connections) {
+        for (const auto& [eth_chan, connected_chip_chan] : connections) {
+            ChipId other_chip_id = std::get<0>(connected_chip_chan);
+            EthernetChannel other_chan = std::get<1>(connected_chip_chan);
+            auto fill_remote = [&](ChipId cid, EthernetChannel chan) {
+                if (!remote_chip_ids.contains(cid)) {
+                    return;
+                }
+                auto& routing_info = this->device_eth_routing_info_[cid];
+                auto eth_core = get_soc_desc(cid).get_eth_core_for_channel(chan, CoordSystem::LOGICAL);
+                if (!routing_info.contains(eth_core)) {
+                    routing_info.insert({eth_core, EthRouterMode::IDLE});
+                    this->remote_device_eth_cores_[cid].insert(eth_core);
+                }
+            };
+            fill_remote(chip_id, eth_chan);
+            fill_remote(other_chip_id, other_chan);
+        }
+    }
 }
 
 std::unordered_set<ChipId> Cluster::get_ethernet_connected_device_ids(ChipId chip_id) const {
@@ -1214,6 +1425,7 @@ void Cluster::configure_ethernet_cores_for_fabric_routers(
 }
 
 void Cluster::reserve_ethernet_cores_for_fabric_routers(uint8_t num_routing_planes) {
+    log_info(tt::LogDevice, "DEBUG: reserve_ethernet_cores_for_fabric_routers({})", num_routing_planes);
     if (num_routing_planes == std::numeric_limits<uint8_t>::max()) {
         // default behavior, reserve whatever cores are available
         for (const auto& [chip_id, eth_cores] : this->device_eth_routing_info_) {
@@ -1233,7 +1445,15 @@ void Cluster::reserve_ethernet_cores_for_fabric_routers(uint8_t num_routing_plan
     // to reserve specified number of cores, ensure that the same are avaialble on connected chip id as well
     for (const auto& chip_id : this->driver_->get_target_device_ids()) {
         const auto& connected_chips_and_cores = this->get_ethernet_cores_grouped_by_connected_chips(chip_id);
+        log_info(
+            tt::LogDevice, "DEBUG: reserve: chip {} has {} connected chips", chip_id, connected_chips_and_cores.size());
         for (const auto& [connected_chip_id, cores] : connected_chips_and_cores) {
+            log_info(
+                tt::LogDevice,
+                "DEBUG: reserve: chip {} -> connected chip {} ({} cores)",
+                chip_id,
+                connected_chip_id,
+                cores.size());
             if (pairs_done.contains(std::make_pair(chip_id, connected_chip_id))) {
                 // the cores for this pair of chips are already allocated, skip
                 continue;
@@ -1258,8 +1478,55 @@ void Cluster::reserve_ethernet_cores_for_fabric_routers(uint8_t num_routing_plan
                     break;
                 }
 
+                // Never take the only link between an MMIO and remote device.
+                // The remote device needs at least one lite fabric channel for
+                // UMD reads/writes (dispatch setup, l1_barrier, etc.).
+                if (is_last_link() && cores.size() == 1 &&
+                    (is_mmio_device(chip_id) != is_mmio_device(connected_chip_id))) {
+                    log_info(
+                        tt::LogDevice,
+                        "DEBUG: reserve: skipping last link between MMIO chip {} and remote chip {} to preserve UMD "
+                        "channel",
+                        chip_id,
+                        connected_chip_id);
+                    num_reserved_cores++;
+                    break;
+                }
+
+                log_info(
+                    tt::LogDevice,
+                    "DEBUG: reserve: getting connected core for chip {} core ({},{})",
+                    chip_id,
+                    eth_core.x,
+                    eth_core.y);
                 const auto connected_core =
                     std::get<1>(this->get_connected_ethernet_core(std::make_tuple(chip_id, eth_core)));
+                log_info(
+                    tt::LogDevice,
+                    "DEBUG: reserve: connected core = ({},{}) on chip {}",
+                    connected_core.x,
+                    connected_core.y,
+                    connected_chip_id);
+                if (!this->device_eth_routing_info_.contains(chip_id) ||
+                    !this->device_eth_routing_info_.at(chip_id).contains(eth_core)) {
+                    log_info(
+                        tt::LogDevice,
+                        "DEBUG: reserve: WARNING chip {} core ({},{}) NOT in routing info!",
+                        chip_id,
+                        eth_core.x,
+                        eth_core.y);
+                    continue;
+                }
+                if (!this->device_eth_routing_info_.contains(connected_chip_id) ||
+                    !this->device_eth_routing_info_.at(connected_chip_id).contains(connected_core)) {
+                    log_info(
+                        tt::LogDevice,
+                        "DEBUG: reserve: WARNING connected chip {} core ({},{}) NOT in routing info!",
+                        connected_chip_id,
+                        connected_core.x,
+                        connected_core.y);
+                    continue;
+                }
                 if (this->device_eth_routing_info_.at(chip_id).at(eth_core) == EthRouterMode::FABRIC_ROUTER) {
                     // already reserved for fabric, potenially by the connected chip id
                     num_reserved_cores++;
@@ -1284,9 +1551,11 @@ void Cluster::reserve_ethernet_cores_for_fabric_routers(uint8_t num_routing_plan
         }
     }
 
+    log_info(tt::LogDevice, "DEBUG: reserve: done with core reservation, initializing sockets");
     // re-init sockets to reflect fabric routing
     this->ethernet_sockets_.clear();
     this->initialize_ethernet_sockets();
+    log_info(tt::LogDevice, "DEBUG: reserve: sockets initialized");
 }
 
 void Cluster::release_ethernet_cores_for_fabric_routers() {
@@ -1305,8 +1574,23 @@ std::set<tt_fabric::chan_id_t> Cluster::get_fabric_ethernet_channels(ChipId chip
     std::set<tt_fabric::chan_id_t> fabric_ethernet_channels;
     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
     const auto& active_eth_cores = control_plane.get_active_ethernet_cores(chip_id, false);
+    log_info(
+        tt::LogDevice,
+        "DEBUG: get_fabric_ethernet_channels: chip {} has {} active eth cores",
+        chip_id,
+        active_eth_cores.size());
     for (const auto& eth_core : active_eth_cores) {
         if (!this->is_ethernet_link_up(chip_id, eth_core)) {
+            continue;
+        }
+        if (!this->device_eth_routing_info_.contains(chip_id) ||
+            !this->device_eth_routing_info_.at(chip_id).contains(eth_core)) {
+            log_info(
+                tt::LogDevice,
+                "DEBUG: get_fabric_ethernet_channels: chip {} core ({},{}) NOT in routing info",
+                chip_id,
+                eth_core.x,
+                eth_core.y);
             continue;
         }
         if (this->device_eth_routing_info_.at(chip_id).at(eth_core) == EthRouterMode::FABRIC_ROUTER) {
@@ -1331,29 +1615,78 @@ std::vector<CoreCoord> Cluster::get_fabric_ethernet_routers_between_src_and_dest
 bool Cluster::is_ethernet_link_up(ChipId chip_id, const CoreCoord& logical_core) const {
     const auto& soc_desc = get_soc_desc(chip_id);
     EthernetChannel eth_chan = soc_desc.logical_eth_core_to_chan_map.at(logical_core);
-    return this->cluster_desc_->ethernet_core_has_active_ethernet_link(chip_id, eth_chan);
+    if (this->cluster_desc_->ethernet_core_has_active_ethernet_link(chip_id, eth_chan)) {
+        return true;
+    }
+    // Fallback: for remote devices, UMD only tracks the MMIO side of the link.
+    // Check if this core was discovered from remote device connections.
+    auto it = this->remote_device_eth_cores_.find(chip_id);
+    if (it != this->remote_device_eth_cores_.end()) {
+        return it->second.contains(logical_core);
+    }
+    return false;
 }
 
 std::tuple<ChipId, CoreCoord> Cluster::get_connected_ethernet_core(std::tuple<ChipId, CoreCoord> eth_core) const {
     const auto &soc_desc = get_soc_desc(std::get<0>(eth_core));
     EthernetChannel eth_chan = soc_desc.logical_eth_core_to_chan_map.at(std::get<1>(eth_core));
+    ChipId chip_id = std::get<0>(eth_core);
     TT_FATAL(
-        this->is_ethernet_link_up(std::get<0>(eth_core), std::get<1>(eth_core)),
+        this->is_ethernet_link_up(chip_id, std::get<1>(eth_core)),
         "Logical eth core {} is not an active eth core on chip {}.",
         std::get<1>(eth_core).str(),
-        std::get<0>(eth_core));
+        chip_id);
+
+    // First try local (intra-cluster) connections
     const auto& ethernet_connections_within_cluster = this->get_ethernet_connections();
+    if (ethernet_connections_within_cluster.contains(chip_id) &&
+        ethernet_connections_within_cluster.at(chip_id).contains(eth_chan)) {
+        auto connected_eth_core = this->cluster_desc_->get_chip_and_channel_of_remote_ethernet_core(chip_id, eth_chan);
+        return std::make_tuple(
+            std::get<0>(connected_eth_core),
+            get_soc_desc(std::get<0>(connected_eth_core))
+                .get_eth_core_for_channel(std::get<1>(connected_eth_core), CoordSystem::LOGICAL));
+    }
+
+    // Try remote device connections (lite-fabric tunnels)
+    const auto& remote_connections = this->get_ethernet_connections_to_remote_devices();
+    std::unordered_map<uint64_t, ChipId> uid_to_chip_id;
+    for (const auto& [cid, uid] : this->cluster_desc_->get_chip_unique_ids()) {
+        uid_to_chip_id[uid] = cid;
+    }
+
+    // Case A: chip_id is MMIO with a remote connection on this channel
+    if (remote_connections.contains(chip_id) && remote_connections.at(chip_id).contains(eth_chan)) {
+        const auto& [remote_uid, remote_chan] = remote_connections.at(chip_id).at(eth_chan);
+        auto it = uid_to_chip_id.find(remote_uid);
+        TT_FATAL(it != uid_to_chip_id.end(), "Remote unique ID {} not found in cluster", remote_uid);
+        ChipId remote_chip_id = it->second;
+        return std::make_tuple(
+            remote_chip_id, get_soc_desc(remote_chip_id).get_eth_core_for_channel(remote_chan, CoordSystem::LOGICAL));
+    }
+
+    // Case B: chip_id is a remote device, find the MMIO chip connected on this channel
+    if (!this->cluster_desc_->get_chip_unique_ids().contains(chip_id)) {
+        log_info(tt::LogDevice, "DEBUG: get_connected_ethernet_core: chip {} not in get_chip_unique_ids()!", chip_id);
+        TT_FATAL(false, "Chip {} not found in get_chip_unique_ids()", chip_id);
+    }
+    uint64_t chip_uid = this->cluster_desc_->get_chip_unique_ids().at(chip_id);
+    for (const auto& [mmio_chip, channels] : remote_connections) {
+        for (const auto& [mmio_chan, remote_info] : channels) {
+            const auto& [remote_uid, remote_chan] = remote_info;
+            if (remote_uid == chip_uid && remote_chan == eth_chan) {
+                return std::make_tuple(
+                    mmio_chip, get_soc_desc(mmio_chip).get_eth_core_for_channel(mmio_chan, CoordSystem::LOGICAL));
+            }
+        }
+    }
+
     TT_FATAL(
-        ethernet_connections_within_cluster.contains(std::get<0>(eth_core)) and
-            ethernet_connections_within_cluster.at(std::get<0>(eth_core)).contains(eth_chan),
-        "Chip {} logical eth core {} connects to a remote mmio device",
-        std::get<0>(eth_core),
+        false,
+        "Chip {} logical eth core {} has no connected ethernet core in local or remote connections",
+        chip_id,
         std::get<1>(eth_core).str());
-    auto connected_eth_core =
-        this->cluster_desc_->get_chip_and_channel_of_remote_ethernet_core(std::get<0>(eth_core), eth_chan);
-    return std::make_tuple(
-        std::get<0>(connected_eth_core),
-        soc_desc.get_eth_core_for_channel(std::get<1>(connected_eth_core), CoordSystem::LOGICAL));
+    return {};
 }
 
 // TODO: unify uint64_t with ChipUID
