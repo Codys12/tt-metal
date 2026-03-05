@@ -19,14 +19,57 @@ struct ConnectedRiscInterface {
     static constexpr uint32_t k_SoftResetAddr = 0xFFB121B0;
 
     // Put the connected RISC into reset.
-    // Must include bit 11 (ERISC0/BRISC) to keep ERISC0 in reset.  The previous
-    // value 0x47000 omitted bit 11, which turned a direct register write into an
-    // accidental ERISC0 deassert when the core was in POR state (0x47800).
-    // ERISC0 would then boot and its base firmware init could overwrite the lite
-    // fabric config/binary being sent over ethernet.
+    //
+    // On fresh chip boot (after FLR), ERISC0's bootrom actively uses TXQ0 for
+    // ETH link training.  Hard-resetting ERISC0 while TXQ0 has an in-flight
+    // operation can halt the DMA engine mid-transfer, leaving CMD_ONGOING
+    // permanently asserted.  Remote ERISC1 would then hang at
+    // eth_txq_is_busy(0) and never send its handshake packet.
+    //
+    // Two-step sequence:
+    // Step 1: Assert only ERISC1 reset, keeping ERISC0 running so it
+    //         can finish any in-flight TXQ0 operation naturally.
+    // Step 2: Brief delay for the TXQ0 DMA to drain.
+    // Step 3: Assert both ERISC0 + ERISC1 reset.  TXQ0 is now idle.
+    // Step 4: MAC queue flush on remote TXQ0.
+    //
+    // NOTE: Do NOT disable KEEPALIVE on remote TXQ0 via WRITE_REG here.
+    // KEEPALIVE must be set on both sides for reliable packet delivery.
+    // Disabling it breaks ACK delivery for all subsequent WRITE_REGs,
+    // including the re-enable itself.
     inline static void assert_connected_dm1_reset() {
-        constexpr uint32_t k_ResetValue = 0x47800;
-        internal_::eth_write_remote_reg(k_Txq, k_SoftResetAddr, k_ResetValue);
+        // Step 0: Ensure remote TXQ0 KEEPALIVE is enabled.  A prior run may
+        // have left it disabled (e.g. a debug WRITE_REG that cleared CTRL).
+        // WRITE_REG delivery via START_REG is ACK'd at the MAC level and
+        // does not depend on the remote's TXQ KEEPALIVE setting.
+        constexpr uint32_t k_RemoteTxqCtrlAddr = 0xFFB90000;  // ETH_TXQ0 CTRL
+        internal_::eth_write_remote_reg(k_Txq, k_RemoteTxqCtrlAddr, 0x1);
+        while (internal_::eth_txq_is_busy(k_Txq)) {
+        }
+
+        // Step 1: ERISC1 in reset, ERISC0 stays running.
+        // 0x47000 is safe here because the chip has already booted (ETH link
+        // is up), so ERISC0 is already deasserted.
+        constexpr uint32_t k_ResetErisc1Only = 0x47000;
+        internal_::eth_write_remote_reg(k_Txq, k_SoftResetAddr, k_ResetErisc1Only);
+        while (internal_::eth_txq_is_busy(k_Txq)) {
+        }
+
+        // Step 2: Let ERISC0 drain any pending TXQ0 operation (~50 µs).
+        for (volatile uint32_t i = 0; i < 50000; i++) {
+        }
+
+        // Step 3: Now assert ERISC0 reset too.  TXQ0 is now idle.
+        constexpr uint32_t k_ResetAll = 0x47800;
+        internal_::eth_write_remote_reg(k_Txq, k_SoftResetAddr, k_ResetAll);
+        while (internal_::eth_txq_is_busy(k_Txq)) {
+        }
+
+        // Step 4: Issue MAC queue flush on remote TXQ0 to clear any residual
+        // state, then wait for the WRITE_REG to complete.
+        constexpr uint32_t k_RemoteTxqCmdAddr = 0xFFB90004;  // ETH_TXQ0 CMD
+        constexpr uint32_t k_FlushCmd = 0x8;                 // ETH_TXQ_CMD_FLUSH
+        internal_::eth_write_remote_reg(k_Txq, k_RemoteTxqCmdAddr, k_FlushCmd);
         while (internal_::eth_txq_is_busy(k_Txq)) {
         }
     }

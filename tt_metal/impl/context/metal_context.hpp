@@ -133,6 +133,11 @@ public:
     CommandQueueIdStack& get_command_queue_id_stack_for_thread();
     const CommandQueueIdStack& get_command_queue_id_stack_for_thread() const;
 
+    // N-hop chips discovered via BFS but not reachable via lite fabric.
+    // These chips are in the cluster descriptor for topology mapping but
+    // should not have Device objects or dispatch firmware.
+    bool is_chip_unreachable(ChipId chip_id) const { return unreachable_chip_ids_.contains(chip_id); }
+
     // Utilities
     bool is_coord_in_range(CoreCoord coord, CoreType core_type);
 
@@ -254,6 +259,14 @@ private:
     std::map<tt_fabric::FabricNodeId, ChipId> logical_mesh_chip_id_to_physical_chip_id_mapping_;
     std::optional<std::string> custom_mesh_graph_desc_path_ = std::nullopt;
     tt_fabric::FabricManagerMode fabric_manager_ = tt_fabric::FabricManagerMode::DEFAULT;
+    std::set<ChipId> unreachable_chip_ids_;
+
+    // Remote ETH cores (by logical Y / channel number) that were successfully
+    // initialized with fabric router firmware in initialize_remote_eth_cores_for_fabric().
+    // Used by update_lite_fabric_bindings_for_fabric_routers() to exclude channels
+    // whose remote peers lack fabric routers (MMIO-side router ETH handshake traffic
+    // would corrupt the lite fabric relay on such peers).
+    std::map<ChipId, std::set<uint32_t>> remote_fabric_eth_channels_;
 };
 
 }  // namespace tt::tt_metal

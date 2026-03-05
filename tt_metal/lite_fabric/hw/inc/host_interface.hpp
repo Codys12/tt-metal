@@ -108,6 +108,24 @@ struct FabricLiteConfig {
     volatile RoutingEnabledState routing_enabled = RoutingEnabledState::STOPPED;
 
     unsigned char padding4[14]{};
+
+    // Multi-hop forwarding configuration.  Written by the host after lite fabric
+    // is running to turn an endpoint into a relay.  The receiver inspects this
+    // when processing packets with FORWARD_ONLY or WRITE_AND_FORWARD routing.
+    struct ForwardingConfig {
+        volatile uint8_t enabled = 0;                      // 0 = endpoint only, 1 = relay mode
+        uint8_t downstream_noc_x = 0;                      // NOC X of downstream ETH core on same chip
+        uint8_t downstream_noc_y = 0;                      // NOC Y of downstream ETH core on same chip
+        uint8_t downstream_num_buffers = 0;                // Sender buffer count on downstream core
+        volatile uint32_t downstream_sender_buf_addr = 0;  // Sender buffer base L1 addr on downstream core
+        volatile uint32_t downstream_h2d_addr = 0;         // h2d L1 addr on downstream core
+        uint32_t downstream_buffer_size = 0;               // Buffer slot size (= CHANNEL_BUFFER_SIZE)
+        // Initial value for forwarding_downstream_wr_idx.  Must match the
+        // target sender's current d2h.sender so that wrap_increment(initial)
+        // produces a value != d2h, triggering the sender to pick up the packet.
+        uint8_t initial_wr_idx = 0;
+        uint8_t _forwarding_pad[15]{};  // Pad ForwardingConfig to maintain 16-byte struct alignment
+    } __attribute__((packed)) forwarding;
 } __attribute__((packed));
 
 static_assert(sizeof(FabricLiteConfig) % 16 == 0);

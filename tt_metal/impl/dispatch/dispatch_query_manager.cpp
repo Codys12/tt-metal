@@ -34,6 +34,10 @@ tt_cxy_pair dispatch_core(uint8_t cq_id) {
     // devices are gateways and only remote device dispatch positions matter.
     bool has_remote_dispatch = false;
     for (tt::ChipId device_id : tt::tt_metal::MetalContext::instance().get_cluster().all_chip_ids()) {
+        // Skip BFS-discovered chips that are not reachable via lite fabric.
+        if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(device_id)) {
+            continue;
+        }
         if (tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device_id) != device_id) {
             uint16_t channel =
                 tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device_id);
@@ -46,6 +50,10 @@ tt_cxy_pair dispatch_core(uint8_t cq_id) {
     }
 
     for (tt::ChipId device_id : tt::tt_metal::MetalContext::instance().get_cluster().all_chip_ids()) {
+        // Skip BFS-discovered chips that are not reachable via lite fabric.
+        if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(device_id)) {
+            continue;
+        }
         uint16_t channel =
             tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device_id);
         if (tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device_id) == device_id) {

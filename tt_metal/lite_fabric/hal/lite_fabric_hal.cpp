@@ -37,6 +37,11 @@ lite_fabric::SystemDescriptor GetSystemDescriptor() {
         // Find the correct ethernet core to connect mmio device to connected device id
         const auto connected_id = cluster.get_ethernet_connected_device_ids(mmio_device_id);
         for (const auto& dev_id : connected_id) {
+            // Skip connections to other MMIO devices - tunnels_from_mmio should only
+            // contain tunnels from MMIO devices to remote devices.
+            if (mmio_chip_ids.count(dev_id)) {
+                continue;
+            }
             desc.enabled_eth_channels[dev_id] = GetEthChannelMask(dev_id);
             // We only support 1 hop
             constexpr int hop_count = 1;

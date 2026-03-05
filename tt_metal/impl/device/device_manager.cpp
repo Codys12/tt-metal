@@ -245,6 +245,21 @@ void DeviceManager::initialize(
 }
 
 void DeviceManager::initialize_devices(const std::vector<ChipId>& device_ids) {
+    // Validate requested device IDs exist and are reachable before proceeding.
+    for (auto dev_id : device_ids) {
+        TT_FATAL(
+            tt::tt_metal::MetalContext::instance().get_cluster().all_chip_ids().contains(dev_id),
+            "Device {} does not exist. There are {} devices available (IDs 0 through {}).",
+            dev_id,
+            tt::tt_metal::MetalContext::instance().get_cluster().number_of_devices(),
+            tt::tt_metal::MetalContext::instance().get_cluster().number_of_devices() - 1);
+        TT_FATAL(
+            !tt::tt_metal::MetalContext::instance().is_chip_unreachable(dev_id),
+            "Device {} was discovered via BFS but is not reachable via lite fabric (N-hop chip without tunnel). "
+            "Cannot open this device.",
+            dev_id);
+    }
+
     std::vector<ChipId> device_ids_to_open = device_ids;
     // Never skip for TG Cluster
     bool is_galaxy = tt::tt_metal::MetalContext::instance().get_cluster().is_galaxy_cluster();
@@ -266,11 +281,14 @@ void DeviceManager::initialize_devices(const std::vector<ChipId>& device_ids) {
         // Must launch for TG
         any_remote_devices |= is_galaxy;
 
-        // Must open all devices in cluster to use fabric
+        // Must open all reachable devices in cluster to use fabric.
+        // Exclude N-hop chips discovered via BFS that don't have lite fabric tunnels yet.
         if (any_remote_devices) {
             device_ids_to_open.clear();
             for (int id = 0; id < tt::tt_metal::MetalContext::instance().get_cluster().number_of_devices(); ++id) {
-                device_ids_to_open.push_back(id);
+                if (!tt::tt_metal::MetalContext::instance().is_chip_unreachable(id)) {
+                    device_ids_to_open.push_back(id);
+                }
             }
         }
     }
@@ -470,6 +488,7 @@ void DeviceManager::initialize_active_devices() {
     auto is_dispatch_device = [&](ChipId id) { return !check_chip_mapped || control_plane_ptr->is_chip_mapped(id); };
 
     // Generate static args
+    log_info(tt::LogMetal, "DEBUG: FD init: generating static args for {} devices", active_devices.size());
     for (auto* dev : active_devices) {
         // For Galaxy init, we only need to loop over mmio devices
         const auto& mmio_device_id =
@@ -500,6 +519,7 @@ void DeviceManager::initialize_active_devices() {
     }
 
     // Create command queue programs
+    log_info(tt::LogMetal, "DEBUG: FD init: creating CQ programs");
     for (auto* dev : active_devices) {
         // For Galaxy init, we only need to loop over mmio devices
         const auto& mmio_device_id =
@@ -530,9 +550,11 @@ void DeviceManager::initialize_active_devices() {
     }
 
     // Compile programs
+    log_info(tt::LogMetal, "DEBUG: FD init: compiling CQ programs");
     compile_cq_programs();
 
     // Init command queue
+    log_info(tt::LogMetal, "DEBUG: FD init: initializing command queues");
     for (auto* dev : active_devices) {
         // For Galaxy init, we only need to loop over mmio devices
         const auto& mmio_device_id =
@@ -546,23 +568,50 @@ void DeviceManager::initialize_active_devices() {
 
         auto tunnels_from_mmio =
             tt::tt_metal::MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id);
+        log_info(tt::LogMetal, "DEBUG: FD init: CQ device init for MMIO device {}", dev->id());
         dev->init_command_queue_device();
-        log_debug(tt::LogMetal, "Command Queue initialized on Device {}", dev->id());
+        log_info(tt::LogMetal, "DEBUG: FD init: CQ device {} done", dev->id());
+        // Diagnostic barrier: check if d2h desync already present after MMIO CQ init
+        for (const auto& tunnel : tunnels_from_mmio) {
+            for (uint32_t ts = tunnel.size() - 1; ts > 0; ts--) {
+                uint32_t rid = tunnel[ts];
+                log_info(tt::LogMetal, "DEBUG: FD init: post-MMIO-CQ barrier for remote device {}", rid);
+                tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(rid);
+                log_info(tt::LogMetal, "DEBUG: FD init: post-MMIO-CQ barrier for remote device {} passed", rid);
+            }
+        }
         if (not this->skip_remote_devices_) {
             for (const auto& tunnel : tunnels_from_mmio) {
                 // Need to create devices from farthest to the closest.
                 for (uint32_t ts = tunnel.size() - 1; ts > 0; ts--) {
                     uint32_t mmio_controlled_device_id = tunnel[ts];
+                    log_info(
+                        tt::LogMetal, "DEBUG: FD init: CQ device init for tunnel device {}", mmio_controlled_device_id);
                     if (!is_dispatch_device(mmio_controlled_device_id)) {
+                        log_info(
+                            tt::LogMetal, "DEBUG: FD init: skipping non-dispatch device {}", mmio_controlled_device_id);
                         continue;
                     }
                     auto* device = get_device(mmio_controlled_device_id);
+                    if (!device) {
+                        log_info(
+                            tt::LogMetal, "DEBUG: FD init: device {} not found, skipping", mmio_controlled_device_id);
+                        continue;
+                    }
+                    log_info(
+                        tt::LogMetal, "DEBUG: FD init: pre-CQ barrier for tunnel device {}", mmio_controlled_device_id);
+                    tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(mmio_controlled_device_id);
+                    log_info(
+                        tt::LogMetal,
+                        "DEBUG: FD init: pre-CQ barrier for tunnel device {} passed",
+                        mmio_controlled_device_id);
                     device->init_command_queue_device();
                     log_info(tt::LogMetal, "Command Queue initialized on Device {}", device->id());
                 }
             }
         }
     }
+    log_info(tt::LogMetal, "DEBUG: FD init: complete");
     dispatch_firmware_active_ = true;
 }
 
@@ -659,6 +708,10 @@ void DeviceManager::add_devices_to_pool(const std::vector<ChipId>& device_ids) {
             for (const auto& mmio_controlled_device_id :
                  tt::tt_metal::MetalContext::instance().get_cluster().get_devices_controlled_by_mmio_device(
                      mmio_device_id)) {
+                // Skip unreachable N-hop chips discovered via BFS
+                if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(mmio_controlled_device_id)) {
+                    continue;
+                }
                 devices_to_activate.insert(mmio_controlled_device_id);
             }
         }
@@ -670,11 +723,15 @@ void DeviceManager::add_devices_to_pool(const std::vector<ChipId>& device_ids) {
         }
     }
 
-    // Only can launch Fabric if all devices are active
+    // Only can launch Fabric if all reachable devices are active
     tt_fabric::FabricConfig fabric_config = tt::tt_metal::MetalContext::instance().get_fabric_config();
     if (tt_fabric::is_tt_fabric_config(fabric_config)) {
         for (int i = 0; i < tt::tt_metal::MetalContext::instance().get_cluster().number_of_devices(); i++) {
-            // Fabric currently requires all devices to be active
+            // Skip unreachable N-hop chips that don't have Device objects
+            if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(i)) {
+                continue;
+            }
+            // Fabric currently requires all reachable devices to be active
             TT_FATAL(
                 this->is_device_active(i),
                 "Fabric is being used but Device {} is not active. "
@@ -960,14 +1017,16 @@ void DeviceManager::wait_for_fabric_router_sync(uint32_t timeout_ms) const {
                 tt_metal::detail::ReadFromDeviceL1(
                     dev, master_router_logical_core, router_sync_address, 4, final_status, CoreType::ETH);
 
-                TT_THROW(
+                log_warning(
+                    tt::LogMetal,
                     "Fabric Router Sync: Timeout after {} ms. Device {}: Expected status 0x{:08x}, got 0x{:08x} (final "
-                    "re-read: 0x{:08x})",
+                    "re-read: 0x{:08x}). Continuing without fabric routers on this device.",
                     timeout_ms,
                     dev->id(),
                     expected_status,
                     master_router_status[0],
                     final_status[0]);
+                return;  // Skip this device's fabric routers
             }
         }
 

@@ -42,7 +42,7 @@ using HostInterface = HostToFabricLiteInterface<SENDER_NUM_BUFFERS_ARRAY[0], CHA
 using WriteTridTracker = WriteTransactionIdTracker<
     RECEIVER_NUM_BUFFERS_ARRAY[0],
     NUM_TRANSACTION_IDS,
-    0,
+    TRID_OFFSET,
     lite_fabric::edm_to_local_chip_noc,
     lite_fabric::edm_to_downstream_noc>;
 

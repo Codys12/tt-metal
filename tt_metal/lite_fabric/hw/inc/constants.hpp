@@ -41,6 +41,10 @@ constexpr uint32_t NUM_USED_RECEIVER_CHANNELS = 1;
 constexpr uint32_t NUM_SENDER_CHANNELS = 1;
 
 constexpr uint8_t NUM_TRANSACTION_IDS = 4;
+// Offset into the NOC TRID space so lite fabric (ERISC1) doesn't collide with
+// the fabric router (ERISC0) which shares the same per-tile NOC0 TRID counters.
+// Fabric router uses TRIDs starting at 0; we start at 8 to stay clear.
+constexpr uint8_t TRID_OFFSET = 8;
 
 constexpr std::array<size_t, NUM_SENDER_CHANNELS> SENDER_NUM_BUFFERS_ARRAY = {2};
 

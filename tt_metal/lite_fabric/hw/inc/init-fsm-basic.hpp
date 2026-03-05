@@ -89,21 +89,28 @@ inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) 
                     wait_val(handshake_addr, 1);
                     // Safe to modify config_struct now
                     config_struct->primary_local_handshake = 2;
-                    internal_::eth_send_packet(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
+                    // Use <false> to skip risc_context_switch / ncrisc_noc_full_sync.
+                    // ERISC0 may have used NOC0 before being reset, leaving HW counters
+                    // out of sync with ERISC1's freshly-initialized SW counters.
+                    internal_::eth_send_packet<false>(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
 
                     // Wait for ack
                     wait_val(handshake_addr, 3);
                 } else {
                     // Send first signal to mmio to indicate we have started
                     config_struct->primary_local_handshake = 1;
-                    internal_::eth_send_packet(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
+                    // Use <false>: on the remote side, ERISC0 (syseng FW) is still running
+                    // and sharing NOC0.  risc_context_switch() -> ncrisc_noc_full_sync()
+                    // would hang because HW NOC counters (incremented by ERISC0) don't
+                    // match ERISC1's SW counters.
+                    internal_::eth_send_packet<false>(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
 
                     // wait for signal from mmio
                     wait_val(handshake_addr, 2);
 
                     // send ack to mmio
                     config_struct->primary_local_handshake = 3;
-                    internal_::eth_send_packet(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
+                    internal_::eth_send_packet<false>(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
                 }
                 config_struct->current_state = lite_fabric::InitState::READY;
                 break;
@@ -135,6 +142,12 @@ inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) 
                 ConnectedRiscInterface::deassert_connected_dm1_reset();
                 // Breadcrumb 0x16: ETH_INIT_NEIGHBOUR complete, entering handshake
                 config_struct->primary_local_handshake = 0x16;
+                // Restore is_mmio for this core.  We set it to false above so the
+                // connected core receives an accurate config (it's not on the MMIO
+                // chip).  But this core IS on the MMIO side and object_init reads
+                // config->is_mmio to set the on_mmio_chip global, which gates
+                // return-forwarding and receiver completion updates.
+                config_struct->is_mmio = is_mmio;
                 break;
             }
             case lite_fabric::InitState::ETH_HANDSHAKE_LOCAL: {

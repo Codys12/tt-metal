@@ -97,6 +97,9 @@ public:
     // remote chip and hanging the NOC.
     void refresh_soc_desc_for_chip(ChipId chip_id);
 
+    // Add a Metal SOC descriptor for a dynamically discovered chip.
+    void add_soc_descriptor(ChipId chip_id, metal_SocDescriptor desc);
+
     size_t number_of_pci_devices() const { return this->driver_->get_target_mmio_device_ids().size(); }
 
     std::set<ChipId> all_pci_chip_ids() const { return this->driver_->get_target_mmio_device_ids(); }
@@ -309,8 +312,24 @@ public:
     }
 
     uint16_t get_assigned_channel_for_device(ChipId device_id) const {
-        return this->device_to_host_mem_channel_.at(device_id);
+        auto it = this->device_to_host_mem_channel_.find(device_id);
+        if (it == this->device_to_host_mem_channel_.end()) {
+            log_error(
+                tt::LogDevice,
+                "get_assigned_channel_for_device: device_id={} not in device_to_host_mem_channel_ map (size={}). "
+                "Entries:",
+                device_id,
+                this->device_to_host_mem_channel_.size());
+            for (const auto& [k, v] : this->device_to_host_mem_channel_) {
+                log_error(tt::LogDevice, "  device {} -> channel {}", k, v);
+            }
+            TT_THROW("device_to_host_mem_channel_ missing device_id={}", device_id);
+        }
+        return it->second;
     }
+
+    // Re-run channel assignment for all MMIO groups (e.g. after BFS discovers new chips).
+    void reassign_mem_channels();
 
     // Returns collection of devices that are controlled by the specified MMIO device inclusive of the MMIO device
     const std::unordered_set<ChipId>& get_devices_controlled_by_mmio_device(ChipId mmio_device_id) const;
@@ -389,6 +408,12 @@ public:
     // SOC descriptor for remote chips (Phase 2b), since the channel-to-logical-core mapping
     // may change when real harvesting masks replace proxy harvesting masks.
     void refresh_remote_ethernet_routing_info();
+
+    // Populate device_eth_routing_info_ for dynamically discovered N-hop chips.
+    // Must be called after BFS discovery adds new chips to the cluster descriptor.
+    // Updates routing info for both the new chips and existing chips that have
+    // newly discovered connections to the new chips.
+    void update_routing_info_for_dynamic_chips(const std::set<ChipId>& new_chips);
 
 private:
     void detect_arch_and_target();

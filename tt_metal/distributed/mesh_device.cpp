@@ -339,7 +339,26 @@ std::map<int, std::shared_ptr<MeshDevice>> MeshDevice::create_unit_meshes(
     const DispatchCoreConfig& dispatch_core_config,
     tt::stl::Span<const std::uint32_t> /*l1_bank_remap*/,
     size_t worker_l1_size) {
-    // Validate all devices are on compute meshes (not switches) before creating any resources
+    // Create ScopedDevices first — this triggers MetalContext::initialize() which
+    // runs BFS discovery to find N-hop chips via lite fabric.  The control plane
+    // must not be accessed before this, because it would be lazily built with only
+    // the chips UMD discovered (missing N-hop chips).
+    log_info(tt::LogMetal, "create_unit_meshes: creating ScopedDevices");
+    auto mapped_devices_full_system_device_ids =
+        (*MetalContext::instance().global_distributed_context().size() > 1)
+            ? SystemMesh::instance().get_mapped_devices(std::nullopt).device_ids
+            : wrap_to_maybe_remote(device_ids);
+    auto scoped_devices = std::make_shared<ScopedDevices>(
+        mapped_devices_full_system_device_ids,
+        wrap_to_maybe_remote(device_ids),
+        l1_small_size,
+        trace_region_size,
+        num_command_queues,
+        worker_l1_size,
+        dispatch_core_config);
+
+    // Now validate all devices are on compute meshes (not switches).
+    // The control plane is rebuilt here if BFS discovery found new chips.
     log_info(tt::LogMetal, "create_unit_meshes: getting control plane");
     const auto& mesh_graph = MetalContext::instance().get_control_plane().get_mesh_graph();
     std::vector<tt::tt_fabric::FabricNodeId> fabric_node_ids;
@@ -356,21 +375,6 @@ std::map<int, std::shared_ptr<MeshDevice>> MeshDevice::create_unit_meshes(
             *fabric_node_id.mesh_id);
         fabric_node_ids.push_back(fabric_node_id);
     }
-
-    // Now create ScopedDevices after validation passes
-    log_info(tt::LogMetal, "create_unit_meshes: creating ScopedDevices");
-    auto mapped_devices_full_system_device_ids =
-        (*MetalContext::instance().global_distributed_context().size() > 1)
-            ? SystemMesh::instance().get_mapped_devices(std::nullopt).device_ids
-            : wrap_to_maybe_remote(device_ids);
-    auto scoped_devices = std::make_shared<ScopedDevices>(
-        mapped_devices_full_system_device_ids,
-        wrap_to_maybe_remote(device_ids),
-        l1_small_size,
-        trace_region_size,
-        num_command_queues,
-        worker_l1_size,
-        dispatch_core_config);
 
     // Make a copy because we std::move the scoped_devices when creating MeshDevice
     log_info(tt::LogMetal, "create_unit_meshes: creating MeshDevice");
@@ -411,15 +415,19 @@ std::shared_ptr<MeshDevice> MeshDevice::create_unit_mesh(
     const DispatchCoreConfig& dispatch_core_config,
     tt::stl::Span<const std::uint32_t> l1_bank_remap,
     size_t worker_l1_size) {
-    return create_unit_meshes(
-               {device_id},
-               l1_small_size,
-               trace_region_size,
-               num_command_queues,
-               dispatch_core_config,
-               l1_bank_remap,
-               worker_l1_size)
-        .at(device_id);
+    log_info(tt::LogMetal, "create_unit_mesh: calling create_unit_meshes for device {}", device_id);
+    auto result = create_unit_meshes(
+        {device_id},
+        l1_small_size,
+        trace_region_size,
+        num_command_queues,
+        dispatch_core_config,
+        l1_bank_remap,
+        worker_l1_size);
+    log_info(tt::LogMetal, "create_unit_mesh: extracting submesh for device {}", device_id);
+    auto submesh = result.at(device_id);
+    log_info(tt::LogMetal, "create_unit_mesh: returning submesh, result map size={}", result.size());
+    return submesh;
 }
 
 std::shared_ptr<MeshDevice> MeshDevice::create_submesh(

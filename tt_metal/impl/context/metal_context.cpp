@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <algorithm>
+#include <tuple>
 #include <mutex>
 #include <future>
 #include <vector>
@@ -24,6 +25,7 @@
 #include "debug/inspector/inspector.hpp"
 
 #include <umd/device/types/xy_pair.hpp>
+#include <umd/device/types/core_coordinates.hpp>
 #include "debug/inspector/data.hpp"
 #include "debug/noc_logging.hpp"
 #include "debug/watcher_server.hpp"
@@ -39,7 +41,9 @@
 
 #include <tt_metal.hpp>
 #include <umd/device/types/cluster_descriptor_types.hpp>
+#include <umd/device/chip/remote_chip.hpp>
 #include "lite_fabric/hal/lite_fabric_hal.hpp"
+#include "tt_metal/lite_fabric/hw/inc/blackhole/lf_dev_mem_map.hpp"
 #include "lite_fabric/host_util.hpp"
 #include "dispatch/data_collector.hpp"
 
@@ -65,6 +69,272 @@ void validate_worker_l1_size(size_t& worker_l1_size, Hal& hal) {
         "Worker L1 size {} is larger than max size {}",
         worker_l1_size,
         max_worker_l1_size);
+}
+
+// ETH core L1 register addresses for Blackhole SYSENG boot results.
+// These are populated by the syseng firmware during POR, before Metal starts.
+constexpr uint64_t ETH_PORT_STATUS_ADDR = 0x7CC04;           // uint8_t: port_status_e
+constexpr uint64_t ETH_REMOTE_BOARD_ID_HI_ADDR = 0x7CFE4;    // uint32_t
+constexpr uint64_t ETH_REMOTE_BOARD_ID_LO_ADDR = 0x7CFE8;    // uint32_t
+constexpr uint64_t ETH_REMOTE_ASIC_LOCATION_ADDR = 0x7CFE1;  // uint8_t
+constexpr uint64_t ETH_REMOTE_ETH_ID_ADDR = 0x7CFE2;         // uint8_t (remote channel)
+constexpr uint8_t PORT_UP = 1;                               // blackhole::port_status_e::PORT_UP
+
+// Compute ASIC unique ID from board_id and asic_location (matches UMD's mangle_asic_id).
+inline uint64_t compute_asic_uid(uint64_t board_id, uint8_t asic_location) {
+    return (board_id << 5) | (asic_location & 0x1F);
+}
+
+// Info about a chip discovered during BFS.
+struct DiscoveredChipInfo {
+    ChipId chip_id;                   // Newly assigned chip ID
+    ChipId intermediate_chip;         // Chip via which this was discovered
+    uint32_t downstream_eth_chan;     // ETH channel index on intermediate chip
+    tt_xy_pair downstream_core_noc0;  // NOC0 coords of downstream ETH core on intermediate chip
+    uint8_t remote_eth_id;            // ETH channel on the newly discovered chip
+};
+
+// BFS discovery of chips beyond 1-hop from MMIO via lite fabric.
+// Reads each frontier chip's ETH core registers (populated by syseng FW at POR)
+// to find trained links to undiscovered chips.  Adds discovered chips to the UMD
+// cluster descriptor and creates RemoteChip objects so that subsequent Metal
+// phases can communicate with them.
+//
+// Returns a vector of DiscoveredChipInfo with connection info for each new chip.
+std::vector<DiscoveredChipInfo> discover_nhop_chips(
+    Cluster& cluster, const std::set<ChipId>& frontier_chips, int max_hops) {
+    auto* driver = cluster.get_driver().get();
+    auto* cluster_desc = cluster.get_cluster_desc();
+
+    // Build set of known ASIC UIDs.
+    std::set<uint64_t> known_uids;
+    for (const auto& [chip_id, uid] : cluster_desc->get_chip_unique_ids()) {
+        known_uids.insert(uid);
+    }
+
+    // Map from ASIC UID to chip_id for reverse lookup.
+    auto uid_to_chip_id = [&](uint64_t uid) -> std::optional<ChipId> {
+        for (const auto& [cid, u] : cluster_desc->get_chip_unique_ids()) {
+            if (u == uid) {
+                return cid;
+            }
+        }
+        return std::nullopt;
+    };
+
+    ChipId next_chip_id = 0;
+    for (ChipId cid : cluster_desc->get_all_chips()) {
+        next_chip_id = std::max(next_chip_id, cid + 1);
+    }
+
+    std::vector<DiscoveredChipInfo> all_discovered;
+    std::set<ChipId> current_frontier = frontier_chips;
+
+    // Sanity check: read boot_results from the MMIO chip to verify addresses work
+    {
+        ChipId mmio_chip = *cluster.mmio_chip_ids().begin();
+        const auto& mmio_soc = cluster.get_soc_desc(mmio_chip);
+        auto mmio_eth = mmio_soc.get_cores(CoreType::ETH, CoordSystem::TRANSLATED);
+        log_info(
+            tt::LogMetal,
+            "BFS sanity: reading boot_results from MMIO chip {} ({} ETH cores)",
+            mmio_chip,
+            mmio_eth.size());
+        for (size_t i = 0; i < mmio_eth.size(); i++) {
+            const auto& c = mmio_eth[i];
+            umd::CoreCoord cc(c.x, c.y, CoreType::ETH, CoordSystem::TRANSLATED);
+            uint32_t ps = 0;
+            try {
+                driver->read_from_device(&ps, mmio_chip, cc, ETH_PORT_STATUS_ADDR, sizeof(ps));
+                log_info(
+                    tt::LogMetal,
+                    "BFS sanity: MMIO chip {} chan {} core ({},{}) port_status_word={:#x}",
+                    mmio_chip,
+                    i,
+                    c.x,
+                    c.y,
+                    ps);
+            } catch (const std::exception& e) {
+                log_info(tt::LogMetal, "BFS sanity: MMIO chip {} chan {} exception: {}", mmio_chip, i, e.what());
+            }
+        }
+    }
+
+    for (int hop = 0; hop < max_hops && !current_frontier.empty(); hop++) {
+        std::set<ChipId> next_frontier;
+
+        for (ChipId chip_id : current_frontier) {
+            const auto& soc_desc = cluster.get_soc_desc(chip_id);
+            // Use PHYSICAL coordinates for ETH core reads on remote chips.
+            // Remote chips may not have NOC translation tables programmed yet
+            // (that happens in Phase 3), so TRANSLATED coordinates would
+            // route NOC reads to wrong physical tiles.  PHYSICAL coordinates
+            // match the actual NOC0 grid positions and work regardless of
+            // whether translation is active.
+            auto eth_cores = soc_desc.get_cores(CoreType::ETH, CoordSystem::NOC0);
+
+            log_info(
+                tt::LogMetal, "BFS: scanning chip {} with {} ETH cores (PHYSICAL coords)", chip_id, eth_cores.size());
+
+            for (size_t chan = 0; chan < eth_cores.size(); chan++) {
+                const auto& core = eth_cores[chan];
+                umd::CoreCoord core_coord(core.x, core.y, CoreType::ETH, CoordSystem::NOC0);
+
+                // Read port status — read as uint32_t since the enum is 4 bytes
+                // in the boot_results_t structure, then extract the low byte.
+                uint32_t port_status_word = 0;
+                try {
+                    driver->read_from_device(
+                        &port_status_word, chip_id, core_coord, ETH_PORT_STATUS_ADDR, sizeof(port_status_word));
+                } catch (const std::exception& e) {
+                    log_info(
+                        tt::LogMetal,
+                        "BFS: chip {} chan {} core ({},{}) read exception: {}",
+                        chip_id,
+                        chan,
+                        core.x,
+                        core.y,
+                        e.what());
+                    continue;
+                }
+                uint8_t port_status = static_cast<uint8_t>(port_status_word & 0xFF);
+
+                if (port_status != PORT_UP) {
+                    log_info(
+                        tt::LogMetal,
+                        "BFS: chip {} chan {} core ({},{}) port_status_word={:#x} port_status={} (not UP)",
+                        chip_id,
+                        chan,
+                        core.x,
+                        core.y,
+                        port_status_word,
+                        port_status);
+                    continue;
+                }
+
+                // Read remote chip info
+                uint32_t board_id_hi = 0, board_id_lo = 0;
+                uint8_t asic_location = 0, remote_eth_id = 0;
+                try {
+                    driver->read_from_device(
+                        &board_id_hi, chip_id, core_coord, ETH_REMOTE_BOARD_ID_HI_ADDR, sizeof(board_id_hi));
+                    driver->read_from_device(
+                        &board_id_lo, chip_id, core_coord, ETH_REMOTE_BOARD_ID_LO_ADDR, sizeof(board_id_lo));
+                    driver->read_from_device(
+                        &asic_location, chip_id, core_coord, ETH_REMOTE_ASIC_LOCATION_ADDR, sizeof(asic_location));
+                    driver->read_from_device(
+                        &remote_eth_id, chip_id, core_coord, ETH_REMOTE_ETH_ID_ADDR, sizeof(remote_eth_id));
+                } catch (const std::exception& e) {
+                    log_info(
+                        tt::LogMetal,
+                        "BFS: chip {} chan {} core ({},{}) remote info read exception: {}",
+                        chip_id,
+                        chan,
+                        core.x,
+                        core.y,
+                        e.what());
+                    continue;
+                }
+
+                uint64_t remote_board_id = (static_cast<uint64_t>(board_id_hi) << 32) | board_id_lo;
+                uint64_t remote_uid = compute_asic_uid(remote_board_id, asic_location);
+
+                log_info(
+                    tt::LogMetal,
+                    "BFS: chip {} chan {} core ({},{}) port_status=UP remote_uid={:#x} "
+                    "board_id={:#x} asic_loc={} remote_eth={}",
+                    chip_id,
+                    chan,
+                    core.x,
+                    core.y,
+                    remote_uid,
+                    remote_board_id,
+                    asic_location,
+                    remote_eth_id);
+
+                if (known_uids.count(remote_uid)) {
+                    // Already known chip — record the connection if missing
+                    auto existing_id = uid_to_chip_id(remote_uid);
+                    if (existing_id.has_value()) {
+                        log_info(
+                            tt::LogMetal,
+                            "BFS: chip {} chan {} -> already known as chip {}",
+                            chip_id,
+                            chan,
+                            *existing_id);
+                        cluster_desc->add_ethernet_connection(
+                            chip_id, static_cast<uint32_t>(chan), *existing_id, remote_eth_id);
+                    }
+                    continue;
+                }
+
+                // New chip discovered!
+                ChipId new_chip_id = next_chip_id++;
+                known_uids.insert(remote_uid);
+
+                ChipId gateway_id = cluster_desc->get_closest_mmio_capable_chip(chip_id);
+
+                log_info(
+                    tt::LogMetal,
+                    "BFS discovery: found new chip {} (uid={:#x}) via chip {} ETH channel {} "
+                    "(board_id={:#x} asic_loc={} remote_eth={} gateway={})",
+                    new_chip_id,
+                    remote_uid,
+                    chip_id,
+                    chan,
+                    remote_board_id,
+                    asic_location,
+                    remote_eth_id,
+                    gateway_id);
+
+                // Register chip in the cluster descriptor with proxy metadata from gateway
+                cluster_desc->register_chip(
+                    new_chip_id,
+                    remote_uid,
+                    ARCH::BLACKHOLE,
+                    gateway_id,
+                    cluster_desc->get_board_type(gateway_id),
+                    cluster_desc->get_noc_translation_table_en().at(gateway_id),
+                    cluster_desc->get_harvesting_masks(gateway_id));
+
+                // Record ethernet connections (bidirectional)
+                cluster_desc->add_ethernet_connection(chip_id, static_cast<uint32_t>(chan), new_chip_id, remote_eth_id);
+
+                // Create a RemoteChip in UMD with the gateway's ETH channels
+                auto gateway_channels = cluster_desc->get_active_eth_channels(gateway_id);
+                if (gateway_channels.empty()) {
+                    gateway_channels = cluster_desc->get_idle_eth_channels(gateway_id);
+                }
+                auto proxy_soc_desc = driver->get_soc_descriptor(gateway_id);
+                driver->register_remote_chip(new_chip_id, gateway_id, gateway_channels, proxy_soc_desc);
+
+                // Add Metal-layer SOC descriptor (proxy from gateway)
+                cluster.add_soc_descriptor(
+                    new_chip_id,
+                    metal_SocDescriptor(
+                        driver->get_soc_descriptor(new_chip_id), cluster_desc->get_board_type(new_chip_id)));
+
+                all_discovered.push_back(DiscoveredChipInfo{
+                    .chip_id = new_chip_id,
+                    .intermediate_chip = chip_id,
+                    .downstream_eth_chan = static_cast<uint32_t>(chan),
+                    .downstream_core_noc0 = tt_xy_pair(core.x, core.y),
+                    .remote_eth_id = remote_eth_id,
+                });
+                next_frontier.insert(new_chip_id);
+            }
+        }
+
+        current_frontier = next_frontier;
+        log_info(
+            tt::LogMetal,
+            "BFS discovery hop {}: discovered {} new chips, next frontier size {}",
+            hop + 1,
+            next_frontier.size(),
+            current_frontier.size());
+    }
+
+    return all_discovered;
 }
 
 // Construct compute-only distributed context by filtering out switch meshes
@@ -349,8 +619,12 @@ void MetalContext::initialize(
         // populate_fd_kernels(all_devices_set, num_hw_cqs);
     }
 
-    // Set internal routing for active ethernet cores, this is required for our FW to run
-    if (has_flag(MetalContext::instance().get_fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
+    // Set internal routing for active ethernet cores, this is required for our FW to run.
+    // Skip when needs_lite_fabric: on first init fabric_manager_ isn't set yet (no-op),
+    // and on re-init this fires before lite fabric is relaunched, hanging on writes to
+    // remote ETH cores.  Routing info will be set later by initialize_active_devices().
+    if (!needs_lite_fabric &&
+        has_flag(MetalContext::instance().get_fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
         cluster_->set_internal_routing_info_for_ethernet_cores(true);
     }
 
@@ -431,8 +705,10 @@ void MetalContext::initialize(
                 // remote chip.
                 // Key: (connected_id, mmio_id) -> set of ETH channel Y-coordinates
                 std::map<std::pair<ChipId, ChipId>, std::set<uint32_t>> remote_chip_eth_channels;
+                std::map<std::pair<ChipId, ChipId>, int> remote_chip_num_hops;
                 for (const auto& tunnel : tunnels) {
                     remote_chip_eth_channels[{tunnel.connected_id, tunnel.mmio_id}].insert(tunnel.mmio_core_logical.y);
+                    remote_chip_num_hops[{tunnel.connected_id, tunnel.mmio_id}] = tunnel.num_hops;
                 }
 
                 std::set<ChipId> reachable_remote_devices;
@@ -474,12 +750,18 @@ void MetalContext::initialize(
                     reachable_remote_devices.insert(chip_id);
 
                     // Rebind UMD remote communication to only the channels with tunnels to this chip
-                    cluster_->get_driver()->get_remote_chip(chip_id)->set_remote_transfer_ethernet_cores(channels);
+                    auto* remote_chip = cluster_->get_driver()->get_remote_chip(chip_id);
+                    remote_chip->set_remote_transfer_ethernet_cores(channels);
+                    int nhops = remote_chip_num_hops[key];
+                    if (nhops > 1) {
+                        remote_chip->get_remote_communication()->set_num_hops(nhops);
+                    }
                     log_info(
                         tt::LogMetal,
-                        "Bound remote device {} to lite fabric ETH channel(s): [{}]",
+                        "Bound remote device {} to lite fabric ETH channel(s): [{}] ({} hops)",
                         chip_id,
-                        fmt::join(channels, ", "));
+                        fmt::join(channels, ", "),
+                        nhops);
                 }
 
                 if (reachable_remote_devices.size() < remote_devices.size()) {
@@ -497,27 +779,771 @@ void MetalContext::initialize(
                 remote_devices = std::move(reachable_remote_devices);
             }
 
-            // Phase 2b: Upgrade remote BH chip firmware info providers now that lite fabric
+            // Phase 2a: Upgrade remote BH chip firmware info providers now that lite fabric
             // is running and the remote ARC is accessible.  This replaces the proxy providers
             // (borrowed from the local gateway chip during topology discovery) with real ones
             // that read the actual harvesting masks, DRAM training status, and other chip
             // metadata from each remote chip.  Also refreshes the SocDescriptor and
             // ClusterDescriptor entries, then polls DRAM training to completion.
+            //
+            // This MUST run before BFS discovery because RemoteBlackholeTTDevice::read_from_device()
+            // returns zeros until upgrade_firmware_info_provider() sets lite_fabric_running_ = true.
             {
                 ZoneScopedN("Remote Chip Info Upgrade");
                 for (ChipId id : remote_devices) {
-                    log_info(tt::LogMetal, "Phase 2b: upgrade_remote_bh_chip_info for device {}", id);
+                    log_info(tt::LogMetal, "Phase 2a: upgrade_remote_bh_chip_info for device {}", id);
                     cluster_->upgrade_remote_bh_chip_info(id);
                     // The UMD SoC descriptor now has the real harvesting masks from the
                     // remote chip's ARC.  Refresh the metal-layer SoC descriptor so that
                     // all subsequent coordinate translations (logical → virtual → translated)
                     // account for the remote chip's actual harvesting, not the gateway's.
                     cluster_->refresh_soc_desc_for_chip(id);
-                    log_info(tt::LogMetal, "Phase 2b: upgrade complete for device {}", id);
+                    log_info(tt::LogMetal, "Phase 2a: upgrade complete for device {}", id);
                 }
                 // SOC descriptors changed — channel-to-logical-core mappings may differ.
                 // Refresh the routing info so it uses the correct logical coordinates.
                 cluster_->refresh_remote_ethernet_routing_info();
+            }
+
+            // Phase 2b: Iterative N-hop BFS discovery with downstream tunnel launch.
+            // For each hop level: discover new chips, launch lite fabric on the
+            // intermediate chip's downstream ETH core, configure forwarding on the
+            // upstream receiver, create tunnel descriptors, bind UMD, and upgrade.
+            // Track which MMIO ETH channels have forwarding configured per 1-hop
+            // chip.  After Phase 2b, intermediate devices are rebound to exclude
+            // these channels so that reads don't desync the downstream receiver's
+            // forwarding_downstream_wr_idx.
+            // Key: (intermediate chip_id, mmio_id) -> set of forwarded channel Y-coords
+            std::map<std::pair<ChipId, ChipId>, std::set<uint32_t>> forwarded_channels_per_1hop;
+
+            if (!remote_devices.empty()) {
+                ZoneScopedN("N-Hop BFS Discovery");
+                constexpr int max_extra_hops = 3;  // Up to 4-hop chips total
+                std::set<ChipId> current_frontier = remote_devices;
+                std::set<ChipId> all_nhop_chips;
+                int current_hop_level = 1;
+                const auto& binary_data = lite_fabric_hal_->get_binary_data();
+                auto& sys_desc = lite_fabric_hal_->get_mutable_system_descriptor();
+
+                // Build lookup: for each remote chip, which tunnel(s) reach it and
+                // from which MMIO ETH core.
+                auto find_tunnel_to_chip = [&](ChipId target_chip) -> const lite_fabric::TunnelDescriptor* {
+                    for (const auto& t : sys_desc.tunnels_from_mmio) {
+                        if (t.connected_id == target_chip) {
+                            return &t;
+                        }
+                    }
+                    return nullptr;
+                };
+
+                for (int extra = 0; extra < max_extra_hops && !current_frontier.empty(); extra++) {
+                    int next_hop_level = current_hop_level + 1;
+                    log_info(
+                        tt::LogMetal,
+                        "Phase 2b: BFS iteration {}, frontier size {}, discovering {}-hop chips",
+                        extra + 1,
+                        current_frontier.size(),
+                        next_hop_level);
+
+                    auto discovered = discover_nhop_chips(*cluster_, current_frontier, /*max_hops=*/1);
+                    if (discovered.empty()) {
+                        log_info(tt::LogMetal, "Phase 2b: no new chips at hop level {}", next_hop_level);
+                        break;
+                    }
+
+                    log_info(
+                        tt::LogMetal, "Phase 2b: discovered {} new {}-hop chips", discovered.size(), next_hop_level);
+
+                    // Register new chips in system containers
+                    std::set<ChipId> new_chip_ids;
+                    for (const auto& info : discovered) {
+                        new_chip_ids.insert(info.chip_id);
+                        all_devices.insert(info.chip_id);
+                        dram_bank_offset_map_.emplace(info.chip_id, std::vector<int32_t>{});
+                        l1_bank_offset_map_.emplace(info.chip_id, std::vector<int32_t>{});
+                        dram_bank_to_noc_xy_.emplace(info.chip_id, std::vector<uint16_t>{});
+                        l1_bank_to_noc_xy_.emplace(info.chip_id, std::vector<uint16_t>{});
+                        worker_logical_col_to_virtual_col_.emplace(info.chip_id, std::vector<uint8_t>{});
+                        worker_logical_row_to_virtual_row_.emplace(info.chip_id, std::vector<uint8_t>{});
+                    }
+
+                    // Update UMD routing info for new chips
+                    cluster_->update_routing_info_for_dynamic_chips(new_chip_ids);
+                    cluster_->reassign_mem_channels();
+
+                    // Fix-up tunnel descriptors for frontier chips.  The connected_core
+                    // was derived from remote_eth_id (BFS boot results), which is a
+                    // hardware port number that may NOT match the SoC descriptor's
+                    // channel index.  Now that the BFS has scanned the frontier chips
+                    // (updating ethernet_connections from their perspective), we can
+                    // verify the stored channel and correct it by probing candidate
+                    // cores for routing_enabled via lite fabric reads.
+                    for (auto frontier_chip : current_frontier) {
+                        auto tunnel_it = std::find_if(
+                            sys_desc.tunnels_from_mmio.begin(),
+                            sys_desc.tunnels_from_mmio.end(),
+                            [frontier_chip](const lite_fabric::TunnelDescriptor& t) {
+                                return t.connected_id == frontier_chip;
+                            });
+                        if (tunnel_it == sys_desc.tunnels_from_mmio.end() || tunnel_it->num_hops < 2) {
+                            continue;
+                        }
+                        auto& tunnel = *tunnel_it;
+
+                        // Find the parent chip (one-hop-closer in the chain)
+                        ChipId parent_chip = 0;
+                        bool found_parent = false;
+                        for (const auto& t : sys_desc.tunnels_from_mmio) {
+                            if (t.mmio_core_logical == tunnel.mmio_core_logical && t.num_hops == tunnel.num_hops - 1) {
+                                parent_chip = t.connected_id;
+                                found_parent = true;
+                                break;
+                            }
+                        }
+                        if (!found_parent) {
+                            continue;
+                        }
+
+                        auto* cluster_desc = cluster_->get_cluster_desc();
+                        uint32_t stored_channel = static_cast<uint32_t>(tunnel.connected_core_logical.y);
+
+                        // Check if stored channel still connects to parent after BFS update
+                        bool stored_ok = false;
+                        try {
+                            if (cluster_desc->ethernet_core_has_active_ethernet_link(frontier_chip, stored_channel)) {
+                                auto [peer_chip, peer_chan] =
+                                    cluster_desc->get_chip_and_channel_of_remote_ethernet_core(
+                                        frontier_chip, stored_channel);
+                                stored_ok = (peer_chip == parent_chip);
+                            }
+                        } catch (...) {
+                        }
+
+                        if (stored_ok) {
+                            continue;
+                        }
+
+                        // Stored channel is wrong — find candidates connecting to parent
+                        std::vector<std::tuple<int, int>> channel_pairs;
+                        try {
+                            channel_pairs = cluster_desc->get_directly_connected_ethernet_channels_between_chips(
+                                frontier_chip, parent_chip);
+                        } catch (...) {
+                        }
+
+                        if (channel_pairs.empty()) {
+                            log_warning(
+                                tt::LogMetal,
+                                "Phase 2b: tunnel fixup: chip {} has no ethernet connections "
+                                "back to parent chip {}, skipping",
+                                frontier_chip,
+                                parent_chip);
+                            continue;
+                        }
+
+                        // Probe candidates: read routing_enabled from each core.
+                        // The upstream receiver (from routing_init) has ENABLED.
+                        const auto& frontier_soc = cluster_->get_soc_desc(frontier_chip);
+                        auto eth_cores_noc0 = frontier_soc.get_cores(CoreType::ETH, CoordSystem::NOC0);
+                        uint32_t re_addr = LITE_FABRIC_CONFIG_START +
+                                           offsetof(lite_fabric::FabricLiteMemoryMap, config) +
+                                           offsetof(lite_fabric::FabricLiteConfig, routing_enabled);
+
+                        uint32_t correct_channel = static_cast<uint32_t>(std::get<0>(channel_pairs[0]));
+                        bool probed = false;
+
+                        for (const auto& [local_chan, remote_chan] : channel_pairs) {
+                            if (static_cast<size_t>(local_chan) >= eth_cores_noc0.size()) {
+                                continue;
+                            }
+                            auto core_noc0 = eth_cores_noc0[local_chan];
+                            auto core_translated = frontier_soc.translate_coord_to(
+                                tt_xy_pair(core_noc0.x, core_noc0.y), CoordSystem::NOC0, CoordSystem::TRANSLATED);
+                            auto cxy =
+                                tt_cxy_pair(static_cast<size_t>(frontier_chip), core_translated.x, core_translated.y);
+
+                            uint32_t routing_val = 0;
+                            try {
+                                cluster_->read_core(&routing_val, sizeof(routing_val), cxy, re_addr);
+                            } catch (...) {
+                                continue;
+                            }
+
+                            if (static_cast<lite_fabric::RoutingEnabledState>(routing_val) ==
+                                lite_fabric::RoutingEnabledState::ENABLED) {
+                                correct_channel = static_cast<uint32_t>(local_chan);
+                                probed = true;
+                                break;
+                            }
+                        }
+
+                        if (!probed && channel_pairs.size() > 1) {
+                            log_warning(
+                                tt::LogMetal,
+                                "Phase 2b: tunnel fixup: could not probe upstream receiver "
+                                "on chip {} (none of {} candidates have routing_enabled), "
+                                "using first candidate chan {}",
+                                frontier_chip,
+                                channel_pairs.size(),
+                                correct_channel);
+                        }
+
+                        auto logical = frontier_soc.get_eth_core_for_channel(correct_channel, CoordSystem::LOGICAL);
+                        auto virtual_cc = cluster_->get_virtual_coordinate_from_logical_coordinates(
+                            frontier_chip, CoreCoord(logical.x, logical.y), tt::CoreType::ETH);
+
+                        log_info(
+                            tt::LogMetal,
+                            "Phase 2b: tunnel fixup: correcting chip {} connected_core "
+                            "from chan {} to chan {} (parent chip {})",
+                            frontier_chip,
+                            stored_channel,
+                            correct_channel,
+                            parent_chip);
+
+                        tunnel.connected_core_logical = CoreCoord(logical.x, logical.y);
+                        tunnel.connected_core_virtual = CoreCoord(virtual_cc.x, virtual_cc.y);
+                    }
+
+                    // Launch downstream tunnels and configure forwarding
+                    uint32_t config_addr =
+                        LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteMemoryMap, config);
+                    uint32_t host_iface_addr =
+                        LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteMemoryMap, host_interface);
+                    uint32_t sender_buf_addr =
+                        LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteMemoryMap, sender_channel_buffer);
+                    uint32_t forwarding_offset = config_addr + offsetof(lite_fabric::FabricLiteConfig, forwarding);
+
+                    for (const auto& info : discovered) {
+                        // Find existing tunnel to the intermediate chip
+                        const auto* upstream_tunnel = find_tunnel_to_chip(info.intermediate_chip);
+                        if (!upstream_tunnel) {
+                            log_warning(
+                                tt::LogMetal,
+                                "Phase 2b: no tunnel to intermediate chip {} for new chip {}, skipping",
+                                info.intermediate_chip,
+                                info.chip_id);
+                            continue;
+                        }
+
+                        log_info(
+                            tt::LogMetal,
+                            "Phase 2b: launching downstream tunnel on chip {} ETH chan {} "
+                            "core ({},{}) for {}-hop chip {}",
+                            info.intermediate_chip,
+                            info.downstream_eth_chan,
+                            info.downstream_core_noc0.x,
+                            info.downstream_core_noc0.y,
+                            next_hop_level,
+                            info.chip_id);
+
+                        // Write lite fabric config to downstream ETH core
+                        lite_fabric::FabricLiteConfig ds_config{};
+                        ds_config.is_primary = true;
+                        ds_config.is_mmio = true;
+                        ds_config.initial_state = lite_fabric::InitState::ETH_INIT_NEIGHBOUR;
+                        ds_config.current_state = lite_fabric::InitState::ETH_INIT_NEIGHBOUR;
+                        ds_config.binary_addr = LITE_FABRIC_TEXT_START;
+                        ds_config.binary_size = (binary_data.size() + 15) & ~0xF;
+                        ds_config.eth_chans_mask = 0x3;  // Needs ≥2 bits for routing_init assert
+                        ds_config.routing_enabled = lite_fabric::RoutingEnabledState::ENABLED;
+
+                        // Configure reverse forwarding on downstream receiver so read
+                        // responses from the downstream chip get relayed upstream to the
+                        // upstream core's sender buffer (and eventually back to MMIO).
+                        {
+                            const auto& interm_soc = cluster_->get_soc_desc(info.intermediate_chip);
+                            auto upstream_eth_cores_noc0 = interm_soc.get_cores(CoreType::ETH, CoordSystem::NOC0);
+                            auto upstream_core_noc0 =
+                                upstream_eth_cores_noc0[upstream_tunnel->connected_core_logical.y];
+                            // Use TRANSLATED coordinates for NOC addressing on the
+                            // remote chip.  The ARC programs NOC translation tables
+                            // at POR, so ERISC1's NOC0 writes go through the
+                            // translation layer.  NOC0/physical coords (e.g. (12,1))
+                            // would be translated to the wrong physical tile.
+                            auto upstream_core_translated = interm_soc.translate_coord_to(
+                                tt_xy_pair(upstream_core_noc0.x, upstream_core_noc0.y),
+                                CoordSystem::NOC0,
+                                CoordSystem::TRANSLATED);
+                            using HostIface = lite_fabric::HostToFabricLiteInterface<
+                                lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0],
+                                lite_fabric::CHANNEL_BUFFER_SIZE>;
+                            // Start with forwarding disabled.  We enable it AFTER all
+                            // reads through the upstream sender complete so that
+                            // initial_wr_idx is computed from a stable d2h (avoids
+                            // TOCTOU: lite-fabric reads advance d2h between the
+                            // snapshot and the first reverse-forwarding use).
+                            ds_config.forwarding.enabled = 0;
+                            ds_config.forwarding.downstream_noc_x = static_cast<uint8_t>(upstream_core_translated.x);
+                            ds_config.forwarding.downstream_noc_y = static_cast<uint8_t>(upstream_core_translated.y);
+                            ds_config.forwarding.downstream_num_buffers = lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0];
+                            ds_config.forwarding.downstream_sender_buf_addr = sender_buf_addr;
+                            ds_config.forwarding.downstream_h2d_addr = host_iface_addr + offsetof(HostIface, h2d);
+                            ds_config.forwarding.downstream_buffer_size = lite_fabric::CHANNEL_BUFFER_SIZE;
+
+                            log_info(
+                                tt::LogMetal,
+                                "Phase 2b: reverse forwarding prepared on downstream core ({},{}) "
+                                "-> upstream ({},{}) TRANSLATED (deferred activation)",
+                                info.downstream_core_noc0.x,
+                                info.downstream_core_noc0.y,
+                                upstream_core_translated.x,
+                                upstream_core_translated.y);
+                        }
+
+                        // Convert NOC0 physical coords to TRANSLATED for host-side operations
+                        const auto& ds_soc = cluster_->get_soc_desc(info.intermediate_chip);
+                        auto ds_core_translated = ds_soc.translate_coord_to(
+                            tt_xy_pair(info.downstream_core_noc0.x, info.downstream_core_noc0.y),
+                            CoordSystem::NOC0,
+                            CoordSystem::TRANSLATED);
+                        auto ds_cxy = tt_cxy_pair(
+                            static_cast<size_t>(info.intermediate_chip), ds_core_translated.x, ds_core_translated.y);
+
+                        // Assert both ERISCs in reset before writing config/binary.
+                        // RiscType::ALL_TENSIX doesn't include ERISC bits on BH, so
+                        // write the soft reset register directly.  On reinit, ERISC1
+                        // may still be running from the previous iteration; failing to
+                        // reset it corrupts forwarding_downstream_wr_idx (lazy-init
+                        // sentinel 0xFF is never restored) and causes 2-hop read
+                        // response loss.
+                        constexpr uint32_t kSoftResetAddr = 0xFFB121B0;
+                        constexpr uint32_t kBothEriscsInReset = 0x47800;
+                        cluster_->write_core(&kBothEriscsInReset, sizeof(kBothEriscsInReset), ds_cxy, kSoftResetAddr);
+
+                        // Zero entire host interface (d2h, pad, AND h2d) on downstream
+                        // core.  The FW zeros h2d during object_init, but on reinit
+                        // stale h2d values from the previous iteration can cause phantom
+                        // sends before the FW init runs.  Zero 8 bytes: d2h (2B) +
+                        // _d2h_h2d_pad (2B) + h2d (2B) + 2 extra for alignment.
+                        uint64_t zero = 0;
+                        cluster_->write_core(&zero, sizeof(zero), ds_cxy, host_iface_addr);
+
+                        // Write config and binary
+                        cluster_->write_core(&ds_config, sizeof(ds_config), ds_cxy, config_addr);
+                        cluster_->write_core(binary_data.data(), binary_data.size(), ds_cxy, LITE_FABRIC_TEXT_START);
+
+                        // Set PC for ERISC1
+                        uint32_t pc = LITE_FABRIC_TEXT_START;
+                        cluster_->write_core(&pc, sizeof(pc), ds_cxy, LITE_FABRIC_RESET_PC);
+
+                        // Deassert ERISC1 on the downstream core (ERISC0 stays in reset)
+                        constexpr uint32_t kErisc1OutErisc0InReset = 0x46800;
+                        cluster_->write_core(
+                            &kErisc1OutErisc0InReset, sizeof(kErisc1OutErisc0InReset), ds_cxy, kSoftResetAddr);
+
+                        log_info(
+                            tt::LogMetal,
+                            "Phase 2b: downstream tunnel launched on chip {} core ({},{}), waiting for READY",
+                            info.intermediate_chip,
+                            info.downstream_core_noc0.x,
+                            info.downstream_core_noc0.y);
+
+                        // Wait for downstream lite fabric to reach READY
+                        constexpr int k_MaxPolls = 20;
+                        constexpr int k_PollMs = 100;
+                        uint32_t state_addr = config_addr + offsetof(lite_fabric::FabricLiteConfig, current_state);
+                        bool ready = false;
+                        for (int p = 0; p < k_MaxPolls; p++) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(k_PollMs));
+                            uint32_t state = 0;
+                            cluster_->read_core(&state, sizeof(state), ds_cxy, state_addr);
+                            if (static_cast<lite_fabric::InitState>(state) == lite_fabric::InitState::READY) {
+                                ready = true;
+                                break;
+                            }
+                        }
+                        if (!ready) {
+                            log_warning(
+                                tt::LogMetal,
+                                "Phase 2b: downstream tunnel on chip {} core ({},{}) failed to reach "
+                                "READY, skipping chip {}",
+                                info.intermediate_chip,
+                                info.downstream_core_noc0.x,
+                                info.downstream_core_noc0.y,
+                                info.chip_id);
+                            // Clean up: put ERISC1 back in reset on the failed core
+                            cluster_->assert_risc_reset_at_core(ds_cxy, tt::umd::RiscType::ERISC1);
+                            continue;
+                        }
+
+                        log_info(tt::LogMetal, "Phase 2b: downstream tunnel READY, configuring forwarding");
+
+                        // Configure forwarding on the upstream receiver (on intermediate chip)
+                        // The upstream receiver is on the connected_core of the tunnel to
+                        // intermediate_chip.
+                        lite_fabric::FabricLiteConfig::ForwardingConfig fwd{};
+                        fwd.enabled = 1;
+                        fwd.downstream_noc_x = static_cast<uint8_t>(ds_core_translated.x);
+                        fwd.downstream_noc_y = static_cast<uint8_t>(ds_core_translated.y);
+                        fwd.downstream_num_buffers = lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0];
+                        fwd.downstream_sender_buf_addr = sender_buf_addr;
+                        // offsetof with template types containing commas breaks the macro;
+                        // use a typedef to avoid the issue.
+                        using HostIface = lite_fabric::HostToFabricLiteInterface<
+                            lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0],
+                            lite_fabric::CHANNEL_BUFFER_SIZE>;
+                        fwd.downstream_h2d_addr = host_iface_addr + offsetof(HostIface, h2d);
+                        fwd.downstream_buffer_size = lite_fabric::CHANNEL_BUFFER_SIZE;
+
+                        // Write forwarding config to the upstream receiver core on
+                        // intermediate chip (the connected end of the existing tunnel)
+                        auto upstream_rx_cxy = upstream_tunnel->connected_cxy_virtual();
+                        cluster_->write_core(&fwd, sizeof(fwd), upstream_rx_cxy, forwarding_offset);
+
+                        auto mmio_cxy = tt_cxy_pair(
+                            upstream_tunnel->mmio_id,
+                            upstream_tunnel->mmio_core_virtual.x,
+                            upstream_tunnel->mmio_core_virtual.y);
+
+                        // Ensure the forwarding config write has been consumed by the
+                        // MMIO sender FW.  l1_barrier for remote chips calls
+                        // wait_for_non_mmio_flush which waits for d2h.sender ==
+                        // h2d.sender.  It does NOT generate a receiver response.
+                        cluster_->l1_barrier(info.intermediate_chip);
+
+                        // Ensure d2h.receiver on the MMIO core is stable before using
+                        // it for initial_wr_idx.  The FW writes a diagnostic word with
+                        // wr_sent (bits 31-24) and completion (bits 23-16) counters.
+                        // When they match, all pending completions have fired and
+                        // d2h.receiver is accurate.
+                        {
+                            uint32_t diag_addr = LITE_FABRIC_CONFIG_START +
+                                                 offsetof(lite_fabric::FabricLiteMemoryMap, config) +
+                                                 offsetof(lite_fabric::FabricLiteConfig, padding1);
+                            auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                            while (true) {
+                                uint32_t diag = 0;
+                                cluster_->read_core(&diag, sizeof(diag), mmio_cxy, diag_addr);
+                                uint8_t wr_sent = (diag >> 24) & 0xFF;
+                                uint8_t completion = (diag >> 16) & 0xFF;
+                                if (wr_sent == completion) {
+                                    break;
+                                }
+                                if (std::chrono::steady_clock::now() > timeout) {
+                                    TT_THROW(
+                                        "Phase 2b: timeout waiting for MMIO "
+                                        "receiver completion to catch up on "
+                                        "core ({},{}) wr_sent={} completion={}",
+                                        mmio_cxy.x,
+                                        mmio_cxy.y,
+                                        wr_sent,
+                                        completion);
+                                }
+                            }
+                        }
+
+                        log_info(
+                            tt::LogMetal,
+                            "Phase 2b: forwarding configured on chip {} core ({},{}) -> "
+                            "downstream ({},{})",
+                            info.intermediate_chip,
+                            upstream_rx_cxy.x,
+                            upstream_rx_cxy.y,
+                            info.downstream_core_noc0.x,
+                            info.downstream_core_noc0.y);
+
+                        // Record that this MMIO channel has forwarding configured
+                        // through the intermediate (1-hop) chip.  After Phase 2b,
+                        // the 1-hop chip will be rebound to exclude this channel.
+                        forwarded_channels_per_1hop[{info.intermediate_chip, upstream_tunnel->mmio_id}].insert(
+                            static_cast<uint32_t>(upstream_tunnel->mmio_core_logical.y));
+
+                        // Deferred reverse-forwarding activation: compute the correct
+                        // initial_wr_idx for the downstream receiver's return forwarding.
+                        // This must match the upstream sender's current d2h.sender so
+                        // that forwarding_downstream_wr_idx starts at the right slot.
+                        {
+                            uint8_t upstream_sender_d2h = 0;
+
+                            if (next_hop_level <= 2) {
+                                // 2-hop: upstream sender is on chip 1, 1:1 with MMIO receiver.
+                                // Read MMIO d2h locally (PCI, no side effects).
+                                uint32_t mmio_d2h_word = 0;
+                                cluster_->read_core(&mmio_d2h_word, sizeof(mmio_d2h_word), mmio_cxy, host_iface_addr);
+                                // d2h.fabric_receiver_channel_index is byte 1.
+                                upstream_sender_d2h = (mmio_d2h_word >> 8) & 0xFF;
+                            } else {
+                                // 3+ hop: upstream sender is on the intermediate chip
+                                // (not MMIO). Read d2h.sender from the actual upstream
+                                // sender core via lite fabric.  The read itself advances
+                                // that sender's d2h by 1 (response travels back), so
+                                // compensate: initial_wr_idx = (read_value + 1) % NUM_BUFS.
+                                uint32_t upstream_d2h_word = 0;
+                                cluster_->read_core(
+                                    &upstream_d2h_word, sizeof(upstream_d2h_word), upstream_rx_cxy, host_iface_addr);
+                                uint8_t read_d2h_sender = upstream_d2h_word & 0xFF;
+                                upstream_sender_d2h = (read_d2h_sender + 1) % lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0];
+                                log_info(
+                                    tt::LogMetal,
+                                    "Phase 2b: read upstream sender d2h.sender={} from "
+                                    "chip {} core ({},{}), compensated initial_wr_idx={}",
+                                    read_d2h_sender,
+                                    info.intermediate_chip,
+                                    upstream_rx_cxy.x,
+                                    upstream_rx_cxy.y,
+                                    upstream_sender_d2h);
+                            }
+
+                            // Record pre-write d2h.sender from MMIO core (byte 0).
+                            uint32_t mmio_pre_word = 0;
+                            cluster_->read_core(&mmio_pre_word, sizeof(mmio_pre_word), mmio_cxy, host_iface_addr);
+                            uint8_t pre_write_d2h_sender = mmio_pre_word & 0xFF;
+
+                            ds_config.forwarding.initial_wr_idx = upstream_sender_d2h;
+                            ds_config.forwarding.enabled = 1;
+                            cluster_->write_core(
+                                &ds_config.forwarding, sizeof(ds_config.forwarding), ds_cxy, forwarding_offset);
+                            // Wait for the MMIO sender to consume the activation write by
+                            // polling d2h.sender LOCALLY (PCI read, no lite fabric).
+                            {
+                                auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                                uint32_t poll_d2h_word = 0;
+                                while (true) {
+                                    cluster_->read_core(
+                                        &poll_d2h_word, sizeof(poll_d2h_word), mmio_cxy, host_iface_addr);
+                                    uint8_t cur_d2h_sender = poll_d2h_word & 0xFF;
+                                    if (cur_d2h_sender != pre_write_d2h_sender) {
+                                        break;
+                                    }
+                                    if (std::chrono::steady_clock::now() > timeout) {
+                                        TT_THROW(
+                                            "Phase 2b: timeout waiting for MMIO sender to consume "
+                                            "reverse forwarding activation write on core ({},{})",
+                                            mmio_cxy.x,
+                                            mmio_cxy.y);
+                                    }
+                                }
+                            }
+
+                            log_info(
+                                tt::LogMetal,
+                                "Phase 2b: reverse forwarding enabled on downstream core ({},{}) "
+                                "initial_wr_idx={} (hop_level={})",
+                                info.downstream_core_noc0.x,
+                                info.downstream_core_noc0.y,
+                                upstream_sender_d2h,
+                                next_hop_level);
+                        }
+
+                        // Create tunnel descriptor for the new chip
+                        // Reuse the same MMIO ETH core as the upstream tunnel
+                        const auto& new_soc = cluster_->get_soc_desc(info.chip_id);
+                        auto connected_logical_cc =
+                            new_soc.get_eth_core_for_channel(info.remote_eth_id, CoordSystem::LOGICAL);
+                        auto connected_virtual_cc = cluster_->get_virtual_coordinate_from_logical_coordinates(
+                            info.chip_id, CoreCoord(connected_logical_cc.x, connected_logical_cc.y), tt::CoreType::ETH);
+
+                        sys_desc.tunnels_from_mmio.push_back(lite_fabric::TunnelDescriptor{
+                            .mmio_id = upstream_tunnel->mmio_id,
+                            .mmio_core_virtual = upstream_tunnel->mmio_core_virtual,
+                            .mmio_core_logical = upstream_tunnel->mmio_core_logical,
+                            .connected_id = info.chip_id,
+                            .connected_core_virtual = CoreCoord(connected_virtual_cc.x, connected_virtual_cc.y),
+                            .connected_core_logical = CoreCoord(connected_logical_cc.x, connected_logical_cc.y),
+                            .num_hops = next_hop_level,
+                        });
+
+                        // Bind UMD communication for the new chip
+                        std::set<uint32_t> channels = {static_cast<uint32_t>(upstream_tunnel->mmio_core_logical.y)};
+                        auto* remote_chip = cluster_->get_driver()->get_remote_chip(info.chip_id);
+                        remote_chip->set_remote_transfer_ethernet_cores(channels);
+                        remote_chip->get_remote_communication()->set_num_hops(next_hop_level);
+
+                        log_info(
+                            tt::LogMetal,
+                            "Phase 2b: bound chip {} via MMIO ETH chan {} ({} hops)",
+                            info.chip_id,
+                            upstream_tunnel->mmio_core_logical.y,
+                            next_hop_level);
+
+                        // Upgrade remote chip info with retry.  Multi-hop reads
+                        // can intermittently time out if the response is lost in
+                        // the forwarding chain (e.g. race between forwarding lazy-init
+                        // and the first forwarded packet).  Re-syncing h2d/d2h and
+                        // retrying recovers from both "FW didn't see h2d" and
+                        // "response lost in chain" failure modes.
+                        constexpr int k_MaxUpgradeRetries = 2;
+                        for (int attempt = 0; attempt <= k_MaxUpgradeRetries; attempt++) {
+                            try {
+                                cluster_->upgrade_remote_bh_chip_info(info.chip_id);
+                                break;
+                            } catch (const std::runtime_error& e) {
+                                if (attempt < k_MaxUpgradeRetries) {
+                                    log_warning(
+                                        tt::LogMetal,
+                                        "Phase 2b: upgrade_remote_bh_chip_info({}) attempt {} failed: {}. "
+                                        "Re-syncing h2d/d2h and retrying...",
+                                        info.chip_id,
+                                        attempt + 1,
+                                        e.what());
+
+                                    // Diagnostic: read intermediate core state before resync.
+                                    // Upstream receiver and downstream core on intermediate chip
+                                    // are 1-hop reachable.  First resync chip 1's communication
+                                    // so reads work, then dump state from both cores.
+                                    try {
+                                        auto* interm_chip =
+                                            cluster_->get_driver()->get_remote_chip(info.intermediate_chip);
+                                        std::set<uint32_t> interm_channels = {
+                                            static_cast<uint32_t>(upstream_tunnel->mmio_core_logical.y)};
+                                        interm_chip->set_remote_transfer_ethernet_cores(interm_channels);
+
+                                        uint32_t handshake_addr =
+                                            config_addr +
+                                            offsetof(lite_fabric::FabricLiteConfig, primary_local_handshake);
+                                        uint32_t padding1_addr =
+                                            config_addr + offsetof(lite_fabric::FabricLiteConfig, padding1);
+                                        uint32_t loop_addr =
+                                            config_addr + offsetof(lite_fabric::FabricLiteConfig, neighbour_handshake);
+
+                                        uint32_t padding2_addr =
+                                            config_addr + offsetof(lite_fabric::FabricLiteConfig, padding2);
+
+                                        uint32_t padding0_addr =
+                                            config_addr + offsetof(lite_fabric::FabricLiteConfig, padding0);
+                                        auto dump_core = [&](const char* label, tt_cxy_pair cxy) {
+                                            uint32_t d2h_word = 0, h2d_word = 0;
+                                            uint32_t sdiag = 0, rdiag = 0, loop_cnt = 0;
+                                            uint32_t fwd_diag = 0, fwd_tgt = 0;
+                                            lite_fabric::FabricLiteConfig::ForwardingConfig fwd_cfg{};
+                                            cluster_->read_core(&d2h_word, 4, cxy, host_iface_addr);
+                                            using HostIface = lite_fabric::HostToFabricLiteInterface<
+                                                lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0],
+                                                lite_fabric::CHANNEL_BUFFER_SIZE>;
+                                            cluster_->read_core(
+                                                &h2d_word, 4, cxy, host_iface_addr + offsetof(HostIface, h2d));
+                                            cluster_->read_core(&sdiag, 4, cxy, handshake_addr);
+                                            cluster_->read_core(&rdiag, 4, cxy, padding1_addr);
+                                            cluster_->read_core(&loop_cnt, 4, cxy, loop_addr);
+                                            cluster_->read_core(&fwd_diag, 4, cxy, padding2_addr);
+                                            cluster_->read_core(&fwd_tgt, 4, cxy, padding0_addr);
+                                            cluster_->read_core(&fwd_cfg, sizeof(fwd_cfg), cxy, forwarding_offset);
+                                            log_warning(
+                                                tt::LogMetal,
+                                                "Phase 2b diag {}: chip {} core ({},{}) | "
+                                                "d2h.s={} d2h.r={} h2d.s={} h2d.r={} | "
+                                                "sender: nfs={} comp={} unsent={} can={} | "
+                                                "receiver: wr_sent={} comp={} d2h_idx={} h2d_idx={} | "
+                                                "fwd_cfg: en={} noc=({},{}) init_wr={} | "
+                                                "fwd_fw: wr_idx={} en={} mmio={} | "
+                                                "fwd_tgt: noc=({},{}) wr={} addr_lo=0x{:02x} | loop={}",
+                                                label,
+                                                cxy.chip,
+                                                cxy.x,
+                                                cxy.y,
+                                                d2h_word & 0xFF,
+                                                (d2h_word >> 8) & 0xFF,
+                                                h2d_word & 0xFF,
+                                                (h2d_word >> 8) & 0xFF,
+                                                (sdiag >> 24) & 0xFF,
+                                                (sdiag >> 16) & 0xFF,
+                                                (sdiag >> 8) & 0xFF,
+                                                sdiag & 0xFF,
+                                                (rdiag >> 24) & 0xFF,
+                                                (rdiag >> 16) & 0xFF,
+                                                (rdiag >> 8) & 0xFF,
+                                                rdiag & 0xFF,
+                                                fwd_cfg.enabled,
+                                                fwd_cfg.downstream_noc_x,
+                                                fwd_cfg.downstream_noc_y,
+                                                fwd_cfg.initial_wr_idx,
+                                                fwd_diag & 0xFF,
+                                                (fwd_diag >> 8) & 0xFF,
+                                                (fwd_diag >> 16) & 0xFF,
+                                                (fwd_tgt >> 24) & 0xFF,
+                                                (fwd_tgt >> 16) & 0xFF,
+                                                (fwd_tgt >> 8) & 0xFF,
+                                                fwd_tgt & 0xFF,
+                                                loop_cnt);
+                                        };
+
+                                        auto up_rx_cxy = upstream_tunnel->connected_cxy_virtual();
+                                        dump_core("upstream_rx", up_rx_cxy);
+                                        dump_core("downstream", ds_cxy);
+                                    } catch (const std::exception& diag_ex) {
+                                        log_warning(
+                                            tt::LogMetal, "Phase 2b: diagnostic reads failed: {}", diag_ex.what());
+                                    }
+
+                                    // Re-sync h2d/d2h counters with device state
+                                    remote_chip->set_remote_transfer_ethernet_cores(channels);
+                                    remote_chip->get_remote_communication()->set_num_hops(next_hop_level);
+                                } else {
+                                    throw;
+                                }
+                            }
+                        }
+                        cluster_->refresh_soc_desc_for_chip(info.chip_id);
+
+                        // Add to remote_devices for Phase 3 FW launch
+                        remote_devices.insert(info.chip_id);
+                        all_nhop_chips.insert(info.chip_id);
+                    }
+
+                    current_frontier = new_chip_ids;
+                    current_hop_level = next_hop_level;
+                }
+
+                if (!all_nhop_chips.empty()) {
+                    cluster_->refresh_remote_ethernet_routing_info();
+                    control_plane_.reset();
+                    log_info(
+                        tt::LogMetal,
+                        "Phase 2b: total {} N-hop chips discovered and made reachable",
+                        all_nhop_chips.size());
+                } else {
+                    log_info(tt::LogMetal, "Phase 2b: no additional chips discovered beyond 1-hop");
+                }
+            }
+
+            // Rebind intermediate devices to exclude MMIO ETH channels that
+            // have forwarding configured for deeper n-hop chips.  If a read to
+            // an intermediate chip goes through a forwarding-enabled channel,
+            // the upstream sender's d2h advances without updating the deeper
+            // downstream receiver's forwarding_downstream_wr_idx.  When a
+            // subsequent deeper read response arrives, the downstream receiver
+            // writes to the wrong upstream sender slot → response lost.
+            // This applies to ALL intermediate hops, not just 1-hop chips.
+            std::map<std::pair<ChipId, ChipId>, std::set<uint32_t>> remote_chip_eth_channels;
+            for (const auto& t : lite_fabric_hal_->get_system_descriptor().tunnels_from_mmio) {
+                remote_chip_eth_channels[{t.connected_id, t.mmio_id}].insert(t.mmio_core_logical.y);
+            }
+            for (const auto& [key, fwd_channels] : forwarded_channels_per_1hop) {
+                auto [chip_id, mmio_id] = key;
+                auto orig_it = remote_chip_eth_channels.find(key);
+                if (orig_it == remote_chip_eth_channels.end()) {
+                    continue;
+                }
+                const auto& orig_channels = orig_it->second;
+
+                std::set<uint32_t> clean_channels;
+                for (uint32_t ch : orig_channels) {
+                    if (fwd_channels.find(ch) == fwd_channels.end()) {
+                        clean_channels.insert(ch);
+                    }
+                }
+
+                if (clean_channels.empty()) {
+                    log_warning(
+                        tt::LogMetal,
+                        "Phase 2b: all channels for chip {} have forwarding, "
+                        "cannot rebind (deeper reads may conflict)",
+                        chip_id);
+                    continue;
+                }
+
+                if (clean_channels != orig_channels) {
+                    auto* remote_chip = cluster_->get_driver()->get_remote_chip(chip_id);
+                    remote_chip->set_remote_transfer_ethernet_cores(clean_channels);
+                    log_info(
+                        tt::LogMetal,
+                        "Phase 2b: rebound chip {} to non-forwarded channels [{}] "
+                        "(excluded forwarded [{}])",
+                        chip_id,
+                        fmt::join(clean_channels, ", "),
+                        fmt::join(fwd_channels, ", "));
+                }
             }
 
             // Phase 3: FW builds, device init, resets, and FW launch for remote chips
@@ -526,6 +1552,24 @@ void MetalContext::initialize(
                 ZoneScopedN("Remote Device Init and FW Launch");
                 log_info(
                     tt::LogMetal, "Phase 3: build_and_init_devices for {} remote device(s)", remote_devices.size());
+                // Process devices deepest-first (descending hop count).  This prevents
+                // reads to intermediate chips from desyncing forwarding_downstream_wr_idx
+                // on downstream receivers before deeper reads are processed.
+                // Build a vector sorted by hop count (descending), breaking ties by chip ID (descending).
+                auto& tunnels = lite_fabric_hal_->get_system_descriptor().tunnels_from_mmio;
+                std::vector<ChipId> remote_devices_ordered(remote_devices.begin(), remote_devices.end());
+                std::sort(remote_devices_ordered.begin(), remote_devices_ordered.end(), [&tunnels](ChipId a, ChipId b) {
+                    int hops_a = 1, hops_b = 1;
+                    for (const auto& t : tunnels) {
+                        if (t.connected_id == a) {
+                            hops_a = t.num_hops;
+                        }
+                        if (t.connected_id == b) {
+                            hops_b = t.num_hops;
+                        }
+                    }
+                    return hops_a != hops_b ? hops_a > hops_b : a > b;
+                });
                 // Run sequentially and skip ETH cores for remote devices behind
                 // lite fabric.  All writes to remote chips go through lite fabric
                 // tunnels which share sender/receiver buffers on the MMIO-side
@@ -533,7 +1577,7 @@ void MetalContext::initialize(
                 // threads.  ETH cores are skipped because ERISC0 is not running on
                 // remote ETH cores (all in POR reset), and the lite fabric ETH core
                 // has ERISC1 actively servicing the link.
-                build_and_init_devices(remote_devices, /*sequential=*/true, /*skip_eth=*/true);
+                build_and_init_devices(remote_devices_ordered, /*sequential=*/true, /*skip_eth=*/true);
                 log_info(tt::LogMetal, "Phase 3: build_and_init_devices complete, launching FW for remote devices");
                 // Skip reset_cores for remote BH chips: their Tensix cores are
                 // already in POR reset, and reset_cores would kill the lite
@@ -545,7 +1589,7 @@ void MetalContext::initialize(
                 // go through lite fabric tunnels which share sender/receiver
                 // buffers on the MMIO-side ETH core and are not safe for
                 // concurrent access from multiple threads.
-                for (ChipId device_id : remote_devices) {
+                for (ChipId device_id : remote_devices_ordered) {
                     log_info(tt::LogMetal, "launch_fw device {} (remote): initialize_and_launch_firmware", device_id);
                     initialize_and_launch_firmware(device_id);
                     log_info(tt::LogMetal, "launch_fw device {} (remote): complete", device_id);
@@ -618,6 +1662,21 @@ void MetalContext::teardown() {
         lite_fabric_hal_.reset();
     }
 
+    // Reset lite_fabric_running_ on all remote chips so that UMD silently drops
+    // any subsequent reads/writes (e.g. from watcher init during reinit) until
+    // upgrade_remote_bh_chip_info() re-enables them after lite fabric relaunch.
+    {
+        auto mmio_ids = cluster_->mmio_chip_ids();
+        for (ChipId id : all_devices) {
+            if (!mmio_ids.contains(id)) {
+                auto* remote_chip = cluster_->get_driver()->get_remote_chip(id);
+                if (remote_chip) {
+                    remote_chip->downgrade_after_lite_fabric_teardown();
+                }
+            }
+        }
+    }
+
     if (data_collector_) {
         data_collector_->DumpData();
         data_collector_.reset();
@@ -631,7 +1690,17 @@ void MetalContext::teardown() {
 
     watcher_server_->detach_devices();
     watcher_server_.reset();
+
+    // Assert cores on MMIO devices only.  Remote devices are unreachable after lite fabric
+    // termination, and their cores will be reset during the next init cycle.
+    auto mmio_ids = cluster_->mmio_chip_ids();
     for (ChipId device_id : all_devices) {
+        if (unreachable_chip_ids_.contains(device_id)) {
+            continue;
+        }
+        if (!mmio_ids.contains(device_id)) {
+            continue;
+        }
         assert_cores(device_id);
 
         cluster_->l1_barrier(device_id);
@@ -1029,48 +2098,47 @@ void MetalContext::update_lite_fabric_bindings_for_fabric_routers() {
         return;
     }
 
-    // Group remaining (non-fabric-router) channels by remote chip.
-    // Exclude channels on the MMIO side that are now reserved for fabric routing,
-    // since the fabric router firmware will overwrite the lite fabric relay on those cores.
-    std::map<ChipId, std::set<uint32_t>> remaining_channels_per_remote;
-    std::set<ChipId> all_remote_chips;
+    // Group channels by remote chip, but only include channels whose remote
+    // peers have fabric routers.  On 2-erisc Blackhole devices, the fabric
+    // router runs on ERISC0 and the lite fabric relay runs on ERISC1 of the same
+    // ETH core.  They coexist when BOTH sides have fabric routers.
+    //
+    // However, if the remote peer does NOT have a fabric router, the MMIO-side
+    // fabric router's ETH handshake traffic can corrupt the lite fabric relay
+    // receiver on the remote side (the unhandled handshake data pollutes the
+    // receiver's L1 state), causing wait_for_all_writes_consumed to hang with
+    // num_free_slots=0.  Exclude these channels from UMD bindings so L1 ops
+    // only flow through channels with healthy relay receivers.
+    std::map<ChipId, std::set<uint32_t>> channels_per_remote;
     for (const auto& t : tunnels) {
-        all_remote_chips.insert(t.connected_id);
-        const auto& routing_info = cluster_->get_eth_routing_info(t.mmio_id);
-        auto it = routing_info.find(t.mmio_core_logical);
-        if (it != routing_info.end() && it->second == EthRouterMode::FABRIC_ROUTER) {
+        auto it = remote_fabric_eth_channels_.find(t.connected_id);
+        if (it != remote_fabric_eth_channels_.end() && it->second.count(t.connected_core_logical.y)) {
+            channels_per_remote[t.connected_id].insert(t.mmio_core_logical.y);
+        } else {
             log_info(
                 tt::LogMetal,
-                "Excluding lite fabric channel y={} (mmio={}, core={}) from UMD binding - reserved for fabric router",
+                "Excluding MMIO channel {} for remote device {} — remote peer core {} has no fabric router",
                 t.mmio_core_logical.y,
-                t.mmio_id,
-                t.mmio_core_logical.str());
-            continue;
+                t.connected_id,
+                t.connected_core_logical.str());
         }
-        remaining_channels_per_remote[t.connected_id].insert(t.mmio_core_logical.y);
     }
 
-    for (auto chip_id : all_remote_chips) {
-        auto it = remaining_channels_per_remote.find(chip_id);
-        if (it == remaining_channels_per_remote.end() || it->second.empty()) {
-            // All channels for this remote chip are fabric routers.
-            // Clear UMD bindings so wait_for_non_mmio_flush returns immediately
-            // (no lite fabric relay is running, and all future data movement goes
-            // through the fabric).
-            log_warning(
-                tt::LogMetal,
-                "Remote device {} has no remaining lite fabric channels after fabric router reservation - "
-                "clearing UMD bindings (l1_membar/dram_membar will be no-ops)",
-                chip_id);
-            cluster_->get_driver()->get_remote_chip(chip_id)->set_remote_transfer_ethernet_cores(std::set<uint32_t>{});
-            continue;
-        }
-        cluster_->get_driver()->get_remote_chip(chip_id)->set_remote_transfer_ethernet_cores(it->second);
+    for (auto& [chip_id, channels] : channels_per_remote) {
+        // Drain all pending lite fabric writes before re-syncing the host-side
+        // h2d/d2h counters.  set_remote_transfer_ethernet_cores reads d2h from
+        // the device and sets host h2d = d2h.  If the relay hasn't finished
+        // processing a write (d2h < h2d on device), the sync picks up stale d2h,
+        // and when the relay eventually advances d2h, it permanently disagrees
+        // with the host's h2d, causing wait_for_all_writes_consumed to hang.
+        cluster_->l1_barrier(chip_id);
+
+        cluster_->get_driver()->get_remote_chip(chip_id)->set_remote_transfer_ethernet_cores(channels);
         log_info(
             tt::LogMetal,
             "Updated UMD binding for remote device {}: lite fabric channels=[{}]",
             chip_id,
-            fmt::join(it->second, ", "));
+            fmt::join(channels, ", "));
     }
 }
 
@@ -1276,14 +2344,18 @@ void MetalContext::assert_cores(ChipId device_id) {
         const auto assert_eth_core = [&](const CoreCoord& logical_eth_core) {
             CoreCoord virtual_eth_core =
                 cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, logical_eth_core, CoreType::ETH);
-            // Ensure that the core has returned to base fw
             if (rtoptions_.get_enable_2_erisc_mode()) {
-                llrt::internal_::return_to_base_firmware_and_wait_for_heartbeat(device_id, virtual_eth_core);
+                // In 2-erisc mode, ERISC0 may be stuck in service_eth_msg() after lite fabric
+                // termination killed ERISC1. Skip the heartbeat wait and assert reset on ALL
+                // cores including ERISC0. The next init cycle will re-boot everything.
+                cluster_->assert_risc_reset_at_core(
+                    tt_cxy_pair(device_id, virtual_eth_core), tt::umd::RiscType::ALL_TENSIX);
+            } else {
+                // Stop subordinate
+                // Assert all cores except ERISC0, which is running base firmware.
+                tt::umd::RiscType reset_val = tt::umd::RiscType::ALL_TENSIX & ~tt::umd::RiscType::ERISC0;
+                cluster_->assert_risc_reset_at_core(tt_cxy_pair(device_id, virtual_eth_core), reset_val);
             }
-            // Stop subordinate
-            // Assert all cores except ERISC0, which is running base firmware.
-            tt::umd::RiscType reset_val = tt::umd::RiscType::ALL_TENSIX & ~tt::umd::RiscType::ERISC0;
-            cluster_->assert_risc_reset_at_core(tt_cxy_pair(device_id, virtual_eth_core), reset_val);
         };
 
         for (const auto& eth_core : this->get_control_plane().get_active_ethernet_cores(device_id)) {
@@ -1899,36 +2971,64 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
     // Bit 11 = ERISC0 reset, bit 12 = ERISC1 reset.
     // These values match the lite fabric FW (risc_interface.hpp).
     constexpr uint32_t SOFT_RESET_REG_ADDR = 0xFFB121B0;
-    // Use the same assert/deassert values as the MMIO subordinate_erisc:
-    //   assert  = RISCV_SOFT_RESET_0_BRISC (0x00800) — only bit 11 (ERISC0 in reset)
-    //   deassert = RISCV_SOFT_RESET_0_NONE  (0x00000) — all cores running
-    // The previous values (0x46800 / 0x46000) also set bits 13, 14, 18 (TRISC/NCRISC
-    // positions).  When ERISC0's firmware clears all reset bits via deassert_all_reset()
-    // and then the host re-asserts with 0x46800, the 0→1 transition on bits 13/14/18
-    // resets the AERISC_RESET_PC debug register, causing ERISC0 to boot from 0x0
-    // (trampoline) instead of resume_from_reset and re-enter the spin loop permanently.
-    constexpr uint32_t SOFT_RESET_ERISC0_RUNNING = 0x00000;  // all out of reset
+    // Deassert ERISC0 (clear bit 11) while keeping subsystem bits 13, 14, 18 set.
+    // The lite fabric setup left the register at 0x46800 (ERISC0 in reset, ERISC1
+    // running, subsystem bits set).  Writing 0x46000 clears only bit 11.
+    // Do NOT use 0x00000 — clearing bits 13/14/18 prevents ERISC0 from booting.
+    // With skip_dance=true, ERISC0 doesn't call deassert_all_reset(), so these
+    // bits stay at 1 and there's no 0→1 transition that would reset AERISC_RESET_PC.
+    constexpr uint32_t SOFT_RESET_ERISC0_RUNNING = 0x46000;  // bit 11 clear, bits 13/14/18 set
     constexpr uint32_t AERISC_RESET_PC_ADDR = 0xFFB14000;    // debug reg: ERISC0 boot PC
 
     for (const auto& logical_core : logical_eth_cores) {
         CoreCoord virtual_core =
             cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, logical_core, CoreType::ETH);
 
-        // Look up the MMIO-side ETH core that connects to this remote core.
-        // write_remote_eth_debug_reg needs the sender's NOC0 coordinates.
-        auto [mmio_chip, mmio_logical] = cluster_->get_connected_ethernet_core({device_id, logical_core});
-        CoreCoord mmio_virtual =
-            cluster_->get_virtual_coordinate_from_logical_coordinates(mmio_chip, mmio_logical, CoreType::ETH);
-        tt_xy_pair sender_noc0(mmio_virtual.x, mmio_virtual.y);
+        // Look up the peer ETH core to check if the peer is MMIO-reachable.
+        auto [peer_chip, peer_logical] = cluster_->get_connected_ethernet_core({device_id, logical_core});
+
+        // Skip ETH cores whose peer is an unreachable N-hop chip.  The WRITE_REG
+        // to deassert ERISC0 would need to go through the peer chip's relay, which
+        // doesn't exist for unreachable chips.  The fabric router on this core will
+        // also be unable to handshake with the unreachable peer.
+        if (is_chip_unreachable(peer_chip)) {
+            log_info(
+                tt::LogMetal,
+                "Device {} init remote ETH: skipping core {} — peer chip {} is unreachable",
+                device_id,
+                logical_core.str(),
+                peer_chip);
+            continue;
+        }
+
+        // Skip ETH cores whose peer is NOT on the MMIO chip.  WRITE_REG commands
+        // to deassert ERISC0 go through the lite fabric relay which only runs on
+        // MMIO ETH cores.  For cores connecting to other remote devices, the relay
+        // would need multi-hop routing which is not supported.  Additionally, ERISC1
+        // on these cores was never deasserted by the lite fabric setup (only MMIO-
+        // connected remote cores have ERISC1 running the lite fabric receiver).
+        if (!cluster_->mmio_chip_ids().count(peer_chip)) {
+            log_info(
+                tt::LogMetal,
+                "Device {} init remote ETH: skipping core {} — peer chip {} is not MMIO",
+                device_id,
+                logical_core.str(),
+                peer_chip);
+            continue;
+        }
 
         log_info(
             tt::LogMetal,
-            "Device {} init remote ETH: core {} (virtual {}) via MMIO chip {} core {}",
+            "Device {} init remote ETH: core {} (virtual {}) peer MMIO chip {} peer_logical {}",
             device_id,
             logical_core.str(),
             virtual_core.str(),
-            mmio_chip,
-            mmio_virtual.str());
+            peer_chip,
+            peer_logical.str());
+
+        // Track this core so update_lite_fabric_bindings_for_fabric_routers() knows
+        // which remote peers have fabric routers and can exclude channels without them.
+        remote_fabric_eth_channels_[device_id].insert(logical_core.y);
 
         // Clear erisc app sync info
         cluster_->write_core(
@@ -1957,9 +3057,9 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
         // into Metal's active erisc FW.
         //
         // Debug registers (0xFFBxxxxx) including the soft reset register
-        // are NOT reachable via NOC unicast writes on remote devices.
-        // Use write_remote_eth_debug_reg which sends a WRITE_REG command
-        // through the lite fabric relay's eth_write_remote_reg() path.
+        // are written via write_core, which routes through UMD's default
+        // channel for this remote device.  On Blackhole, the NOC can deliver
+        // writes to tile register addresses from the lite fabric receiver.
 
         // 1. ERISC0 is already held in reset by the lite fabric setup
         //    (deassert_connected_dm1_reset wrote 0x46800: bit 11 set = ERISC0
@@ -2055,7 +3155,11 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
         // the trampoline which initializes SP before jumping to fw_base.
         // On remote devices ERISC0 was never running (POR state), so SP=0;
         // booting directly at fw_base would crash on the first stack access.
-        cluster_->write_remote_eth_debug_reg(device_id, AERISC_RESET_PC_ADDR, 0x0, sender_noc0);
+        {
+            uint32_t reset_pc_val = 0x0;
+            cluster_->write_core(
+                &reset_pc_val, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), AERISC_RESET_PC_ADDR);
+        }
 
         // Verify writes by reading back key addresses.
         cluster_->l1_barrier(device_id);
@@ -2087,19 +3191,53 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
                 &skip_dance_flag, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), mailbox_addr);
         }
 
+        // 5b. Write a sentinel to subordinate_sync so we can detect if ERISC0 boots.
+        //     FW line 218 writes 0 to subordinate_sync.all; if we see the sentinel
+        //     after the delay, ERISC0 never reached that point.
+        {
+            DeviceAddr mailbox_addr = hal_->get_dev_addr(core_type, HalL1MemAddrType::MAILBOX);
+            uint32_t sentinel = 0xDEADBEEF;
+            // subordinate_sync is at offset 8 from mailbox base (after ncrisc_halt which is 8 bytes)
+            cluster_->write_core(&sentinel, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), mailbox_addr + 8);
+        }
+
         // 6. Deassert ERISC0.  Write SOFT_RESET_ERISC0_RUNNING (0x00000)
         //    to clear ERISC0's reset bit.  ERISC1 (bit 12) was already
         //    deasserted by the lite fabric setup and remains running so
         //    the lite fabric channel stays operational for subsequent
         //    L1 reads/writes and barriers.
         cluster_->l1_barrier(device_id);
+
+        // Deassert ERISC0 via write_core (NOC unicast write to the soft reset
+        // register).  On Blackhole, the 0xFFBxxxxx tile register space is
+        // reachable via NOC writes from the lite fabric receiver, so
+        // write_core routes through UMD's correctly-mapped default channel
+        // for this remote device.
+        //
+        // NOTE: Do NOT use write_remote_eth_debug_reg (WRITE_REG path) here.
+        // The WRITE_REG sender core is determined by the remote ETH core's
+        // boot_results peer mapping, which may not match UMD's tunnel mapping
+        // (e.g., device 2's ETH core may report its MMIO peer as channel 7,
+        // but UMD maps channel 7 to device 1).  Sending a WRITE_REG through
+        // the wrong channel corrupts the h2d/d2h counter state on that
+        // channel, causing wait_for_all_writes_consumed to hang.
         log_info(
             tt::LogMetal,
-            "Device {} init remote ETH: deasserting ERISC0 ({:#x}) on core {}",
+            "Device {} init remote ETH: deasserting ERISC0 ({:#x}) on core {} via write_core",
             device_id,
             SOFT_RESET_ERISC0_RUNNING,
             virtual_core.str());
-        cluster_->write_remote_eth_debug_reg(device_id, SOFT_RESET_REG_ADDR, SOFT_RESET_ERISC0_RUNNING, sender_noc0);
+        {
+            uint32_t soft_reset_val = SOFT_RESET_ERISC0_RUNNING;
+            cluster_->write_core(
+                &soft_reset_val, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), SOFT_RESET_REG_ADDR);
+        }
+        // Also write 0x0 (all deasserted) in case the subsystem bits prevent boot
+        {
+            uint32_t soft_reset_zero = 0x0;
+            cluster_->write_core(
+                &soft_reset_zero, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), SOFT_RESET_REG_ADDR);
+        }
     }
 
     // Barrier to ensure deassert has reached the device
@@ -2108,6 +3246,48 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
     // Wait for ERISC0 to boot, skip the 2-erisc dance (via the skip flag),
     // pass through wait_subordinate_eriscs(), and reach the go-signal loop.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Diagnostic: check if ERISC0 booted by reading back sentinel and go signal.
+    for (const auto& logical_core : logical_eth_cores) {
+        CoreCoord virtual_core =
+            cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, logical_core, CoreType::ETH);
+        auto [peer_chip, peer_logical] = cluster_->get_connected_ethernet_core({device_id, logical_core});
+        if (is_chip_unreachable(peer_chip)) {
+            continue;
+        }
+        DeviceAddr mailbox_addr = hal_->get_dev_addr(core_type, HalL1MemAddrType::MAILBOX);
+        uint32_t diag[8] = {};
+        cluster_->read_core(diag, sizeof(diag), tt_cxy_pair(device_id, virtual_core), mailbox_addr);
+        // go_messages[0] is at go_addr; read it too
+        uint32_t go_area[4] = {};
+        DeviceAddr go_addr = hal_->get_dev_addr(core_type, HalL1MemAddrType::GO_MSG);
+        if (go_addr == 0) {
+            go_addr = 0x410;  // fallback: known BH ACTIVE_ETH go_messages address
+        }
+        cluster_->read_core(go_area, sizeof(go_area), tt_cxy_pair(device_id, virtual_core), go_addr);
+        log_info(
+            tt::LogMetal,
+            "Device {} init remote ETH DIAG: core {} mailbox[0..7]="
+            "[{:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}] "
+            "go[0..3]=[{:#010x}, {:#010x}, {:#010x}, {:#010x}] "
+            "(sentinel at +8: {} booted={})",
+            device_id,
+            virtual_core.str(),
+            diag[0],
+            diag[1],
+            diag[2],
+            diag[3],
+            diag[4],
+            diag[5],
+            diag[6],
+            diag[7],
+            go_area[0],
+            go_area[1],
+            go_area[2],
+            go_area[3],
+            diag[2] == 0xDEADBEEF ? "SENTINEL" : "cleared",
+            diag[2] != 0xDEADBEEF ? "YES" : "NO");
+    }
 
     log_info(tt::LogMetal, "Device {} init remote ETH: {} core(s) initialized", device_id, logical_eth_cores.size());
 }

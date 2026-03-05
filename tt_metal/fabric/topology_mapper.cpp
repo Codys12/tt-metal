@@ -1439,8 +1439,10 @@ std::vector<MeshShape> generate_possible_cluster_shapes(std::uint32_t total_numb
                     shape = MeshShape(2, 4);
                 }
 
-                // if odd shape then skip
-                if ((larger_dim % 2 != 0 && larger_dim != 1) || (smaller_dim % 2 != 0 && smaller_dim != 1)) {
+                // if odd shape then skip, but allow odd 1D shapes (e.g. 3x1, 5x1)
+                // so that systems with odd chip counts can still map all physical chips
+                if (smaller_dim != 1 &&
+                    ((larger_dim % 2 != 0 && larger_dim != 1) || (smaller_dim % 2 != 0 && smaller_dim != 1))) {
                     continue;
                 }
 

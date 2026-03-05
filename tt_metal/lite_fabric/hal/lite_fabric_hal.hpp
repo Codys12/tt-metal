@@ -79,6 +79,11 @@ public:
     void set_reset_state(bool assert_reset);
 
     const SystemDescriptor& get_system_descriptor() { return system_descriptor_; }
+    SystemDescriptor& get_mutable_system_descriptor() { return system_descriptor_; }
+    const std::vector<uint8_t>& get_binary_data() const { return binary_data_; }
+
+protected:
+    std::vector<uint8_t> binary_data_;
 };
 
 }  // namespace lite_fabric

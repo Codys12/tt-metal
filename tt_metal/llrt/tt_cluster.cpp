@@ -394,17 +394,34 @@ void Cluster::assign_mem_channels_to_devices(
     // g_MAX_HOST_MEM_CHANNELS (4) is defined in tt::umd::Cluster and denotes the max number of host memory channels per
     // MMIO device Metal currently assigns 1 channel per device. See https://github.com/tenstorrent/tt-metal/issues/4087
     // One WH gateway should have 8 remote deivces in its control group.
+    log_info(
+        tt::LogDevice,
+        "assign_mem_channels_to_devices: mmio_device_id={}, controlled_device_ids.size()={}",
+        mmio_device_id,
+        controlled_device_ids.size());
+    for (const ChipId& device_id : controlled_device_ids) {
+        log_info(tt::LogDevice, "  controlled device: {}", device_id);
+    }
     TT_ASSERT(controlled_device_ids.size() <= 9, "Unable to assign each device to its own host memory channel!");
     uint16_t channel = 0;
     this->device_to_host_mem_channel_[mmio_device_id] = channel++;
+    log_info(tt::LogDevice, "  assigned mmio device {} -> channel {}", mmio_device_id, 0);
     for (const ChipId& device_id : controlled_device_ids) {
         if (device_id == mmio_device_id) {
             continue;
         }
         this->device_to_host_mem_channel_[device_id] = channel++;
+        log_info(tt::LogDevice, "  assigned device {} -> channel {}", device_id, channel - 1);
         if ((channel + 1) % 4 == 0) {
             channel++;
         }
+    }
+}
+
+void Cluster::reassign_mem_channels() {
+    this->device_to_host_mem_channel_.clear();
+    for (const auto& [mmio_device_id, controlled_devices] : this->cluster_desc_->get_chips_grouped_by_closest_mmio()) {
+        this->assign_mem_channels_to_devices(mmio_device_id, controlled_devices);
     }
 }
 
@@ -413,6 +430,10 @@ void Cluster::get_metal_desc_from_tt_desc() {
         this->sdesc_per_chip_.emplace(
             id, metal_SocDescriptor(this->driver_->get_soc_descriptor(id), this->cluster_desc_->get_board_type(id)));
     }
+}
+
+void Cluster::add_soc_descriptor(ChipId chip_id, metal_SocDescriptor desc) {
+    this->sdesc_per_chip_.emplace(chip_id, std::move(desc));
 }
 
 void Cluster::refresh_soc_desc_for_chip(ChipId chip_id) {
@@ -1397,6 +1418,59 @@ void Cluster::refresh_remote_ethernet_routing_info() {
     }
 }
 
+void Cluster::update_routing_info_for_dynamic_chips(const std::set<ChipId>& new_chips) {
+    log_info(tt::LogDevice, "update_routing_info_for_dynamic_chips: called with {} new chips", new_chips.size());
+    for (ChipId c : new_chips) {
+        log_info(tt::LogDevice, "update_routing_info_for_dynamic_chips: new chip {}", c);
+    }
+    // Ensure all new chips have entries in device_eth_routing_info_
+    for (ChipId chip_id : new_chips) {
+        if (!this->device_eth_routing_info_.contains(chip_id)) {
+            this->device_eth_routing_info_.insert({chip_id, {}});
+            log_info(
+                tt::LogDevice,
+                "update_routing_info_for_dynamic_chips: created routing info entry for chip {}",
+                chip_id);
+        }
+    }
+
+    // Use get_ethernet_connections() to populate ETH cores for new chips
+    // and add any new ETH cores for existing chips that connect to new chips.
+    const auto& all_eth_connections = this->cluster_desc_->get_ethernet_connections();
+    for (const auto& [chip_id, connections] : all_eth_connections) {
+        for (const auto& [eth_chan, connected_chip_chan] : connections) {
+            ChipId other_chip_id = std::get<0>(connected_chip_chan);
+            EthernetChannel other_chan = std::get<1>(connected_chip_chan);
+
+            // Only process connections involving at least one new chip
+            bool involves_new_chip = new_chips.contains(chip_id) || new_chips.contains(other_chip_id);
+            if (!involves_new_chip) {
+                continue;
+            }
+
+            auto fill_if_present = [&](ChipId cid, EthernetChannel chan) {
+                auto it = this->device_eth_routing_info_.find(cid);
+                if (it == this->device_eth_routing_info_.end()) {
+                    return;
+                }
+                auto eth_core = get_soc_desc(cid).get_eth_core_for_channel(chan, CoordSystem::LOGICAL);
+                if (!it->second.contains(eth_core)) {
+                    it->second.insert({eth_core, EthRouterMode::IDLE});
+                    log_info(
+                        tt::LogDevice,
+                        "update_routing_info_for_dynamic_chips: added chip {} core ({},{}) chan {} to routing info",
+                        cid,
+                        eth_core.x,
+                        eth_core.y,
+                        chan);
+                }
+            };
+            fill_if_present(chip_id, eth_chan);
+            fill_if_present(other_chip_id, other_chan);
+        }
+    }
+}
+
 std::unordered_set<ChipId> Cluster::get_ethernet_connected_device_ids(ChipId chip_id) const {
     std::unordered_set<ChipId> device_ids;
     const auto &connected_chips = this->get_ethernet_cores_grouped_by_connected_chips(chip_id);
@@ -1753,6 +1827,10 @@ void Cluster::set_internal_routing_info_for_ethernet_cores(
         }
     }
     for (auto chip_id : this->driver_->get_target_remote_device_ids()) {
+        // Skip unreachable N-hop chips — no lite fabric path, no FW running
+        if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(chip_id)) {
+            continue;
+        }
         non_mmio_devices.emplace_back(chip_id);
     }
     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();

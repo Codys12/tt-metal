@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <fstream>
+#include <thread>
 
 #include "blackhole_impl.hpp"
 #include "hw/inc/host_interface.hpp"
@@ -67,10 +68,71 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
     bin_file.seekg(0, std::ios::end);
     size_t bin_size = bin_file.tellg();
     bin_file.seekg(0, std::ios::beg);
-    std::vector<uint8_t> binary_data(bin_size);
-    bin_file.read(reinterpret_cast<char*>(binary_data.data()), bin_size);
+    binary_data_.resize(bin_size);
+    bin_file.read(reinterpret_cast<char*>(binary_data_.data()), bin_size);
     bin_file.close();
     log_info(tt::LogMetal, "Loaded lite fabric binary {} size {} B", bin_path, bin_size);
+    const auto& binary_data = binary_data_;
+
+    // Diagnostic: read ETH port status and TXQ0 registers for each tunnel's MMIO core
+    for (const auto& tunnel_1x : system_descriptor_.tunnels_from_mmio) {
+        try {
+            uint8_t port_status = 0xFF;
+            cluster.read_core(&port_status, sizeof(port_status), tunnel_1x.mmio_cxy_virtual(), 0x7CC04);
+            const char* status_str = (port_status == 1)   ? "UP"
+                                     : (port_status == 2) ? "DOWN"
+                                     : (port_status == 0) ? "UNKNOWN/TRAINING"
+                                                          : "UNUSED/OTHER";
+            log_info(
+                tt::LogMetal,
+                "ETH port status: mmio chip={} core={} (virtual={}) -> remote chip={}: port_status={} ({})",
+                tunnel_1x.mmio_id,
+                tunnel_1x.mmio_core_logical.str(),
+                tunnel_1x.mmio_core_virtual.str(),
+                tunnel_1x.connected_id,
+                port_status,
+                status_str);
+        } catch (const std::exception& e) {
+            log_warning(
+                tt::LogMetal,
+                "ETH port status: mmio chip={} core={} -> remote chip={}: read failed: {}",
+                tunnel_1x.mmio_id,
+                tunnel_1x.mmio_core_logical.str(),
+                tunnel_1x.connected_id,
+                e.what());
+        }
+        // Read TXQ0 registers: CTRL (offset 0x0), CMD (0x4), STATUS (0x8),
+        // TRANSFER_CNT (0x30), PKT_START_CNT (0x34), PKT_END_CNT (0x3C)
+        try {
+            constexpr uint32_t TXQ0_BASE = 0xFFB90000;
+            uint32_t ctrl = 0, status = 0, xfer_cnt = 0, pkt_start = 0, pkt_end = 0;
+            cluster.read_core(&ctrl, sizeof(ctrl), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x00);
+            cluster.read_core(&status, sizeof(status), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x08);
+            cluster.read_core(&xfer_cnt, sizeof(xfer_cnt), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x30);
+            cluster.read_core(&pkt_start, sizeof(pkt_start), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x34);
+            cluster.read_core(&pkt_end, sizeof(pkt_end), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x3C);
+            log_info(
+                tt::LogMetal,
+                "TXQ0 diag: mmio chip={} core={}: CTRL=0x{:x} (KEEPALIVE={}), STATUS=0x{:x} (CMD_ONGOING={}), "
+                "TRANSFER_CNT={}, PKT_START={}, PKT_END={}",
+                tunnel_1x.mmio_id,
+                tunnel_1x.mmio_core_logical.str(),
+                ctrl,
+                (ctrl & 1) ? "YES" : "NO",
+                status,
+                ((status >> 16) & 1) ? "YES" : "NO",
+                xfer_cnt,
+                pkt_start,
+                pkt_end);
+        } catch (const std::exception& e) {
+            log_warning(
+                tt::LogMetal,
+                "TXQ0 diag: mmio chip={} core={}: read failed: {}",
+                tunnel_1x.mmio_id,
+                tunnel_1x.mmio_core_logical.str(),
+                e.what());
+        }
+    }
 
     for (const auto& tunnel_1x : system_descriptor_.tunnels_from_mmio) {
         auto mmio_mask = system_descriptor_.enabled_eth_channels.at(tunnel_1x.mmio_id);
@@ -193,6 +255,31 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
                     tunnel_1x.connected_id,
                     e.what());
             }
+            // Post-timeout TXQ0 diagnostic on MMIO core
+            try {
+                constexpr uint32_t TXQ0_BASE = 0xFFB90000;
+                uint32_t ctrl = 0, status = 0, xfer_cnt = 0, pkt_start = 0, pkt_end = 0;
+                cluster.read_core(&ctrl, sizeof(ctrl), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x00);
+                cluster.read_core(&status, sizeof(status), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x08);
+                cluster.read_core(&xfer_cnt, sizeof(xfer_cnt), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x30);
+                cluster.read_core(&pkt_start, sizeof(pkt_start), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x34);
+                cluster.read_core(&pkt_end, sizeof(pkt_end), tunnel_1x.mmio_cxy_virtual(), TXQ0_BASE + 0x3C);
+                log_warning(
+                    tt::LogMetal,
+                    "Post-timeout TXQ0: mmio chip={} core={}: CTRL=0x{:x} (KEEPALIVE={}), STATUS=0x{:x} "
+                    "(CMD_ONGOING={}), "
+                    "TRANSFER_CNT={}, PKT_START={}, PKT_END={}",
+                    tunnel_1x.mmio_id,
+                    tunnel_1x.mmio_core_logical.str(),
+                    ctrl,
+                    (ctrl & 1) ? "YES" : "NO",
+                    status,
+                    ((status >> 16) & 1) ? "YES" : "NO",
+                    xfer_cnt,
+                    pkt_start,
+                    pkt_end);
+            } catch (...) {
+            }
             // Reset the failed MMIO-side core and remove the tunnel
             set_reset_state(tunnel_1x.mmio_cxy_virtual(), true);
             it = system_descriptor_.tunnels_from_mmio.erase(it);
@@ -214,10 +301,14 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
 void BlackholeLiteFabricHal::terminate() {
     uint32_t routing_enabled_address = LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteMemoryMap, config) +
                                        offsetof(lite_fabric::FabricLiteConfig, routing_enabled);
-    uint32_t enabled = 0;
     auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
 
-    // Signal MMIO-side ERISC1 to stop; firmware propagates STOP to remote via ethernet
+    // Signal STOP (not STOPPED) so the firmware properly shuts down the remote side.
+    // The STOP handler in service_lite_fabric() asserts reset on the remote ERISC1
+    // before transitioning to STOPPED.  Without this, the remote ERISC1 keeps running
+    // after the MMIO side is killed, leaving stale state (possibly a busy TXQ) that
+    // causes the next init to fail.
+    uint32_t stop_val = static_cast<uint32_t>(lite_fabric::RoutingEnabledState::STOP);
     for (const auto& tunnel_1x : system_descriptor_.tunnels_from_mmio) {
         log_info(
             tt::LogMetal,
@@ -225,9 +316,25 @@ void BlackholeLiteFabricHal::terminate() {
             tunnel_1x.mmio_id,
             tunnel_1x.mmio_core_logical,
             tunnel_1x.mmio_core_virtual);
-        cluster.write_core((void*)&enabled, sizeof(uint32_t), tunnel_1x.mmio_cxy_virtual(), routing_enabled_address);
+        cluster.write_core((void*)&stop_val, sizeof(uint32_t), tunnel_1x.mmio_cxy_virtual(), routing_enabled_address);
     }
     cluster.l1_barrier(0);
+
+    // Wait for firmware to process STOP and transition to STOPPED.
+    // This confirms the remote ERISC1 has been reset.
+    std::vector<uint32_t> readback(1);
+    constexpr int k_TerminateMaxPolls = 100;
+    constexpr int k_TerminatePollMs = 10;
+    for (const auto& tunnel_1x : system_descriptor_.tunnels_from_mmio) {
+        for (int i = 0; i < k_TerminateMaxPolls; i++) {
+            cluster.read_core(readback, sizeof(uint32_t), tunnel_1x.mmio_cxy_virtual(), routing_enabled_address);
+            if (static_cast<lite_fabric::RoutingEnabledState>(readback[0]) ==
+                lite_fabric::RoutingEnabledState::STOPPED) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(k_TerminatePollMs));
+        }
+    }
 
     LiteFabricHal::set_reset_state(true);
 }
@@ -261,7 +368,8 @@ void BlackholeLiteFabricHal::wait_for_state(tt_cxy_pair virtual_core, lite_fabri
                 "wait_for_state: TIMEOUT on core {}. current_state={}, initial_state={}, "
                 "is_mmio={}, is_primary={}, routing_enabled={}, eth_chans_mask=0x{:x}, "
                 "binary_addr=0x{:x}, binary_size={}, "
-                "primary_local_handshake=0x{:x}, neighbour_handshake=0x{:x}",
+                "primary_local_handshake=0x{:x}, neighbour_handshake=0x{:x}, "
+                "padding1=[0x{:x},0x{:x},0x{:x}], padding2=[0x{:x}]",
                 virtual_core.str(),
                 static_cast<uint32_t>(cfg->current_state),
                 static_cast<uint32_t>(cfg->initial_state),
@@ -272,7 +380,11 @@ void BlackholeLiteFabricHal::wait_for_state(tt_cxy_pair virtual_core, lite_fabri
                 static_cast<uint32_t>(cfg->binary_addr),
                 static_cast<uint32_t>(cfg->binary_size),
                 cfg->primary_local_handshake,
-                cfg->neighbour_handshake);
+                cfg->neighbour_handshake,
+                cfg->padding1[0],
+                cfg->padding1[1],
+                cfg->padding1[2],
+                cfg->padding2[0]);
             TT_THROW(
                 "Lite fabric core {} failed to reach state {} (stuck at {})",
                 virtual_core.str(),

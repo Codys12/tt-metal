@@ -280,6 +280,10 @@ int __attribute__((noinline)) main(void) {
             // While the go signal for kernel execution is not sent, check if the worker was signalled
             // to reset its launch message read pointer.
             if (flag_disable[0] != 1) {
+                // Increment heartbeat so host can detect we're returning to base FW.
+                // RISC_POST_HEARTBEAT is a no-op on Blackhole, so we do it explicitly.
+                volatile uint32_t* hb = reinterpret_cast<volatile uint32_t*>(MEM_SYSENG_ETH_HEARTBEAT);
+                *hb = *hb + 1;
                 return 0;
             } else if (
                 go_message_signal == RUN_MSG_RESET_READ_PTR || go_message_signal == RUN_MSG_RESET_READ_PTR_FROM_HOST ||

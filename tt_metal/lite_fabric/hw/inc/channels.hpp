@@ -27,6 +27,10 @@ extern WriteTridTracker receiver_channel_0_trid_tracker;
 extern OutboundReceiverChannelPointersTupleImpl outbound_to_receiver_channel_pointers_tuple;
 extern ReceiverChannelPointersTupleImpl receiver_channel_pointers_tuple;
 
+// Forwarding state for multi-hop relay
+extern volatile FabricLiteConfig::ForwardingConfig* forwarding_config;
+extern uint8_t forwarding_downstream_wr_idx;
+
 /////////////////////
 // Sender Channel
 /////////////////////
@@ -45,10 +49,17 @@ FORCE_INLINE void send_next_data(
     pkt_header->debug = 0xd05e0000;
 
     if (pkt_header->get_base_send_type() == lite_fabric::NocSendTypeEnum::WRITE_REG) {
-        const uint32_t reg_address = pkt_header->command_fields.write_reg.reg_address;
-        const uint32_t reg_value = pkt_header->command_fields.write_reg.reg_value;
-        while (internal_::eth_txq_is_busy(sender_txq_id));
-        internal_::eth_write_remote_reg(sender_txq_id, reg_address, reg_value);
+        // Only apply WRITE_REG locally if this is the last hop before the destination.
+        // For intermediate FORWARD_ONLY hops, skip eth_write_remote_reg — the downstream
+        // sender at the final hop will apply it via its own ETH link.
+        uint32_t current_hop = pkt_header->routing_fields.value & lite_fabric::LiteFabricRoutingFields::FIELD_MASK;
+        if (current_hop == lite_fabric::LiteFabricRoutingFields::WRITE_ONLY ||
+            current_hop == lite_fabric::LiteFabricRoutingFields::WRITE_AND_FORWARD) {
+            const uint32_t reg_address = pkt_header->command_fields.write_reg.reg_address;
+            const uint32_t reg_value = pkt_header->command_fields.write_reg.reg_value;
+            while (internal_::eth_txq_is_busy(sender_txq_id));
+            internal_::eth_write_remote_reg(sender_txq_id, reg_address, reg_value);
+        }
         // Continue to forward the packet to ensure pointers are synced
     }
 
@@ -116,6 +127,97 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
     invalidate_l1_cache();
     const auto& header = *packet_start;
 
+    // Multi-hop forwarding: inspect routing_fields to decide whether to forward
+    // this packet to a downstream ETH core on the same chip via NOC write.
+    uint32_t current_hop_action = header.routing_fields.value & lite_fabric::LiteFabricRoutingFields::FIELD_MASK;
+    if (forwarding_config->enabled && (current_hop_action == lite_fabric::LiteFabricRoutingFields::FORWARD_ONLY ||
+                                       current_hop_action == lite_fabric::LiteFabricRoutingFields::WRITE_AND_FORWARD)) {
+        // Shift routing fields right to consume this hop
+        const_cast<lite_fabric::FabricLiteHeader*>(packet_start)->routing_fields.value >>=
+            lite_fabric::LiteFabricRoutingFields::FIELD_WIDTH;
+
+        // Calculate destination in the downstream core's sender buffer
+        uint32_t downstream_buf = forwarding_config->downstream_sender_buf_addr +
+                                  forwarding_downstream_wr_idx * forwarding_config->downstream_buffer_size;
+        uint64_t downstream_noc_addr =
+            get_noc_addr(forwarding_config->downstream_noc_x, forwarding_config->downstream_noc_y, downstream_buf);
+
+        // Copy the full packet (header + unaligned_offset + payload) to downstream sender buffer
+        uint32_t total_size = sizeof(lite_fabric::FabricLiteHeader) + header.unaligned_offset + payload_size_bytes;
+        total_size = (total_size + 15) & ~15;  // 16-byte aligned
+        // Use per-TRID writes and barriers instead of noc_async_write + noc_async_write_barrier().
+        // noc_async_write_barrier() checks NIU_MST_WR_ACK_RECEIVED == noc_nonposted_writes_acked[noc],
+        // but the HW register is shared between ERISC0 and ERISC1 on the same tile.  ERISC0's
+        // service_eth_msg() (called from risc_context_switch) can do NOC0 non-posted writes that
+        // increment the shared HW counter without updating ERISC1's SW counter, causing the ==
+        // check to never pass and ERISC1 to hang forever.  Per-TRID barriers check
+        // NIU_MST_WRITE_REQS_OUTGOING_ID(trid) which is specific to our TRID and immune to ERISC0.
+        noc_async_write_one_packet_with_trid<true, false>(
+            reinterpret_cast<uint32_t>(packet_start),
+            downstream_noc_addr,
+            total_size,
+            transaction_id,
+            lite_fabric::local_chip_data_cmd_buf,
+            lite_fabric::edm_to_local_chip_noc,
+            lite_fabric::forward_and_local_write_noc_vc);
+        while (
+            !ncrisc_noc_nonposted_write_with_transaction_id_sent(lite_fabric::edm_to_local_chip_noc, transaction_id)) {
+            invalidate_l1_cache();
+        }
+
+        // Signal the downstream sender to pick up the forwarded packet.
+        // Instead of writing h2d.sender directly (not 16B-aligned, would clobber
+        // d2h via the 16B-aligned write workaround), write new_wr_idx to the
+        // target core's ForwardingConfig.initial_wr_idx which IS 16B-aligned.
+        // The target FW polls initial_wr_idx and copies to h2d.sender locally.
+        uint8_t new_wr_idx =
+            lite_fabric::wrap_increment<SENDER_NUM_BUFFERS_ARRAY[CHANNEL_INDEX]>(forwarding_downstream_wr_idx);
+        // Build 16B scratch block with new_wr_idx at byte 0 (initial_wr_idx is
+        // at byte 0 of its 16B-aligned block), rest is padding.
+        volatile uint32_t* h2d_scratch =
+            reinterpret_cast<volatile uint32_t*>(reinterpret_cast<uint32_t>(packet_start) + total_size);
+        h2d_scratch[0] = static_cast<uint32_t>(new_wr_idx);  // initial_wr_idx in LSB
+        h2d_scratch[1] = 0;
+        h2d_scratch[2] = 0;
+        h2d_scratch[3] = 0;
+        asm volatile("fence w,w" ::: "memory");
+        // initial_wr_idx L1 address is the same on all cores (identical memory map)
+        uint32_t mailbox_l1_addr = reinterpret_cast<uint32_t>(&forwarding_config->initial_wr_idx);
+        uint64_t mailbox_noc_addr =
+            get_noc_addr(forwarding_config->downstream_noc_x, forwarding_config->downstream_noc_y, mailbox_l1_addr);
+        noc_async_write_one_packet_with_trid<true, false>(
+            reinterpret_cast<uint32_t>(h2d_scratch),
+            mailbox_noc_addr,
+            16,
+            transaction_id,
+            lite_fabric::local_chip_data_cmd_buf,
+            lite_fabric::edm_to_local_chip_noc,
+            lite_fabric::forward_and_local_write_noc_vc);
+        while (
+            !ncrisc_noc_nonposted_write_with_transaction_id_sent(lite_fabric::edm_to_local_chip_noc, transaction_id)) {
+            invalidate_l1_cache();
+        }
+
+        forwarding_downstream_wr_idx = new_wr_idx;
+
+        // Diagnostic: record outbound forwarding target in padding0 so the host
+        // can verify the NOC write destination.
+        // bits 31-24: downstream_noc_x
+        // bits 23-16: downstream_noc_y
+        // bits 15-8:  new_wr_idx (value written to downstream h2d.sender)
+        // bits 7-0:   downstream_h2d_addr low byte
+        auto* diag_map = reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(LITE_FABRIC_CONFIG_START);
+        diag_map->config.padding0 = (static_cast<uint32_t>(forwarding_config->downstream_noc_x) << 24) |
+                                    (static_cast<uint32_t>(forwarding_config->downstream_noc_y) << 16) |
+                                    (static_cast<uint32_t>(new_wr_idx) << 8) |
+                                    (forwarding_config->downstream_h2d_addr & 0xFF);
+    }
+
+    // For FORWARD_ONLY, skip local processing entirely
+    if (current_hop_action == lite_fabric::LiteFabricRoutingFields::FORWARD_ONLY) {
+        return;
+    }
+
     lite_fabric::NocSendTypeEnum noc_send_type = header.get_base_send_type();
     uint8_t noc_index = header.get_noc_index();
     if (static_cast<int>(noc_send_type) > static_cast<int>(lite_fabric::NocSendTypeEnum::NOC_SEND_TYPE_LAST)) {
@@ -145,7 +247,66 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
         } break;
 
         case lite_fabric::NocSendTypeEnum::NOC_READ: {
-            if (!on_mmio_chip) {
+            if (on_mmio_chip && forwarding_config->enabled) {
+                // Relay node (downstream receiver): forward read response upstream.
+                // The downstream tunnel has is_mmio=true and forwarding configured
+                // to point to the upstream core's sender buffer.  The response
+                // arrived from the downstream chip; relay it upstream so it
+                // eventually reaches the real MMIO receiver for the host to read.
+                uint32_t upstream_buf = forwarding_config->downstream_sender_buf_addr +
+                                        forwarding_downstream_wr_idx * forwarding_config->downstream_buffer_size;
+                uint64_t upstream_noc_addr = get_noc_addr(
+                    forwarding_config->downstream_noc_x, forwarding_config->downstream_noc_y, upstream_buf);
+
+                uint32_t total_size =
+                    sizeof(lite_fabric::FabricLiteHeader) + header.unaligned_offset + payload_size_bytes;
+                total_size = (total_size + 15) & ~15;
+                // Per-TRID writes + barriers (see outbound forwarding comment above for rationale)
+                noc_async_write_one_packet_with_trid<true, false>(
+                    reinterpret_cast<uint32_t>(packet_start),
+                    upstream_noc_addr,
+                    total_size,
+                    transaction_id,
+                    lite_fabric::local_chip_data_cmd_buf,
+                    lite_fabric::edm_to_local_chip_noc,
+                    lite_fabric::forward_and_local_write_noc_vc);
+                while (!ncrisc_noc_nonposted_write_with_transaction_id_sent(
+                    lite_fabric::edm_to_local_chip_noc, transaction_id)) {
+                    invalidate_l1_cache();
+                }
+
+                // Signal the upstream sender to pick up the response.
+                // Write new_wr_idx to the target's ForwardingConfig.initial_wr_idx
+                // (16B-aligned mailbox) instead of h2d.sender (not 16B-aligned).
+                // This avoids clobbering the upstream sender's d2h, which may be
+                // non-zero from processing previous forwarding config writes.
+                uint8_t new_wr_idx =
+                    lite_fabric::wrap_increment<SENDER_NUM_BUFFERS_ARRAY[CHANNEL_INDEX]>(forwarding_downstream_wr_idx);
+                volatile uint32_t* h2d_scratch =
+                    reinterpret_cast<volatile uint32_t*>(reinterpret_cast<uint32_t>(packet_start) + total_size);
+                h2d_scratch[0] = static_cast<uint32_t>(new_wr_idx);
+                h2d_scratch[1] = 0;
+                h2d_scratch[2] = 0;
+                h2d_scratch[3] = 0;
+                asm volatile("fence w,w" ::: "memory");
+                uint32_t mailbox_l1_addr = reinterpret_cast<uint32_t>(&forwarding_config->initial_wr_idx);
+                uint64_t mailbox_noc_addr = get_noc_addr(
+                    forwarding_config->downstream_noc_x, forwarding_config->downstream_noc_y, mailbox_l1_addr);
+                noc_async_write_one_packet_with_trid<true, false>(
+                    reinterpret_cast<uint32_t>(h2d_scratch),
+                    mailbox_noc_addr,
+                    16,
+                    transaction_id,
+                    lite_fabric::local_chip_data_cmd_buf,
+                    lite_fabric::edm_to_local_chip_noc,
+                    lite_fabric::forward_and_local_write_noc_vc);
+                while (!ncrisc_noc_nonposted_write_with_transaction_id_sent(
+                    lite_fabric::edm_to_local_chip_noc, transaction_id)) {
+                    invalidate_l1_cache();
+                }
+
+                forwarding_downstream_wr_idx = new_wr_idx;
+            } else if (!on_mmio_chip) {
                 const uint64_t src_address = header.command_fields.noc_read.noc_address;
                 // This assumes nobody else is using the sender channel on device 1 because
                 // the tunnel depth is only 1 at the moment
@@ -187,17 +348,28 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
                 diag_map->config.padding1[1] = static_cast<uint32_t>(src_address);
                 diag_map->config.padding1[2] = static_cast<uint32_t>(src_address >> 32);
 
+                // Sentinel-based read barrier: ERISC0 and ERISC1 share NOC0 HW
+                // read counters.  ERISC0's service_eth_msg() can issue NOC reads
+                // that increment NIU_MST_RD_RESP_RECEIVED, causing the equality
+                // check in ncrisc_noc_reads_flushed() to permanently fail (HW
+                // overshoots SW).  Instead of using the shared counter, we write
+                // a sentinel to the read destination and poll for the NOC DMA to
+                // overwrite it.  On BH ERISC, L1 is SRAM (no D-cache), so
+                // volatile reads see NOC DMA writes immediately.
+                volatile uint32_t* sentinel_ptr = reinterpret_cast<volatile uint32_t*>(payload_dst_address);
+                constexpr uint32_t SENTINEL = 0xFACECA5E;
+                *sentinel_ptr = SENTINEL;
+
+                // Resync SW counter for bookkeeping (not used for barrier)
+                noc_reads_num_issued[noc_index] = NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_RESP_RECEIVED);
+
                 noc_async_read(src_address, payload_dst_address, payload_size_bytes, noc_index);
 
-                // Timed barrier: if the NOC read doesn't complete within ~1s,
-                // skip the response to prevent a permanent firmware hang.
-                // NOC_STATUS_READ_REG is an uncached MMIO read (~100-200 cycles),
-                // so keep the iteration count low enough to fire within a few seconds.
                 bool read_completed = false;
                 {
                     constexpr uint32_t k_MaxBarrierIters = 5000000;
                     for (uint32_t i = 0; i < k_MaxBarrierIters; i++) {
-                        if (ncrisc_noc_reads_flushed(noc_index)) {
+                        if (*sentinel_ptr != SENTINEL) {
                             read_completed = true;
                             break;
                         }
@@ -205,20 +377,29 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
                     invalidate_l1_cache();
                 }
 
+                // Resync SW counter to prevent drift for future reads
+                noc_reads_num_issued[noc_index] = NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_RESP_RECEIVED);
+
                 if (read_completed) {
                     // Tell ourselves there is data to send
                     // NOTE: sender_buffer_channel index will be incremented in send_next_data
                     host_interface->h2d.sender_host_write_index =
                         tt::tt_fabric::wrap_increment<SENDER_NUM_BUFFERS_ARRAY[CHANNEL_INDEX]>(
                             host_interface->h2d.sender_host_write_index);
+                    // Keep the forwarding mailbox in sync: service_lite_fabric()
+                    // polls initial_wr_idx and copies to h2d.sender every iteration.
+                    // If we don't update initial_wr_idx here, the polling clobbers
+                    // h2d.sender back to the stale mailbox value, preventing the
+                    // sender from ever picking up this 1-hop read response.
+                    if (forwarding_config->enabled) {
+                        forwarding_config->initial_wr_idx = host_interface->h2d.sender_host_write_index;
+                    }
                 } else {
-                    // Read timed out. Resync the software counter with the hardware
-                    // so that subsequent reads don't also hang waiting for this one.
-                    noc_reads_num_issued[noc_index] = NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_RESP_RECEIVED);
                     // Don't update sender_host_write_index — no response is sent back.
                     // The host-side wait_for_read_event will time out and report the error.
                 }
             }
+            // else: real MMIO chip without forwarding — host reads from receiver buffer directly
         } break;
 
         case lite_fabric::NocSendTypeEnum::WRITE_REG: {
@@ -267,7 +448,11 @@ FORCE_INLINE void run_receiver_channel_step() {
     auto receiver_buffer_index = completion_counter.get_buffer_index();
     bool next_trid_flushed = receiver_channel_0_trid_tracker.transaction_flushed(receiver_buffer_index);
     bool can_send_completion = unflushed_writes && next_trid_flushed;
-    if (on_mmio_chip) {
+    if (on_mmio_chip && !forwarding_config->enabled) {
+        // On the real MMIO receiver (no forwarding), gate completion on the host
+        // having consumed previous responses.  Skip this for relay receivers
+        // (on_mmio_chip=true + forwarding enabled) because no host drains their
+        // receiver buffer — the relay forwards responses upstream directly.
         can_send_completion =
             can_send_completion &&
             (((host_interface->d2h.fabric_receiver_channel_index + 1) % RECEIVER_NUM_BUFFERS_ARRAY[CHANNEL_INDEX]) !=

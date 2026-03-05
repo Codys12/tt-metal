@@ -513,80 +513,106 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<ChipId>& device_id
                 index_offset += nodes_for_one_mmio.size();
             }
         } else {
-            // Should be paired mmio/remote devices
-            TT_ASSERT(
-                mmio_devices.size() == remote_devices.size() or remote_devices.empty(),
-                "N300/T3K expects devices in mmio/remote pairs.");
-            std::vector<DispatchKernelNode> nodes_for_one_mmio =
+            // Build a mapping from each MMIO device to its paired remote device (if any).
+            // Not every MMIO device necessarily has a remote — e.g. in a Blackhole 8-chip ring
+            // with lite fabric, only one MMIO device may gateway a single remote device.
+            std::map<ChipId, ChipId> mmio_to_remote;
+            for (auto remote_id : remote_devices) {
+                ChipId mmio_id = MetalContext::instance().get_cluster().get_associated_mmio_device(remote_id);
+                mmio_to_remote[mmio_id] = remote_id;
+            }
+
+            std::vector<DispatchKernelNode> nodes_for_single = populate_single_device();
+            std::vector<DispatchKernelNode> nodes_for_two_chip =
                 (num_hw_cqs == 1) ? two_chip_arch_1cq_fabric : two_chip_arch_2cq_fabric;
 
             uint32_t index_offset = 0;
             for (auto mmio_device_id : mmio_devices) {
-                // Find the corresponding remote chip
-                ChipId remote_device_id{};
-                bool found_remote = false;
-                for (auto id : remote_devices) {
-                    if (MetalContext::instance().get_cluster().get_associated_mmio_device(id) == mmio_device_id) {
-                        remote_device_id = id;
-                        found_remote = true;
-                        break;
-                    }
-                }
-                TT_ASSERT(found_remote, "Couldn't find paired remote chip for device {}", mmio_device_id);
+                auto it = mmio_to_remote.find(mmio_device_id);
+                bool has_tunnels =
+                    !MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id).empty();
 
-                // Find which tunnel connects the MMIO to the paired remote.
-                // The template assumes tunnel 0 but the remote may be on a
-                // different tunnel when multiple tunnels exist.
-                int tunnel_for_remote = 0;
-                {
-                    auto tunnels = MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id);
-                    for (int t = 0; t < static_cast<int>(tunnels.size()); t++) {
-                        bool found_in_tunnel = false;
-                        for (const auto& chip : tunnels[t]) {
-                            if (chip == remote_device_id) {
-                                tunnel_for_remote = t;
-                                found_in_tunnel = true;
+                if (it == mmio_to_remote.end() || !has_tunnels) {
+                    // No paired remote, or remote is reached via lite fabric (no tunnels)
+                    // — use single-chip dispatch for the MMIO device.
+                    for (auto node : nodes_for_single) {
+                        node.device_id = mmio_device_id;
+                        node.servicing_device_id = mmio_device_id;
+                        increment_node_ids(node, index_offset);
+                        nodes.push_back(node);
+                    }
+                    index_offset += nodes_for_single.size();
+
+                    if (it != mmio_to_remote.end()) {
+                        // Also add single-chip dispatch for the remote device
+                        // (lite fabric handles transport, no tunnel MUX/DEMUX needed).
+                        ChipId remote_device_id = it->second;
+                        for (auto node : nodes_for_single) {
+                            node.device_id = remote_device_id;
+                            node.servicing_device_id = remote_device_id;
+                            increment_node_ids(node, index_offset);
+                            nodes.push_back(node);
+                        }
+                        index_offset += nodes_for_single.size();
+                    }
+                } else {
+                    ChipId remote_device_id = it->second;
+
+                    // Find which tunnel connects the MMIO to the paired remote.
+                    // The template assumes tunnel 0 but the remote may be on a
+                    // different tunnel when multiple tunnels exist.
+                    int tunnel_for_remote = 0;
+                    {
+                        auto tunnels =
+                            MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id);
+                        for (int t = 0; t < static_cast<int>(tunnels.size()); t++) {
+                            bool found_in_tunnel = false;
+                            for (const auto& chip : tunnels[t]) {
+                                if (chip == remote_device_id) {
+                                    tunnel_for_remote = t;
+                                    found_in_tunnel = true;
+                                    break;
+                                }
+                            }
+                            if (found_in_tunnel) {
                                 break;
                             }
                         }
-                        if (found_in_tunnel) {
-                            break;
+                    }
+
+                    // Add dispatch kernels for the mmio/remote pair
+                    for (DispatchKernelNode node : nodes_for_two_chip) {
+                        constexpr uint32_t k_MMIO = 0;
+                        constexpr uint32_t k_Remote = 1;
+                        TT_ASSERT(node.device_id == k_MMIO || node.device_id == k_Remote);
+                        TT_ASSERT(
+                            node.servicing_device_id == k_MMIO || node.servicing_device_id == k_Remote ||
+                            node.servicing_device_id == x);
+
+                        if (node.device_id == k_MMIO) {
+                            node.device_id = mmio_device_id;
+                        } else {
+                            // node.device_id == k_Remote
+                            node.device_id = remote_device_id;
                         }
+
+                        if (node.servicing_device_id == k_MMIO) {
+                            node.servicing_device_id = mmio_device_id;
+                        } else if (node.servicing_device_id == k_Remote) {
+                            node.servicing_device_id = remote_device_id;
+                        }
+
+                        // Update tunnel index for MUX nodes to match the actual
+                        // tunnel connecting the MMIO to the paired remote device.
+                        if (node.tunnel_index >= 0) {
+                            node.tunnel_index = tunnel_for_remote;
+                        }
+
+                        increment_node_ids(node, index_offset);
+                        nodes.push_back(node);
                     }
+                    index_offset += nodes_for_two_chip.size();
                 }
-
-                // Add dispatch kernels for the mmio/remote pair
-                for (DispatchKernelNode node : nodes_for_one_mmio) {
-                    constexpr uint32_t k_MMIO = 0;
-                    constexpr uint32_t k_Remote = 1;
-                    TT_ASSERT(node.device_id == k_MMIO || node.device_id == k_Remote);
-                    TT_ASSERT(
-                        node.servicing_device_id == k_MMIO || node.servicing_device_id == k_Remote ||
-                        node.servicing_device_id == x);
-
-                    if (node.device_id == k_MMIO) {
-                        node.device_id = mmio_device_id;
-                    } else {
-                        // node.device_id == k_Remote
-                        node.device_id = remote_device_id;
-                    }
-
-                    if (node.servicing_device_id == k_MMIO) {
-                        node.servicing_device_id = mmio_device_id;
-                    } else if (node.servicing_device_id == k_Remote) {
-                        node.servicing_device_id = remote_device_id;
-                    }
-
-                    // Update tunnel index for MUX nodes to match the actual
-                    // tunnel connecting the MMIO to the paired remote device.
-                    if (node.tunnel_index >= 0) {
-                        node.tunnel_index = tunnel_for_remote;
-                    }
-
-                    increment_node_ids(node, index_offset);
-                    nodes.push_back(node);
-                }
-                index_offset += nodes_for_one_mmio.size();
             }
         }
     }
@@ -791,6 +817,10 @@ void configure_dispatch_cores(IDevice* device) {
     if (device->is_mmio_capable()) {
         for (ChipId serviced_device_id :
              MetalContext::instance().get_cluster().get_devices_controlled_by_mmio_device(device->id())) {
+            // Skip unreachable N-hop chips — they don't have host memory channels assigned.
+            if (MetalContext::instance().is_chip_unreachable(serviced_device_id)) {
+                continue;
+            }
             uint16_t channel =
                 MetalContext::instance().get_cluster().get_assigned_channel_for_device(serviced_device_id);
             for (uint8_t cq_id = 0; cq_id < device->num_hw_cqs(); cq_id++) {

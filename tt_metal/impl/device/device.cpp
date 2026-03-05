@@ -189,6 +189,7 @@ std::unique_ptr<AllocatorImpl> Device::initialize_allocator(
 // cores
 void Device::configure_command_queue_programs() {
     ChipId device_id = this->id();
+    log_info(tt::LogMetal, "DEBUG: configure_cq_programs: device {} step 1", device_id);
     ChipId mmio_device_id = tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device_id);
 
     std::vector<uint32_t> zero = {0x0};  // Reset state in case L1 Clear is disabled.
@@ -200,9 +201,14 @@ void Device::configure_command_queue_programs() {
     uint8_t num_hw_cqs = this->num_hw_cqs();
 
     // Reset host-side command queue pointers for all channels controlled by this mmio device
+    log_info(tt::LogMetal, "DEBUG: configure_cq_programs: device {} step 2 (mmio loop)", device_id);
     if (this->is_mmio_capable()) {
         for (ChipId serviced_device_id :
              tt::tt_metal::MetalContext::instance().get_cluster().get_devices_controlled_by_mmio_device(device_id)) {
+            // Skip unreachable N-hop chips — they don't have host memory channels assigned.
+            if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(serviced_device_id)) {
+                continue;
+            }
             uint16_t channel = tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(
                 serviced_device_id);
             uint32_t host_issue_q_rd_ptr = MetalContext::instance().dispatch_mem_map().get_host_command_queue_addr(
@@ -244,9 +250,11 @@ void Device::configure_command_queue_programs() {
     }
 
     // Write device-side cq pointers
+    log_info(tt::LogMetal, "DEBUG: configure_cq_programs: device {} step 3 (dispatch cores)", device_id);
     configure_dispatch_cores(this);
 
     // Run the cq program
+    log_info(tt::LogMetal, "DEBUG: configure_cq_programs: device {} step 4 (finalize + configure)", device_id);
     command_queue_program.impl().finalize_offsets(this);
     detail::ConfigureDeviceWithProgram(this, command_queue_program, true);
     tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(this->id());
@@ -265,9 +273,12 @@ void Device::init_command_queue_host() {
 }
 
 void Device::init_command_queue_device() {
+    log_info(tt::LogMetal, "DEBUG: Device {} init_cq_device: get_compiled_cq_program", id_);
     this->command_queue_programs_.push_back(get_compiled_cq_program(this));
     TT_ASSERT(this->command_queue_programs_.size() == 1);
+    log_info(tt::LogMetal, "DEBUG: Device {} init_cq_device: configure_command_queue_programs", id_);
     this->configure_command_queue_programs();
+    log_info(tt::LogMetal, "DEBUG: Device {} init_cq_device: configure done, processing program", id_);
     Program& command_queue_program = *this->command_queue_programs_[0];
 
     // Write 0 to all workers launch message read pointer. Need to do this since dispatch cores are written new on each

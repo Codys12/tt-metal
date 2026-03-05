@@ -999,6 +999,11 @@ void ControlPlane::configure_routing_tables_for_fabric_ethernet_channels(
             auto physical_chip_id = this->get_physical_chip_id_from_fabric_node_id(fabric_node_id);
             auto asic_id = this->topology_mapper_->get_asic_id_from_fabric_node_id(fabric_node_id);
 
+            // Skip building router port directions for unreachable source chips
+            if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(physical_chip_id)) {
+                continue;
+            }
+
             for (const auto& [logical_connected_chip_id, edge] : intra_mesh_connectivity[*mesh_id][fabric_chip_id]) {
                 auto connected_mesh_coord = this->mesh_graph_->chip_to_coordinate(mesh_id, logical_connected_chip_id);
                 if (local_mesh_coord_range.contains(connected_mesh_coord)) {
@@ -1011,6 +1016,18 @@ void ControlPlane::configure_routing_tables_for_fabric_ethernet_channels(
                         logical_connected_chip_id);
                     const auto& physical_connected_chip_id = this->logical_mesh_chip_id_to_physical_chip_id_mapping_.at(
                         FabricNodeId(mesh_id, logical_connected_chip_id));
+
+                    // Skip ETH links to unreachable N-hop chips
+                    if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(physical_connected_chip_id)) {
+                        log_info(
+                            tt::LogFabric,
+                            "build_intra_mesh_router_port_directions: skipping ETH links from chip {} to unreachable "
+                            "chip {} (fabric {})",
+                            physical_chip_id,
+                            physical_connected_chip_id,
+                            logical_connected_chip_id);
+                        continue;
+                    }
 
                     const auto& connected_chips_and_eth_cores =
                         tt::tt_metal::MetalContext::instance().get_cluster().get_ethernet_cores_grouped_by_connected_chips(
@@ -1903,6 +1920,16 @@ void ControlPlane::write_routing_tables_to_all_chips() const {
         for (const auto& mesh_coord : local_mesh_coord_range) {
             auto fabric_chip_id = this->mesh_graph_->coordinate_to_chip(mesh_id, mesh_coord);
             auto fabric_node_id = FabricNodeId(mesh_id, fabric_chip_id);
+            // Skip unreachable N-hop chips — no lite fabric path to write routing tables.
+            auto physical_chip_id = this->logical_mesh_chip_id_to_physical_chip_id_mapping_.at(fabric_node_id);
+            if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(physical_chip_id)) {
+                log_info(
+                    tt::LogFabric,
+                    "write_routing_tables_to_all_chips: skipping unreachable chip {} (physical {})",
+                    fabric_chip_id,
+                    physical_chip_id);
+                continue;
+            }
             TT_ASSERT(
                 this->inter_mesh_routing_tables_.contains(fabric_node_id),
                 "Intra mesh routing tables keys mismatch with inter mesh routing tables");
