@@ -211,6 +211,11 @@ void Device::configure_command_queue_programs() {
             }
             uint16_t channel = tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(
                 serviced_device_id);
+            // Skip devices that don't have dispatch cores allocated (fabric-only intermediates).
+            if (!MetalContext::instance().get_dispatch_core_manager().is_completion_queue_writer_core_allocated(
+                    serviced_device_id, channel, 0)) {
+                continue;
+            }
             uint32_t host_issue_q_rd_ptr = MetalContext::instance().dispatch_mem_map().get_host_command_queue_addr(
                 CommandQueueHostAddrType::ISSUE_Q_RD);
             uint32_t host_issue_q_wr_ptr = MetalContext::instance().dispatch_mem_map().get_host_command_queue_addr(
@@ -396,62 +401,6 @@ void Device::configure_fabric() {
     detail::WriteRuntimeArgsToDevice(this, *fabric_program_, using_fast_dispatch_);
     detail::ConfigureDeviceWithProgram(this, *fabric_program_, using_fast_dispatch_);
 
-    // Debug: readback kernel binary after ConfigureDeviceWithProgram for remote devices
-    if (!cluster.mmio_chip_ids().count(this->id())) {
-        const auto& hal_dbg = MetalContext::instance().hal();
-        auto eth_type_dbg = HalProgrammableCoreType::ACTIVE_ETH;
-        uint64_t kconfig_base = hal_dbg.get_dev_addr(eth_type_dbg, HalL1MemAddrType::KERNEL_CONFIG);
-        uint64_t launch_addr_dbg = hal_dbg.get_dev_addr(eth_type_dbg, HalL1MemAddrType::LAUNCH);
-        std::vector<std::vector<CoreCoord>> dbg_cores = fabric_program_->impl().logical_cores();
-        for (uint32_t idx = 0; idx < dbg_cores.size(); idx++) {
-            if (hal_dbg.get_core_type(idx) != CoreType::ETH) {
-                continue;
-            }
-            for (const auto& lc : dbg_cores[idx]) {
-                auto vc = this->virtual_core_from_logical_core(lc, CoreType::ETH);
-                // Read launch message first word
-                uint32_t launch_first = 0;
-                MetalContext::instance().get_cluster().read_core(
-                    &launch_first, sizeof(uint32_t), tt_cxy_pair(this->id(), vc), launch_addr_dbg);
-                // Read kernel config base first 4 words
-                uint32_t kconfig_data[4] = {0};
-                MetalContext::instance().get_cluster().read_core(
-                    kconfig_data, sizeof(kconfig_data), tt_cxy_pair(this->id(), vc), kconfig_base);
-                // Read more launch data to get kernel_text_offset[0] (at byte offset 44)
-                uint32_t launch_extra[12] = {0};  // words 0..11 (48 bytes)
-                MetalContext::instance().get_cluster().read_core(
-                    launch_extra, sizeof(launch_extra), tt_cxy_pair(this->id(), vc), launch_addr_dbg);
-                uint32_t kernel_text_offset_0 = launch_extra[11];  // offset 44/4
-                uint32_t kernel_entry = (uint32_t)kconfig_base + kernel_text_offset_0;
-                // Read kernel entry point data
-                uint32_t ktext_data[4] = {0};
-                if (kconfig_base != 0) {
-                    MetalContext::instance().get_cluster().read_core(
-                        ktext_data, sizeof(ktext_data), tt_cxy_pair(this->id(), vc), kernel_entry);
-                }
-                log_info(
-                    tt::LogMetal,
-                    "Device {} configure_fabric POST-WRITE: core {} kconfig_base=0x{:x} "
-                    "kconfig[0..3]=[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}] "
-                    "kernel_text_offset[0]=0x{:x} kernel_entry=0x{:x} "
-                    "ktext[0..3]=[0x{:08x}, 0x{:08x}, 0x{:08x}, 0x{:08x}]",
-                    this->id_,
-                    vc.str(),
-                    kconfig_base,
-                    kconfig_data[0],
-                    kconfig_data[1],
-                    kconfig_data[2],
-                    kconfig_data[3],
-                    kernel_text_offset_0,
-                    kernel_entry,
-                    ktext_data[0],
-                    ktext_data[1],
-                    ktext_data[2],
-                    ktext_data[3]);
-            }
-        }
-    }
-
     // For remote devices: re-write syseng API table stubs on ETH cores.
     // ConfigureDeviceWithProgram writes kernel binaries and data to L1 which
     // may overwrite the syseng API table stubs at MEM_SYSENG_ETH_API_TABLE
@@ -507,19 +456,21 @@ void Device::configure_fabric() {
         }
     }
     // Barrier to ensure launch/go messages reach the device before we return.
-    // For remote devices behind lite fabric, these writes go through the relay
-    // on the MMIO-side ETH core.  The MMIO device's configure_fabric() will
-    // overwrite that relay with its own fabric router, so the go_msg must be
-    // fully flushed before the relay is destroyed.
     tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(this->id());
 
     // For MMIO devices: deassert ERISC0 on fabric ETH cores.
     // The lite fabric launch (blackhole_impl.cpp set_reset_state) put ERISC0 in
     // hard reset via assert_risc_reset_at_core(ALL_TENSIX) and only deasserted
     // ERISC1.  ERISC0 must be restarted to process the fabric router go message.
+    //
+    // Lite fabric uses TXQ2; fabric router uses TXQ0/TXQ1.  No TXQ contention,
+    // so ERISC0 can be safely deasserted on ALL cores including those where
+    // ERISC1 runs the lite fabric relay.
     if (cluster.mmio_chip_ids().count(this->id())) {
         constexpr uint32_t SOFT_RESET_REG_ADDR = 0xFFB121B0;
-        constexpr uint32_t SOFT_RESET_ERISC0_RUNNING = 0x00000;
+        // 0x46000: bits 13/14/18 set (standard for ETH tiles), ERISC0+ERISC1 out of reset.
+        // Previous value 0x00000 incorrectly cleared bits 13/14/18.
+        constexpr uint32_t SOFT_RESET_BOTH_RUNNING = 0x46000;
         constexpr uint32_t AERISC_RESET_PC_ADDR = 0xFFB14000;
         constexpr uint32_t API_TABLE_ADDR = 0x7CF00;
         constexpr uint32_t API_TABLE_ENTRIES = 4;
@@ -533,12 +484,16 @@ void Device::configure_fabric() {
         uint32_t fw_base = jit_build_config.fw_launch_addr_value;
         DeviceAddr mailbox_addr = hal_ref.get_dev_addr(eth_type, HalL1MemAddrType::MAILBOX);
 
+        bool any_deasserted = false;
         for (uint32_t pct_idx = 0; pct_idx < logical_cores_used_in_program.size(); pct_idx++) {
             if (hal.get_core_type(pct_idx) != CoreType::ETH) {
                 continue;
             }
             for (const auto& logical_core : logical_cores_used_in_program[pct_idx]) {
                 auto vc = this->virtual_core_from_logical_core(logical_core, CoreType::ETH);
+
+                // Lite fabric uses TXQ2; fabric router uses TXQ0/TXQ1.
+                // No TXQ contention — ERISC0 can be safely deasserted on all cores.
 
                 // Re-write syseng API table stubs (may have been overwritten by ConfigureDeviceWithProgram)
                 uint32_t ret_insn = RISCV_RET_INSN;
@@ -566,15 +521,18 @@ void Device::configure_fabric() {
 
                 // Deassert ERISC0
                 cluster.l1_barrier(this->id());
-                uint32_t soft_reset_val = SOFT_RESET_ERISC0_RUNNING;
+                uint32_t soft_reset_val = SOFT_RESET_BOTH_RUNNING;
                 cluster.write_core(&soft_reset_val, sizeof(uint32_t), tt_cxy_pair(this->id(), vc), SOFT_RESET_REG_ADDR);
 
                 log_info(tt::LogMetal, "Device {} configure_fabric: deasserted ERISC0 on core {}", this->id_, vc.str());
+                any_deasserted = true;
             }
         }
-        cluster.l1_barrier(this->id());
-        // Wait for ERISC0 to boot and reach go-signal polling loop
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (any_deasserted) {
+            cluster.l1_barrier(this->id());
+            // Wait for ERISC0 to boot and reach go-signal polling loop
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
     }
 
     log_info(tt::LogMetal, "Fabric initialized on Device {}", this->id_);

@@ -78,7 +78,7 @@ public:
 
     void set_reset_state(bool assert_reset);
 
-    const SystemDescriptor& get_system_descriptor() { return system_descriptor_; }
+    const SystemDescriptor& get_system_descriptor() const { return system_descriptor_; }
     SystemDescriptor& get_mutable_system_descriptor() { return system_descriptor_; }
     const std::vector<uint8_t>& get_binary_data() const { return binary_data_; }
 

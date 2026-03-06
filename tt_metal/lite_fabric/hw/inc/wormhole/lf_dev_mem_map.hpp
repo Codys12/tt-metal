@@ -12,18 +12,18 @@
 
 // NOTE: Base firmware data is starting at 0x70000.
 // We need to ensure that the Lite Fabric memory does not overlap with it or Metal
-#define MEM_LITE_FABRIC_MEMORY_BASE 0x6A000
-#define MEM_LITE_FABRIC_MEMORY_SIZE (24 * 1024)
+#define MEM_LITE_FABRIC_MEMORY_BASE 0x62000
+#define MEM_LITE_FABRIC_MEMORY_SIZE (56 * 1024)
 #define MEM_LITE_FABRIC_MEMORY_END (MEM_LITE_FABRIC_MEMORY_BASE + MEM_LITE_FABRIC_MEMORY_SIZE)
 
 /* Lite Fabric Memory Layout */
 /* Text (firmware code) section */
 #define LITE_FABRIC_TEXT_START MEM_LITE_FABRIC_MEMORY_BASE
-#define LITE_FABRIC_TEXT_SIZE 0x2000
+#define LITE_FABRIC_TEXT_SIZE 0x3000
 
 /* Data section (in L1) */
 #define LITE_FABRIC_DATA_START (LITE_FABRIC_TEXT_START + LITE_FABRIC_TEXT_SIZE)
-#define LITE_FABRIC_DATA_SIZE 0x1000
+#define LITE_FABRIC_DATA_SIZE 0x800
 
 /* Scratch space for init. Not used. Data is in L1 at this time */
 #define LITE_FABRIC_INIT_SCRATCH (LITE_FABRIC_DATA_START + LITE_FABRIC_DATA_SIZE)
@@ -31,7 +31,7 @@
 
 /* Configuration area */
 #define LITE_FABRIC_CONFIG_START (LITE_FABRIC_DATA_START + LITE_FABRIC_DATA_SIZE)
-#define LITE_FABRIC_CONFIG_SIZE 0x2400
+#define LITE_FABRIC_CONFIG_SIZE 0x9800
 
 /* Stack configuration */
 #define LITE_FABRIC_STACK_START (MEM_LOCAL_BASE)

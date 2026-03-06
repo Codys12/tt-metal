@@ -1644,6 +1644,38 @@ void Cluster::release_ethernet_cores_for_fabric_routers() {
     this->initialize_ethernet_sockets();
 }
 
+void Cluster::release_fabric_routers_for_inactive_links(const std::set<ChipId>& active_chips) {
+    bool changed = false;
+    for (auto& [chip_id, eth_cores] : this->device_eth_routing_info_) {
+        if (!active_chips.contains(chip_id)) {
+            // Release all fabric router reservations on inactive chips.
+            for (auto& [eth_core, mode] : eth_cores) {
+                if (mode == EthRouterMode::FABRIC_ROUTER) {
+                    mode = EthRouterMode::IDLE;
+                    changed = true;
+                }
+            }
+            continue;
+        }
+        // For active chips, release reservations for links to inactive peers.
+        for (auto& [eth_core, mode] : eth_cores) {
+            if (mode != EthRouterMode::FABRIC_ROUTER) {
+                continue;
+            }
+            auto connected = this->get_connected_ethernet_core(std::make_tuple(chip_id, eth_core));
+            ChipId peer_chip = std::get<0>(connected);
+            if (!active_chips.contains(peer_chip)) {
+                mode = EthRouterMode::IDLE;
+                changed = true;
+            }
+        }
+    }
+    if (changed) {
+        this->ethernet_sockets_.clear();
+        this->initialize_ethernet_sockets();
+    }
+}
+
 std::set<tt_fabric::chan_id_t> Cluster::get_fabric_ethernet_channels(ChipId chip_id) const {
     std::set<tt_fabric::chan_id_t> fabric_ethernet_channels;
     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();

@@ -405,8 +405,8 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<ChipId>& device_id
     // of active devices. TODO: read this out of YAML instead of the structs above?
     uint32_t total_devices = MetalContext::instance().get_cluster().number_of_devices();
     TT_ASSERT(
-        total_devices == 1 or total_devices == 2 or total_devices == 4 or total_devices == 8 or total_devices == 32 or
-            total_devices == 36,
+        total_devices == 1 or total_devices == 2 or total_devices == 4 or total_devices == 8 or total_devices == 9 or
+            total_devices == 32 or total_devices == 36,
         "Unexpected target.");
     uint32_t num_devices = device_ids.size();
     TT_ASSERT(num_devices > 0, "Can't determine dispatch architecture with no active devices.");
@@ -823,6 +823,13 @@ void configure_dispatch_cores(IDevice* device) {
             }
             uint16_t channel =
                 MetalContext::instance().get_cluster().get_assigned_channel_for_device(serviced_device_id);
+            // Skip serviced devices that don't have dispatch cores allocated.
+            // Fabric-only intermediate devices are activated for routing but
+            // have no dispatch topology, so we must not lazily allocate cores.
+            if (!MetalContext::instance().get_dispatch_core_manager().is_completion_queue_writer_core_allocated(
+                    serviced_device_id, channel, 0)) {
+                continue;
+            }
             for (uint8_t cq_id = 0; cq_id < device->num_hw_cqs(); cq_id++) {
                 tt_cxy_pair completion_q_writer_location =
                     MetalContext::instance().get_dispatch_core_manager().completion_queue_writer_core(

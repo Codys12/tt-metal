@@ -344,6 +344,13 @@ public:
         return this->tunnels_from_mmio_device.at(mmio_chip_id);
     }
 
+    // Replace the tunnels from a given MMIO device.  Used after N-hop BFS
+    // discovery to install flat [MMIO, remote] tunnels for all reachable
+    // remote devices so that dispatch topology can find them.
+    void set_tunnels_from_mmio(ChipId mmio_chip_id, std::vector<std::vector<ChipId>> tunnels) {
+        this->tunnels_from_mmio_device[mmio_chip_id] = std::move(tunnels);
+    }
+
     // Configures ethernet cores for fabric routers depending on whether fabric is enabled
     void configure_ethernet_cores_for_fabric_routers(
         tt_fabric::FabricConfig fabric_config, std::optional<uint8_t> num_routing_planes = std::nullopt);
@@ -414,6 +421,11 @@ public:
     // Updates routing info for both the new chips and existing chips that have
     // newly discovered connections to the new chips.
     void update_routing_info_for_dynamic_chips(const std::set<ChipId>& new_chips);
+
+    // Releases fabric router reservations for links where the connected chip is
+    // not in the active set.  This prevents fabric routers from being deployed on
+    // links to inactive devices, which would cause handshake timeouts.
+    void release_fabric_routers_for_inactive_links(const std::set<ChipId>& active_chips);
 
 private:
     void detect_arch_and_target();

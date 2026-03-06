@@ -34,15 +34,29 @@ using ReceiverChannelPointersTuple =
 using ReceiverChannelPointersTupleImpl =
     decltype(lite_fabric::ChannelPointersTuple<ReceiverChannelPointers, RECEIVER_NUM_BUFFERS_ARRAY>::make());
 
+// Per-channel type aliases.  Channel 0 and 1 have the same buffer count (4)
+// so they share the same concrete type.
 using SenderEthChannelBuffer = tt::tt_fabric::SenderEthChannel<FabricLiteHeader, SENDER_NUM_BUFFERS_ARRAY[0]>;
 using ReceiverEthChannelBuffer = tt::tt_fabric::EthChannelBuffer<FabricLiteHeader, RECEIVER_NUM_BUFFERS_ARRAY[0]>;
 
+// Channel 1 aliases (same type when buffer counts match)
+using SenderEthChannelBuffer1 = tt::tt_fabric::SenderEthChannel<FabricLiteHeader, SENDER_NUM_BUFFERS_ARRAY[1]>;
+using ReceiverEthChannelBuffer1 = tt::tt_fabric::EthChannelBuffer<FabricLiteHeader, RECEIVER_NUM_BUFFERS_ARRAY[1]>;
+
 using HostInterface = HostToFabricLiteInterface<SENDER_NUM_BUFFERS_ARRAY[0], CHANNEL_BUFFER_SIZE>;
+using HostInterface1 = HostToFabricLiteInterface<SENDER_NUM_BUFFERS_ARRAY[1], CHANNEL_BUFFER_SIZE>;
 
 using WriteTridTracker = WriteTransactionIdTracker<
     RECEIVER_NUM_BUFFERS_ARRAY[0],
     NUM_TRANSACTION_IDS,
     TRID_OFFSET,
+    lite_fabric::edm_to_local_chip_noc,
+    lite_fabric::edm_to_downstream_noc>;
+
+using WriteTridTracker1 = WriteTransactionIdTracker<
+    RECEIVER_NUM_BUFFERS_ARRAY[1],
+    NUM_TRANSACTION_IDS,
+    TRID_OFFSET_CH1,
     lite_fabric::edm_to_local_chip_noc,
     lite_fabric::edm_to_downstream_noc>;
 

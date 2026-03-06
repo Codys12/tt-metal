@@ -124,7 +124,12 @@ struct FabricLiteConfig {
         // target sender's current d2h.sender so that wrap_increment(initial)
         // produces a value != d2h, triggering the sender to pick up the packet.
         uint8_t initial_wr_idx = 0;
-        uint8_t _forwarding_pad[15]{};  // Pad ForwardingConfig to maintain 16-byte struct alignment
+        // 1 = this core is a downstream sender that reverse-forwards read
+        // responses upstream.  Used to gate mailbox polling, reverse-forwarding
+        // in the NOC_READ handler, and receiver completion gating.  Upstream
+        // receivers (including the real MMIO receiver) leave this at 0.
+        uint8_t is_reverse_relay = 0;
+        uint8_t _forwarding_pad[14]{};  // Pad ForwardingConfig to maintain 16-byte struct alignment
     } __attribute__((packed)) forwarding;
 } __attribute__((packed));
 
@@ -142,7 +147,8 @@ public:
     static void increment() { event.fetch_add(1); }
 };
 
-// Interface for Host to MMIO Lite Fabric
+// Interface for Host to MMIO Lite Fabric (per-channel).
+// d2h and h2d are on-device (L1); the rest are host-only.
 template <uint32_t NUM_BUFFERS, uint32_t CHANNEL_BUFFER_SIZE>
 struct HostToFabricLiteInterface {
     static constexpr uint32_t k_ConnectedDeviceId = 1;
@@ -191,6 +197,23 @@ struct HostToFabricLiteInterface {
     }
 } __attribute__((packed));
 
+// Helper to compute total sender buffers across all channels
+constexpr size_t total_sender_buffers() {
+    size_t total = 0;
+    for (size_t i = 0; i < NUM_SENDER_CHANNELS; i++) {
+        total += SENDER_NUM_BUFFERS_ARRAY[i];
+    }
+    return total;
+}
+
+constexpr size_t total_receiver_buffers() {
+    size_t total = 0;
+    for (size_t i = 0; i < NUM_RECEIVER_CHANNELS; i++) {
+        total += RECEIVER_NUM_BUFFERS_ARRAY[i];
+    }
+    return total;
+}
+
 struct FabricLiteMemoryMap {
     uint32_t sender_flow_control_semaphore{};
     uint32_t padding0[3]{};
@@ -198,27 +221,40 @@ struct FabricLiteMemoryMap {
     uint32_t padding1[3]{};
     uint32_t worker_semaphore{};
     uint32_t padding2[7]{};
-    unsigned char sender_channel_buffer[lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
-    unsigned char padding3[192]{};
-    unsigned char
-        receiver_channel_buffer[lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[0] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+
+    // Channel 0 sender buffers (outbound commands: writes + read commands)
+    unsigned char sender_ch0_buffer[lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+    // Channel 1 sender buffers (read responses going back to host)
+    unsigned char sender_ch1_buffer[lite_fabric::SENDER_NUM_BUFFERS_ARRAY[1] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+
+    unsigned char padding3[64]{};
+
+    // Channel 0 receiver buffers (incoming commands on remote side)
+    unsigned char receiver_ch0_buffer[lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[0] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+    // Channel 1 receiver buffers (incoming read responses on MMIO side)
+    unsigned char receiver_ch1_buffer[lite_fabric::RECEIVER_NUM_BUFFERS_ARRAY[1] * lite_fabric::CHANNEL_BUFFER_SIZE]{};
+
     // L1 address of the service_lite_fabric function
     uint32_t service_lite_fabric_addr{};
     unsigned char padding4[12]{};
 
     lite_fabric::FabricLiteConfig config;
-    tt::tt_fabric::EDMChannelWorkerLocationInfo sender_location_info;
+    tt::tt_fabric::EDMChannelWorkerLocationInfo sender_ch0_location_info;
+    tt::tt_fabric::EDMChannelWorkerLocationInfo sender_ch1_location_info;
 
-    // Must be last because it has members that are only stored on the host
+    // Channel 0 host interface (outbound commands)
     HostToFabricLiteInterface<lite_fabric::SENDER_NUM_BUFFERS_ARRAY[0], lite_fabric::CHANNEL_BUFFER_SIZE>
         host_interface;
+    // Channel 1 host interface (read responses)
+    HostToFabricLiteInterface<lite_fabric::SENDER_NUM_BUFFERS_ARRAY[1], lite_fabric::CHANNEL_BUFFER_SIZE>
+        host_interface_ch1;
 };
 
 static_assert(offsetof(FabricLiteMemoryMap, sender_flow_control_semaphore) % 16 == 0);
 static_assert(offsetof(FabricLiteMemoryMap, sender_connection_live_semaphore) % 16 == 0);
 static_assert(offsetof(FabricLiteMemoryMap, worker_semaphore) % 16 == 0);
-static_assert(offsetof(FabricLiteMemoryMap, sender_channel_buffer) % GLOBAL_ALIGNMENT == 0);
-static_assert(offsetof(FabricLiteMemoryMap, receiver_channel_buffer) % GLOBAL_ALIGNMENT == 0);
+static_assert(offsetof(FabricLiteMemoryMap, sender_ch0_buffer) % GLOBAL_ALIGNMENT == 0);
+static_assert(offsetof(FabricLiteMemoryMap, receiver_ch0_buffer) % GLOBAL_ALIGNMENT == 0);
 static_assert(offsetof(FabricLiteMemoryMap, config) % 16 == 0);
 static_assert(offsetof(FabricLiteMemoryMap, host_interface) % 16 == 0);
 

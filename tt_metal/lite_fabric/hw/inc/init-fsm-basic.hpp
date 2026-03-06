@@ -28,10 +28,11 @@ namespace lite_fabric {
 static_assert(sizeof(uint32_t) == sizeof(uintptr_t));
 
 // TX queue for data transfers over ethernet.
-// TXQ0 is the only queue guaranteed to be configured for packet mode by the base firmware.
-// TXQ1/TXQ2 require explicit packet mode setup (eth_enable_packet_mode) which we don't do.
-// ETH_TXQ_CMD_START_REG (register writes) is also TXQ0-only.
-static constexpr uint32_t k_DataTxq = 0;
+// Lite fabric uses TXQ2 so ERISC0 (fabric router) can use TXQ0/TXQ1.
+// TXQ2 packet mode is enabled explicitly in routing_init().
+// ETH_TXQ_CMD_START_REG (register writes) is TXQ0-only — ConnectedRiscInterface
+// still uses TXQ0 for remote reset/PC operations during init.
+static constexpr uint32_t k_DataTxq = 2;
 
 inline void wait_val(uint32_t addr, uint32_t val) {
     do {
@@ -41,6 +42,13 @@ inline void wait_val(uint32_t addr, uint32_t val) {
 
 inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) {
     invalidate_l1_cache();
+
+    // Enable packet resend mode on TXQ2.  TXQ0 is configured by the syseng
+    // base firmware at POR, but TXQ2 starts unconfigured.  Packet resend mode
+    // (bit 0 of TXQ_CTRL) enables reliable delivery with MAC-level ACKs and
+    // retransmissions.  Must be enabled before any eth_send_packet on TXQ2.
+    eth_txq_reg_write(k_DataTxq, ETH_TXQ_CTRL, ETH_TXQ_CTRL_KEEPALIVE);
+
     // This value should not be used. It comes from metal.
     // auto my_y = get_absolute_logical_y();
     int number_of_other_eth_chs = __builtin_popcount(config_struct->eth_chans_mask) - 1;
@@ -131,9 +139,17 @@ inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) 
                 // Breadcrumb 0x12: about to set remote PC
                 config_struct->primary_local_handshake = 0x12;
                 ConnectedRiscInterface::set_pc(LITE_FABRIC_TEXT_START);
+                // Clear forwarding.is_reverse_relay before sending config to
+                // neighbor.  The downstream sender's ForwardingConfig has
+                // is_reverse_relay=1, but the neighbor (final-destination chip)
+                // must NOT use the reverse-relay NOC_READ path — it needs the
+                // normal !on_mmio_chip handler to execute reads locally.
+                uint8_t saved_reverse_relay = config_struct->forwarding.is_reverse_relay;
+                config_struct->forwarding.is_reverse_relay = 0;
                 // Breadcrumb 0x13: about to send config
                 config_struct->primary_local_handshake = 0x13;
                 eth_send_config();
+                config_struct->forwarding.is_reverse_relay = saved_reverse_relay;
                 // Breadcrumb 0x14: about to send binary (DATA section)
                 config_struct->primary_local_handshake = 0x14;
                 eth_send_binary();

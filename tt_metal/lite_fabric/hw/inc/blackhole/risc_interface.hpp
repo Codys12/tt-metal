@@ -12,6 +12,30 @@
 
 namespace lite_fabric {
 
+// Bounded wait for local TXQ to become idle, with recovery if stuck.
+// Used during init (before channels.hpp helpers are available).
+inline void txq_wait_or_recover_init(uint32_t txq_id) {
+    const uint32_t txq_base = ETH_TXQ0_REGS_START + txq_id * ETH_TXQ_REGS_SIZE;
+    constexpr uint32_t k_MaxIters = 5000000;
+
+    for (uint32_t i = 0; i < k_MaxIters; i++) {
+        if (!internal_::eth_txq_is_busy(txq_id)) {
+            return;
+        }
+    }
+
+    // TXQ stuck — attempt recovery
+    *reinterpret_cast<volatile uint32_t*>(txq_base + ETH_TXQ_CTRL) = 0;
+    for (volatile uint32_t i = 0; i < 10000; i++) {
+    }
+    *reinterpret_cast<volatile uint32_t*>(txq_base + ETH_TXQ_CMD) = 0x8;  // MAC queue flush
+    for (volatile uint32_t i = 0; i < 10000; i++) {
+    }
+    *reinterpret_cast<volatile uint32_t*>(txq_base + ETH_TXQ_CTRL) = ETH_TXQ_CTRL_KEEPALIVE;
+    for (volatile uint32_t i = 0; i < 10000; i++) {
+    }
+}
+
 // Interface to the connected RISC processor via ethernet
 struct ConnectedRiscInterface {
     // ETH_TXQ_CMD_START_REG (remote register write) is only supported on TXQ0
@@ -44,16 +68,14 @@ struct ConnectedRiscInterface {
         // does not depend on the remote's TXQ KEEPALIVE setting.
         constexpr uint32_t k_RemoteTxqCtrlAddr = 0xFFB90000;  // ETH_TXQ0 CTRL
         internal_::eth_write_remote_reg(k_Txq, k_RemoteTxqCtrlAddr, 0x1);
-        while (internal_::eth_txq_is_busy(k_Txq)) {
-        }
+        txq_wait_or_recover_init(k_Txq);
 
         // Step 1: ERISC1 in reset, ERISC0 stays running.
         // 0x47000 is safe here because the chip has already booted (ETH link
         // is up), so ERISC0 is already deasserted.
         constexpr uint32_t k_ResetErisc1Only = 0x47000;
         internal_::eth_write_remote_reg(k_Txq, k_SoftResetAddr, k_ResetErisc1Only);
-        while (internal_::eth_txq_is_busy(k_Txq)) {
-        }
+        txq_wait_or_recover_init(k_Txq);
 
         // Step 2: Let ERISC0 drain any pending TXQ0 operation (~50 µs).
         for (volatile uint32_t i = 0; i < 50000; i++) {
@@ -62,16 +84,14 @@ struct ConnectedRiscInterface {
         // Step 3: Now assert ERISC0 reset too.  TXQ0 is now idle.
         constexpr uint32_t k_ResetAll = 0x47800;
         internal_::eth_write_remote_reg(k_Txq, k_SoftResetAddr, k_ResetAll);
-        while (internal_::eth_txq_is_busy(k_Txq)) {
-        }
+        txq_wait_or_recover_init(k_Txq);
 
         // Step 4: Issue MAC queue flush on remote TXQ0 to clear any residual
         // state, then wait for the WRITE_REG to complete.
         constexpr uint32_t k_RemoteTxqCmdAddr = 0xFFB90004;  // ETH_TXQ0 CMD
         constexpr uint32_t k_FlushCmd = 0x8;                 // ETH_TXQ_CMD_FLUSH
         internal_::eth_write_remote_reg(k_Txq, k_RemoteTxqCmdAddr, k_FlushCmd);
-        while (internal_::eth_txq_is_busy(k_Txq)) {
-        }
+        txq_wait_or_recover_init(k_Txq);
     }
 
     // Take ERISC1 out of reset while keeping ERISC0 in reset.
@@ -79,15 +99,13 @@ struct ConnectedRiscInterface {
     inline static void deassert_connected_dm1_reset() {
         constexpr uint32_t k_ResetValue = 0x46800;
         internal_::eth_write_remote_reg(k_Txq, k_SoftResetAddr, k_ResetValue);
-        while (internal_::eth_txq_is_busy(k_Txq)) {
-        }
+        txq_wait_or_recover_init(k_Txq);
     }
 
     inline static void set_pc(uint32_t pc) {
         constexpr uint32_t k_ResetPcAddr = LITE_FABRIC_RESET_PC;
         internal_::eth_write_remote_reg(k_Txq, k_ResetPcAddr, pc);
-        while (internal_::eth_txq_is_busy(k_Txq)) {
-        }
+        txq_wait_or_recover_init(k_Txq);
     }
 };
 

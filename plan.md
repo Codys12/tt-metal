@@ -1,403 +1,343 @@
-# N-Hop Lite Fabric: Comprehensive Implementation Plan
+# Full ERISC0 + ERISC1 Coexistence on All Connected ETH Tiles
 
 ## Goal
 
-Enable lite fabric to bootstrap remote devices that are N hops away from any MMIO device, using iterative discovery (BFS). The topology is **not** known ahead of time — we probe chip-by-chip to build the full cluster graph. The same lite fabric firmware binary gains a forwarding code path so intermediate hops relay packets to further devices.
+Every connected ETH core on every chip (MMIO and remote) simultaneously runs:
+- **ERISC0**: Metal's fabric router (for op-level CCL communication)
+- **ERISC1**: Lite fabric relay (for UMD-level L1 reads/writes to remote devices)
 
-Remote chip <-> remote chip links need to be included in the topology mapping .
+They coexist on the same ETH tile because they use separate L1 regions, separate NOC
+TRIDs, and separate TXQs (fabric router: TXQ0/TXQ1, lite fabric: TXQ2).
 
-Some important context: The machine you are on has 8 cards in a ring, with one dangling card you should ignore. Only one card is on PCIe. You need to discover all 8, as device 7 is used in the demo.
+## Current State (what's already done)
 
----
+### Dual-channel architecture (Groups 1-5 complete)
+- **Ch0**: outbound commands (host→remote writes + read commands)
+- **Ch1**: inbound read responses (remote→host)
+- 4 buffer slots per channel for pipelining
+- Per-TRID NOC barriers: ch0 uses TRIDs 8-11, ch1 uses TRIDs 12-15
+- Stream register assignments: ch0 IDs 23-25, ch1 IDs 26-28
+- UMD: `HostToLiteFabricInterface` has `recv_ch1` state, `flush_recv_ch1_h2d()`,
+  `read_one_page()` uses ch1 receiver buffers
+- Memory layout: 56KB (base 0x62000), FW and UMD memory maps in sync
 
-## Current State Summary
+### Lite fabric / fabric router separation
+- Lite fabric: TXQ2, TRIDs 8-15, stream regs 23-28, L1 region 0x62000-0x70000
+- Fabric router: TXQ0/TXQ1, TRIDs 0-7, stream regs 0-22+29-31, L1 below 0x62000
 
-### What exists today (1-hop only)
-
-1. **UMD topology discovery** (`topology_discovery.cpp`): BFS loop discovers MMIO chips via PCIe, then scans their ETH cores to find 1-hop remote chips. Remote BH chips are added to the cluster descriptor but **skipped for ETH scanning** (line 154: `!chip->is_mmio_capable()` → `continue`).
-
-2. **Lite fabric firmware** (`lite_fabric.cpp`): Single binary runs on ERISC1 of both MMIO and remote ETH cores. MMIO side is "sender", remote side is "receiver". Main loop calls `run_sender_channel_step<0>()` + `run_receiver_channel_step<0>()`.
-
-3. **Packet header** (`header.hpp`): `FabricLiteHeader` already has `LiteFabricRoutingFields routing_fields` with 2-bit-per-hop encoding: `NOOP(00)`, `WRITE_ONLY(01)`, `FORWARD_ONLY(10)`, `WRITE_AND_FORWARD(11)`. The `to_chip_unicast(distance_in_hops)` method already generates correct multi-hop routing fields (FORWARD_ONLY for intermediate hops, WRITE_ONLY for final hop). **This is already implemented but unused.**
-
-4. **UMD packet formatting** (`lite_fabric.hpp`): Hardcodes `header.to_chip_unicast(1)` everywhere. Needs parameterization.
-
-5. **Init FSM** (`init-fsm-basic.hpp`): `routing_init()` handles the MMIO→remote handshake. The MMIO primary copies its binary + config to the connected remote core via `eth_send_packet`, then handshakes. Only supports tunnel depth 1.
-
-6. **Host-side launch** (`blackhole_impl.cpp`): `BlackholeLiteFabricHal::launch()` iterates `tunnels_from_mmio`, writes config + binary to each MMIO ETH core, deasserts ERISC1, waits for READY state.
-
-7. **`TunnelDescriptor`**: Stores `mmio_id`, `connected_id`, `num_hops=1`. Only describes direct MMIO↔remote links.
-
-8. **metal_context.cpp phases**: Phase 1 (MMIO FW) → Phase 2 (lite fabric launch + UMD binding) → Phase 2b (remote chip info upgrade) → Phase 3 (remote device build/init/FW launch) → fabric router init → dispatch.
-
----
-
-## Architecture Decision: Extend Lite Fabric In-Place
-
-**One firmware binary.** No separate relay firmware. The existing `lite_fabric.cpp` gains a forwarding code path activated by the routing fields already present in the packet header.
-
-### Key Principle
-
-Every ERISC1 running lite fabric behaves the same way. The difference between "endpoint" and "relay" is purely config-driven: whether it has a downstream ETH link to forward to.
+### N-hop BFS discovery (Phase 2b)
+- BFS discovers multi-hop chips, launches downstream tunnels, configures forwarding
+- Forwarding stays on ch0 only; direct 1-hop reads use ch1
+- `downstream_sender_cores_` tracks which cores have ERISC1 running as downstream senders
 
 ---
 
-## Implementation Plan
+## Remaining Work
 
-### Phase 1: Firmware Forwarding Path
+### Phase A: Remove ERISC0 Kill from Lite Fabric FW
 
-**Files**: `channels.hpp`, `lite_fabric.cpp`, `host_interface.hpp`
+**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
 
-#### 1.1 Add forwarding config to `FabricLiteConfig`
-
-Add a small forwarding table to `FabricLiteConfig` in `host_interface.hpp`:
-
+Currently `main()` (lines 362-382) kills ERISC0 immediately on boot:
 ```cpp
-struct ForwardingConfig {
-    uint8_t enabled;           // 0 = endpoint only, 1 = relay mode
-    uint8_t downstream_txq;    // ETH TXQ to use for forwarding (always 0 for now)
-    uint8_t reserved[14];      // Pad to 16B alignment
-};
+*reinterpret_cast<volatile uint32_t*>(kSoftResetAddr) = 0x46800;  // ERISC0 in reset
+*reinterpret_cast<volatile uint32_t*>(0xFFB90000) = 0x1;          // TXQ0 KEEPALIVE
 ```
 
-Add `ForwardingConfig forwarding` to `FabricLiteConfig`. This is written by the host during the discovery loop when configuring an intermediate hop.
+This was needed because:
+1. ERISC0 syseng FW from POR uses TXQ0 — conflicts with lite fabric
+2. ETH link needs keepalive frames; killing ERISC0 removes its natural keepalive
 
-**Risk**: Must not exceed `LITE_FABRIC_CONFIG_SIZE` (9KB). Current `FabricLiteMemoryMap` fits; 16 bytes is safe.
+With fabric router running on ERISC0:
+1. Fabric router uses TXQ0/TXQ1 — no conflict with lite fabric's TXQ2
+2. Fabric router generates regular ETH traffic — natural keepalive
 
-#### 1.2 Add forwarding logic to receiver channel
+**Changes:**
+- Remove the ERISC0 kill block (lines 362-382)
+- Remove TXQ0 KEEPALIVE enable (line 467): `*reinterpret_cast<volatile uint32_t*>(ETH_TXQ0_REGS_START + ETH_TXQ_CTRL) = ETH_TXQ_CTRL_KEEPALIVE;`
+  - TXQ0 is now managed by ERISC0's fabric router, not ERISC1
+  - Keep TXQ2 enable (line 468) — that's lite fabric's own TXQ
+- Remove periodic keepalive in `service_lite_fabric()` (lines 228-234):
+  ```cpp
+  if ((diag_loop_counter & 0xFFFF) == 0 && diag_loop_counter > 0) { ... }
+  ```
 
-In `channels.hpp`, modify `service_fabric_request()`:
+**Caveat — boot ordering:** Lite fabric (ERISC1) boots in Phase 2, fabric router
+(ERISC0) boots in Phase 4 (init_fabric). There's a window where ERISC1 is running
+but ERISC0 hasn't started yet. During this window, there's no ETH keepalive from
+ERISC0. Options:
+1. **Keep software keepalive until ERISC0 is confirmed running** — check a flag/register
+2. **Accept the gap** — the window is short (seconds), BH MAC timeout is ~10s
+3. **Start ERISC0 earlier** — move fabric router init before Phase 2b BFS
 
-Before processing the packet, inspect `routing_fields`:
+Recommendation: option 2. The boot window is short and BFS operations provide
+ETH traffic anyway. If we see link timeouts during boot, add a conditional keepalive
+that checks whether ERISC0 is running (read TXQ0 CTRL register or a shared flag).
 
+### Phase B: Remove Defensive ERISC0 Re-kill
+
+**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
+
+Currently (not visible in recent reads but was added previously) there may be a
+defensive ERISC0 re-kill every ~128K iterations in `service_lite_fabric()`. With
+fabric router running, this would kill it. Remove any such logic.
+
+Also verify no other code path in `lite_fabric.cpp` or `channels.hpp` touches
+the soft reset register (0xFFB121B0) or puts ERISC0 in reset.
+
+Search patterns:
+```
+grep -n "0xFFB121B0\|0x46800\|kSoftResetAddr\|soft_reset\|assert.*risc.*reset" \
+  tt_metal/lite_fabric/hw/src/lite_fabric.cpp \
+  tt_metal/lite_fabric/hw/inc/channels.hpp
+```
+
+### Phase C: Keepalive Simplification
+
+**File: `tt_metal/lite_fabric/hw/inc/channels.hpp`**
+
+The sentinel spin loop in `service_fabric_request` (around line 460) may have
+keepalive logic inside. Remove it — fabric router traffic keeps the link alive.
+
+**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
+
+Remove the periodic keepalive block in `service_lite_fabric()` (lines 228-234).
+
+### Phase D: Configure Fabric — Launch ERISC0 on ALL Cores
+
+**File: `tt_metal/impl/device/device.cpp` — `Device::configure_fabric()`**
+
+The MMIO section (lines 461-536) already deasserts ERISC0 on all fabric program
+ETH cores. This is correct — it handles ERISC0 deassert with ERISC1 kept alive
+(soft reset 0x46000). No changes needed here if it already covers all connected cores.
+
+Verify: the fabric program's `logical_cores()` includes ALL connected ETH cores,
+not just a subset. If the fabric program only uses some cores, we need to ensure
+that those cores include all cores where lite fabric (ERISC1) is running.
+
+**File: `tt_metal/impl/context/metal_context.cpp` — `initialize_remote_eth_cores_for_fabric()`**
+
+Lines 3449-3463: the `erisc1_running` detection currently checks:
+1. `peer_is_mmio` — 1-hop cores peering with MMIO
+2. Tunnel endpoints — cores in `tunnels_from_mmio`
+3. Downstream senders — cores in `downstream_sender_cores_`
+
+With full coexistence, ALL connected ETH cores on ALL remote chips have ERISC1
+running (launched in Phase 2 for MMIO-peering cores, Phase 2b BFS for everything
+else). The current detection logic may miss some cores.
+
+**Change:** Simplify to `erisc1_running = true` for all cores where lite fabric is
+active. Since we launch lite fabric on all connected MMIO ETH cores (Phase 2) and
+their neighbors propagate it via init-fsm (Phase 2/2b), all connected remote ETH
+cores have ERISC1. Set `erisc1_running = true` unconditionally when `lite_fabric_hal_`
+is present.
+
+The soft reset values:
+- `0x46000`: ERISC0 out of reset + ERISC1 out of reset + bits 13/14/18
+- `0x47000`: ERISC0 out of reset + ERISC1 in reset + bits 13/14/18
+
+With full coexistence, always use `0x46000` (both running).
+
+### Phase E: Update Lite Fabric Bindings
+
+**File: `tt_metal/impl/context/metal_context.cpp` — `update_lite_fabric_bindings_for_fabric_routers()`**
+
+Currently (lines 2459-2538) this rebinds 1-hop chips to channels where the fabric
+router's remote peer has been launched. It skips chips with forwarding chains.
+
+With full coexistence, ALL ETH cores have both ERISC0 and ERISC1 running. The
+binding logic should still work because:
+- Forwarding channels are still excluded (multi-hop chains must not be disturbed)
+- `remote_fabric_eth_channels_` tracks cores where fabric router was launched
+
+Verify this function doesn't break when ALL cores have fabric routers. The current
+filtering (skip forwarding channels, only include cores in `remote_fabric_eth_channels_`)
+should be sufficient.
+
+### Phase F: TXQ0 Boot Ordering
+
+**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
+
+After removing the ERISC0 kill, the TXQ0 self-healing check (lines 425-463) needs
+adjustment. Currently it:
+1. Checks TXQ2 status and recovers if stuck
+2. Enables TXQ0 KEEPALIVE for init handshake
+
+With ERISC0 running fabric router:
+- TXQ0 is managed by ERISC0 — ERISC1 must NOT touch it
+- Remove TXQ0 CTRL write (line 467)
+- Keep TXQ2 self-healing (lines 425-451) — that's lite fabric's own TXQ
+- The init handshake (`ConnectedRiscInterface` in `risc_interface.hpp`) currently
+  uses TXQ0 for `eth_write_remote_reg`. This conflicts with fabric router's TXQ0.
+
+**Resolution:** The init handshake only runs during Phase 2 boot, before fabric
+router starts. Once routing_init completes, TXQ0 is not used by lite fabric again.
+The fabric router starts later (Phase 4). So there's no actual TXQ0 contention
+during normal operation — the concern is only if lite fabric restarts while
+fabric router is running (which doesn't happen in normal flow).
+
+If we want to be safe: change ConnectedRiscInterface to use TXQ2 for the init
+handshake as well. But this is low priority since the timing doesn't overlap.
+
+### Phase G: TXQ Diagnostic on Non-MMIO Cores
+
+Lines 454-462 in `main()` send a diagnostic breadcrumb to the MMIO side via TXQ0:
 ```cpp
-// Extract the current hop's 2-bit routing field (lowest 2 bits)
-uint32_t current_hop_action = header.routing_fields.value & LiteFabricRoutingFields::FIELD_MASK;
-
-if (current_hop_action == LiteFabricRoutingFields::FORWARD_ONLY ||
-    current_hop_action == LiteFabricRoutingFields::WRITE_AND_FORWARD) {
-    // Shift routing fields right by FIELD_WIDTH to consume this hop
-    // Write shifted header to sender buffer for forwarding
-    // Trigger sender channel to forward downstream
-}
-
-if (current_hop_action == LiteFabricRoutingFields::WRITE_ONLY ||
-    current_hop_action == LiteFabricRoutingFields::WRITE_AND_FORWARD) {
-    // Existing local write/read/write_reg logic (unchanged)
-}
-
-if (current_hop_action == LiteFabricRoutingFields::FORWARD_ONLY) {
-    // Skip local write — just forward
-    return;
-}
-```
-
-**Implementation detail**: Forwarding reuses the sender channel. The receiver copies the packet (with shifted routing fields) into the sender buffer slot, increments `h2d.sender_host_write_index`, and the normal sender channel step forwards it via `eth_send_packet_bytes_unsafe()` to the next hop's receiver buffer.
-
-This works because **at a relay node, the host never writes to the sender channel** — the sender channel is exclusively used for forwarding responses and forwarded packets. The host only writes to the MMIO-side sender channel (hop 0).
-
-**For reads**: The response packet travels back. The relay's receiver (on the return path) sees a packet from the downstream direction and forwards it upstream to the MMIO sender. This requires the relay to accept packets from both directions — but this is already the case: the existing receiver channel receives from the ETH link, and the existing sender channel sends to the ETH link. The directions are symmetric. We may need a second receiver/sender channel pair for the return path, or we can reuse the single channel with careful ordering (since the credit system already prevents buffer overflow).
-
-**Simplest approach for reads**: Initially, **do not support reads through multi-hop**. Reads are only used during `upgrade_remote_bh_chip_info` (Phase 2b) to read harvesting info. For n-hop devices, we can defer this or use WRITE_REG-based alternatives. This drastically simplifies the initial implementation.
-
-#### 1.3 Modify `service_lite_fabric()` main loop
-
-No changes needed — `run_sender_channel_step<0>()` already picks up packets in the sender buffer regardless of who put them there (host or receiver forwarding logic). The self-healing check for `num_free_slots` may need adjustment if the receiver is producing packets into the sender buffer.
-
----
-
-### Phase 2: Host-Side Discovery Loop
-
-**Files**: `metal_context.cpp`, `lite_fabric_hal.cpp`, `lite_fabric_hal.hpp`
-
-#### 2.1 Replace flat `tunnels_from_mmio` with a tree structure
-
-Replace the flat vector with a tree that tracks hop-by-hop paths:
-
-```cpp
-struct TunnelDescriptor {
-    ChipId mmio_id;                    // Root MMIO chip
-    CoreCoord mmio_core_virtual;       // MMIO ETH core (first hop sender)
-    CoreCoord mmio_core_logical;
-    ChipId connected_id;               // Final destination chip
-    CoreCoord connected_core_virtual;
-    CoreCoord connected_core_logical;
-    int num_hops;                      // Total hops from MMIO
-    // NEW: intermediate hop chain for multi-hop
-    struct HopInfo {
-        ChipId chip_id;
-        CoreCoord eth_core_logical;     // ETH core on this chip used for relay
-        CoreCoord eth_core_virtual;
-    };
-    std::vector<HopInfo> intermediate_hops;  // Empty for 1-hop, populated for n-hop
-};
-```
-
-#### 2.2 Iterative BFS discovery in `metal_context.cpp`
-
-Replace the current linear flow with a BFS loop:
-
-```
-discovered = {MMIO chips}  // Already booted in Phase 1
-frontier = {MMIO chips}    // Chips whose ETH links we need to probe
-
-while frontier is not empty:
-    next_frontier = {}
-
-    for each chip C in frontier:
-        for each active ETH core on C:
-            if ETH link is trained AND neighbor is not in discovered:
-                new_chip = neighbor chip ID
-
-                // 1. The 2-erisc dance already happened when C's ERISC0 booted
-                //    (for MMIO chips, during Phase 1; for remote chips, when we
-                //    deasserted their ERISC0 in a previous iteration).
-                //    So new_chip's ERISC1 receiver is already alive.
-
-                // 2. If C is MMIO: lite fabric sender is already running on C's ERISC1
-                //    If C is remote: configure C's ERISC1 forwarding to new_chip
-                //    (write ForwardingConfig via existing lite fabric path)
-
-                // 3. We can now reach new_chip via lite fabric chain:
-                //    MMIO → ... → C → new_chip
-
-                // 4. Add tunnel descriptor with full hop chain
-                // 5. Bind UMD for new_chip
-                // 6. Read new_chip's harvesting info (via lite fabric writes/WRITE_REG)
-                // 7. Build and init new_chip (write Tensix FW, deassert Tensix cores)
-                // 8. Boot new_chip's ERISC0 (write FW, trampoline, deassert)
-                //    → This triggers 2-erisc dance with new_chip's further neighbors
-                //    → Those neighbors' ERISC1 receivers come alive
-
-                discovered.add(new_chip)
-                next_frontier.add(new_chip)
-
-    frontier = next_frontier
-
-// Now all devices are discovered and booted
-// Compute control plane routing tables from full topology
-// Deploy routing tables to all devices via lite fabric chain
-// Launch fabric routers
-// Set up dispatch and command queues
-```
-
-#### 2.3 ETH link probing for remote chips
-
-Currently, remote BH chips are skipped during UMD topology discovery because lite fabric isn't running yet. For the BFS loop, we need to probe a remote chip's ETH links **after** lite fabric reaches it.
-
-Three approaches (in order of simplicity):
-
-**Option A: Host-side probing via lite fabric reads**
-- Read `port_status` (0x7CC04) on each ETH core of the newly discovered chip via lite fabric L1 read
-- Read `remote_asic_id` (0x7CFE1 etc.) for trained links
-- This uses existing lite fabric read path — no firmware changes needed
-- **Downside**: Requires multi-hop reads to work, which we may not initially support
-
-**Option B: Firmware-assisted probing**
-- After booting a remote chip's ERISC0, have it write its ETH link status to a known L1 location
-- Host reads that L1 location via lite fabric read
-- Could be done as part of the active_erisc.cc boot sequence: ERISC0 probes all ETH cores and writes a link status bitmap to a fixed L1 address
-
-**Option C: Use 1-hop reads from the most recently booted chip (recommended)**
-- After booting a remote chip and establishing a lite fabric tunnel to it, read its ETH link status using 1-hop lite fabric reads from its directly connected parent
-- No multi-hop reads needed — we always read from the most recently booted chip, which is 1 hop from its parent relay (or from the MMIO chip for the first hop)
-- Each newly booted ERISC0 writes `{port_status, remote_asic_id}` for all 12 ETH cores to a status region in L1 during boot, OR we just do direct 1-hop reads to the syseng boot results addresses (0x7CC04, 0x7CFE1, etc.) since these are populated by the base ERISC firmware that ran at POR
-
-**Recommendation**: Option C. We always have a direct 1-hop lite fabric tunnel to the chip we just booted (its parent is either MMIO or a relay we set up in the previous BFS iteration). Reads from 1 hop away already work. No multi-hop read support needed for discovery.
-
-**Critical detail**: The syseng base firmware boot results (port_status at 0x7CC04, remote_asic_id at 0x7CFE1/0x7CFF4, etc.) are written by the ERISC syseng FW that runs at power-on reset, **before** Metal even starts. These values are already present in L1 on all ETH cores (including those on remote chips). We just need a lite fabric read path to access them.
-
----
-
-### Phase 3: UMD Changes
-
-**Files**: `lite_fabric.hpp` (UMD), `remote_communication_lite_fabric.cpp`, `topology_discovery.cpp`
-
-#### 3.1 Parameterize hop count in UMD packet formatting
-
-Change all `header.to_chip_unicast(1)` to `header.to_chip_unicast(num_hops)` where `num_hops` comes from the tunnel descriptor.
-
-In `lite_fabric.hpp`:
-```cpp
-void write(..., uint8_t distance_in_hops = 1) {
-    header.to_chip_unicast(distance_in_hops);
-    ...
+if (!structs->config.is_mmio && !cmd_ongoing) {
+    internal_::eth_send_packet<false>(0, src_addr >> 4, dst_addr >> 4, 1);
 }
 ```
 
-The `HostToLiteFabricInterface` needs to know the hop count for the tunnel it's associated with. Add `uint8_t num_hops` to the interface state.
+This uses TXQ0 which will be used by fabric router. Remove or change to TXQ2.
 
-#### 3.2 Multi-hop UMD routing
+### Phase H: D-Cache Optimization (Nice-to-Have)
 
-`set_remote_transfer_ethernet_cores()` already binds a remote chip to specific ETH channels on the gateway MMIO device. For n-hop, the gateway is always the MMIO chip — the hop chain is transparent. UMD writes to the MMIO ETH core's sender buffer; the routing fields in the packet handle the rest.
+**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
 
-No fundamental change to UMD routing — just the hop count in the header.
+The `noc_self_read_word()` calls in `service_lite_fabric()` (mailbox polling, lines
+178-215) and `object_init()` (is_mmio check, lines 322-328) are slow because they
+do a full NOC DMA read to bypass the D-cache.
 
-#### 3.3 Deferred remote chip ETH scanning
+Optimization ideas:
+1. **Stream register notification**: Host writes to a stream register instead of L1.
+   Stream registers bypass D-cache. Lite fabric reads the stream register directly.
+2. **RISC-V CSR uncacheable region**: Mark the forwarding config region as uncacheable
+   via CSR 0x7c0 settings.
+3. **RISC-V volatile + invalidate_l1_cache()**: The `invalidate_l1_cache()` at the
+   top of `service_lite_fabric()` should flush stale D-cache lines. Verify this
+   works for the specific L1 addresses being polled.
 
-In `topology_discovery.cpp`, the BH remote chip skip (line 154) stays as-is for the initial UMD discovery. The BFS loop in `metal_context.cpp` handles incremental discovery after lite fabric is running. New chips discovered during the BFS need to be added to the cluster descriptor dynamically:
+Deferred until coexistence is working.
 
-- Add a method to `ClusterDescriptor` to register new chips and connections after initial construction
-- Or: restructure so UMD only discovers MMIO chips, and Metal's BFS loop builds the full cluster descriptor
+### Phase I: Multi-Path Tunnels (Nice-to-Have)
 
-**Recommendation**: Keep UMD discovery as MMIO-only for BH. Metal owns the full topology discovery via the BFS loop after lite fabric is available. This is the least disruptive change to UMD.
+Allow multiple tunnels to the same remote device through different ETH links for
+redundancy and load balancing. Requires:
+- `set_remote_transfer_ethernet_cores` to accept multiple cores
+- Round-robin or least-loaded selection in `get_remote_transfer_ethernet_core()`
+- Per-core h2d/d2h tracking (already in place with separate HostToLiteFabricInterface)
 
----
-
-### Phase 4: Init Sequence Restructuring
-
-**Files**: `metal_context.cpp`, `device_manager.cpp`
-
-The current Phase 1→2→2b→3 sequence becomes iterative:
-
-```
-Phase 1: Boot MMIO devices (unchanged)
-
-Phase 2: BFS Discovery + Lite Fabric Extension
-    Launch 1-hop lite fabric (existing code)
-    BFS loop:
-        For each newly reachable chip:
-            a. Probe its ETH links (read link status from parent relay)
-            b. Build TunnelDescriptor with full hop chain
-            c. Bind UMD for this chip
-            d. Read harvesting info (upgrade_remote_bh_chip_info)
-            e. build_and_init_devices (Tensix FW)
-            f. Boot ERISC0 (FW + trampoline + deassert)
-               → 2-erisc dance brings up next-hop ERISC1 receivers
-            g. Configure forwarding on this chip's ERISC1
-               (write ForwardingConfig via lite fabric)
-            h. Add newly discovered neighbors to BFS frontier
-
-Phase 3: Control plane + fabric routers (unchanged, but now has full topology)
-
-Phase 4: Dispatch + command queues (unchanged)
-```
+Deferred until coexistence is working.
 
 ---
 
-### Phase 5: Completion/ACK Propagation for Multi-Hop
+## Implementation Order
 
-For writes, the completion path is:
-1. Final-hop receiver completes NOC write, sends completion to its sender (upstream)
-2. Upstream relay's receiver gets the completion, forwards it further upstream
-3. Eventually reaches MMIO sender, which updates `d2h.fabric_sender_channel_index`
+1. **Phase A+B+C**: Remove ERISC0 kill, remove keepalive, remove defensive re-kill
+   (all in lite_fabric FW — single coherent change)
+2. **Phase G**: Fix TXQ0 diagnostic to use TXQ2 (part of same FW change)
+3. **Phase F**: Remove TXQ0 CTRL write from boot sequence
+4. **Phase D**: Ensure `initialize_remote_eth_cores_for_fabric` always sets
+   `erisc1_running=true` when lite fabric is active
+5. **Phase E**: Verify `update_lite_fabric_bindings_for_fabric_routers` works
+   correctly with all cores having fabric routers
+6. **Build + test**: Clear FW cache, rebuild, run test script
+7. **Phase H+I**: D-cache optimization and multi-path tunnels (future)
 
-**This already works with the forwarding logic in Phase 1** — completions are stream register updates via `remote_update_ptr_val`, which travel as ETH register writes. Each hop's completion is independent: the MMIO sender waits for its direct receiver (1-hop relay) to ack, the 1-hop relay waits for the 2-hop receiver, etc. The credit system at each hop prevents buffer overflow.
+## Key Files
 
-**Important nuance**: The MMIO sender's completion means "the packet has been forwarded by the 1-hop relay", NOT "the packet has been written to the final destination". For correctness, `l1_barrier()` needs end-to-end semantics. Options:
+| File | Role |
+|------|------|
+| `tt_metal/lite_fabric/hw/src/lite_fabric.cpp` | FW main loop, ERISC0 kill, keepalive, TXQ init |
+| `tt_metal/lite_fabric/hw/inc/channels.hpp` | Sender/receiver logic, sentinel loop keepalive |
+| `tt_metal/lite_fabric/hw/inc/constants.hpp` | TXQ assignments, TRID offsets, stream reg IDs |
+| `tt_metal/lite_fabric/hw/inc/host_interface.hpp` | FabricLiteConfig, FabricLiteMemoryMap |
+| `tt_metal/lite_fabric/hw/inc/init-fsm-basic.hpp` | Init handshake (uses TXQ0 via ConnectedRiscInterface) |
+| `tt_metal/lite_fabric/hw/inc/blackhole/risc_interface.hpp` | ConnectedRiscInterface (TXQ0 for remote reg writes) |
+| `tt_metal/impl/device/device.cpp` | `configure_fabric()` — ERISC0 deassert on MMIO cores |
+| `tt_metal/impl/device/device_manager.cpp` | `init_fabric()` ordering — deep-hop first |
+| `tt_metal/impl/context/metal_context.cpp` | `initialize_remote_eth_cores_for_fabric()`, `update_lite_fabric_bindings_for_fabric_routers()` |
+| `tt_metal/third_party/umd/.../lite_fabric.hpp` | UMD-side host interface and memory map |
+| `tt_metal/third_party/umd/.../remote_communication_lite_fabric.cpp` | UMD read/write/rebind |
 
-- **Option A**: Each relay only sends completion upstream after receiving completion from downstream. This provides end-to-end guarantees but adds latency per hop.
-- **Option B**: Keep per-hop completion and add an explicit end-to-end barrier using a special WRITE_REG or NOC read from the final destination.
-
-**Recommendation**: Option A for correctness. The relay's `run_receiver_channel_step` should only increment `completion_counter` (and thus send upstream ack) when the forwarded packet's downstream ack has been received. This is a natural extension of the existing `transaction_flushed()` check — instead of checking the local NOC write trid, the relay checks the downstream sender's completion counter.
-
----
-
-## Implementation Order (Lowest Risk First)
-
-### Step 1: Firmware forwarding (Phase 1)
-- Add `ForwardingConfig` to `FabricLiteConfig`
-- Add routing field inspection + forwarding in `service_fabric_request()`
-- Test with simulated 2-hop setup (manually configure relay on existing 1-hop)
-- **No changes to discovery or UMD yet** — test by manually setting up forwarding config from host
-
-### Step 2: UMD hop count parameterization (Phase 3.1)
-- Change `to_chip_unicast(1)` → `to_chip_unicast(num_hops)`
-- Add `num_hops` to tunnel/interface state
-- Test end-to-end with manually configured 2-hop
-
-### Step 3: ETH link probing from remote chips (Phase 2.3)
-- Add ERISC0 boot-time link status reporting to `active_erisc.cc`
-- Test reading link status from 1-hop remote devices
-
-### Step 4: BFS discovery loop (Phase 2.2)
-- Restructure `metal_context.cpp` init sequence
-- Implement iterative discovery and lite fabric extension
-- Test with actual n-hop topology
-
-### Step 5: End-to-end completion semantics (Phase 5)
-- Modify relay completion to wait for downstream ack
-- Verify `l1_barrier()` provides end-to-end guarantees
-
-### Step 6: Control plane + dispatch for n-hop devices (Phase 4)
-- Verify control plane routing works with dynamically discovered topology
-- Verify dispatch topology assigns single-chip dispatch to n-hop devices
-- End-to-end test: run ops on n-hop remote devices
-
----
-
-## Risks and Mitigations
-
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Relay buffer exhaustion (store-and-forward at each hop) | Packets dropped or deadlock | Credit system already prevents overflow; 2 buffers per hop is tight but sufficient for sequential ops |
-| ERISC1 L1 space for forwarding | Binary too large | Forwarding is ~50 lines of code in existing binary; no new buffers needed (reuse sender buffer) |
-| Latency increase per hop | Slower remote ops | Acceptable for bootstrapping; dispatch is local once CQ is set up |
-| NOC counter mismatch at relay | Hang | Already solved by `ncrisc_noc_counters_init()` fix; relay doesn't have this issue since forwarding uses ETH send, not NOC |
-| ETH link down during chain | Partial cluster | Existing tunnel failure handling (remove failed tunnel, proceed with remaining). BFS naturally handles partial connectivity |
-| Multi-hop reads | Complex response routing | Defer reads — use 1-hop reads from parent relay for discovery. Full multi-hop reads can be added later |
-| `FabricLiteConfig` size overflow | FW crash | ForwardingConfig is 16 bytes; well within margin |
-| Discovery loop never terminates | Hang at init | BFS terminates naturally; add max-hop-count safety limit (e.g., 16 hops) |
-
----
-
-## What Does NOT Change
-
-- Lite fabric binary is still one binary for all ERISC1 cores
-- Lite fabric is still JIT-compiled at runtime (same build flow)
-- Dispatch topology for remote devices is still single-chip (no MUX/DEMUX)
-- Fabric router on ERISC0 is unchanged
-- The 2-erisc dance mechanism is unchanged
-- UMD's `RemoteCommunicationLiteFabric` class API is unchanged (just parameterize hop count internally)
-- Command queue initialization for remote devices is unchanged (writes go through lite fabric chain)
-
-
-# Test loop
+## Test Plan
 You will be fed the output of this script to debug and complete implementation:
 ```
 import torch
 import ttnn
 
-DEVICE_IDS = [0, 1, 3, 5, 7]
+# DeepSeek V3 MLA dimensions
+NUM_HEADS = 128
+KV_LORA_RANK = 512
+QK_NOPE_HEAD_DIM = 128
+QK_ROPE_HEAD_DIM = 64
+QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM  # 192
+MLA_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576 (what Q/KV look like after absorb)
+
+MESH_SHAPE = (1, 8)
+NUM_HEADS_LOCAL = NUM_HEADS // MESH_SHAPE[1]  # 16
+SEQ_LEN = 128
 
 
-def run_core_logic(device_id: int) -> None:
-    device = ttnn.open_device(device_id=device_id)
-    try:
-        torch_input_tensor_a = torch.rand(4, 7, dtype=torch.float32)
-        input_tensor_a = ttnn.from_torch(
-            torch_input_tensor_a,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
+def run():
+    ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D_RING)
+
+    with ttnn.create_mesh_device(ttnn.MeshShape(*MESH_SHAPE)) as mesh:
+        print(f"Opened mesh: {mesh.shape}")
+        grid = mesh.compute_with_storage_grid_size()
+        mapper = ttnn.ReplicateTensorToMesh(mesh)
+
+        # Random Q and KV tensors (replicated — no CCLs needed)
+        q = ttnn.from_torch(
+            torch.randn(1, NUM_HEADS_LOCAL, SEQ_LEN, MLA_HEAD_DIM, dtype=torch.bfloat16),
+            dtype=ttnn.bfloat16, device=mesh, mesh_mapper=mapper, layout=ttnn.TILE_LAYOUT,
+        )
+        kv = ttnn.from_torch(
+            torch.randn(1, 1, SEQ_LEN, MLA_HEAD_DIM, dtype=torch.bfloat16),
+            dtype=ttnn.bfloat8_b, device=mesh, mesh_mapper=mapper, layout=ttnn.TILE_LAYOUT,
         )
 
-        output_tensor = ttnn.exp(input_tensor_a)
-        torch_output_tensor = ttnn.to_torch(output_tensor)
+        scale = QK_HEAD_DIM**-0.5
 
-        torch_input_tensor_b = torch.rand(7, 1, dtype=torch.float32)
-        input_tensor_b = ttnn.from_torch(
-            torch_input_tensor_b,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
+        out = ttnn.transformer.flash_mla_prefill(
+            q, kv,
+            head_dim_v=KV_LORA_RANK,
+            scale=scale,
+            program_config=ttnn.SDPAProgramConfig(
+                compute_with_storage_grid_size=grid,
+                q_chunk_size=128,
+                k_chunk_size=128,
+                exp_approx_mode=False,
+            ),
+            compute_kernel_config=ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+            ),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            is_causal=True,
         )
 
-        matmul_output_tensor = input_tensor_a @ input_tensor_b
-        torch_matmul_output_tensor = ttnn.to_torch(matmul_output_tensor)
-
-        print(f"device {device_id} matmul output:")
-        print(torch_matmul_output_tensor)
-    finally:
-        ttnn.close_device(device)
+        out_torch = ttnn.to_torch(ttnn.get_device_tensors(out)[0])
+        print(f"Output shape: {out_torch.shape}  (expect [1, {NUM_HEADS_LOCAL}, {SEQ_LEN}, {KV_LORA_RANK}])")
+        print(f"Sample: {out_torch.flatten()[:4].tolist()}")
+        print("PASS")
 
 
-for device_id in DEVICE_IDS:
-    run_core_logic(device_id)
+if __name__ == "__main__":
+    # Intentionally run twice to verify mesh open/close cycle is repeatable
+    run()
+    run()
 ```
 
-Use it to determine what is going wrong with the multi hop device
-For reference, the on hop remote devices were working and running ops at the last commit 'working!' Use that as your stable baseline
 
+Make sure devices 0-7 are fully working for ops and that teardown works successfully
 DO NOT BUILD THE CHANGES OR RUN THEM WHEN YOU ARE DONE. I will do this from an extrnel loop.
 Start this session by checking your memory for progress and bugs from previous runs.
+
+
+## Risks
+
+1. **Boot window**: Between Phase 2 (lite fabric starts) and Phase 4 (fabric router
+   starts), ERISC0 is in reset. No natural keepalive. BH MAC timeout is ~10s;
+   boot window is ~2-5s. Should be fine but monitor.
+
+2. **Init handshake TXQ0**: `ConnectedRiscInterface` uses TXQ0 during Phase 2 init.
+   Fabric router hasn't started yet, so no conflict. But if lite fabric re-inits
+   after fabric router is running, TXQ0 would conflict. This shouldn't happen in
+   normal flow.
+
+3. **L1 overlap**: Fabric router's L1 must not extend into 0x62000-0x70000 (lite
+   fabric region). Verify via `MEM_ERISC_MAX_SIZE < 0x62000` (currently ~0x61260).
+
+4. **NOC contention**: Both ERISCs share NOC0. Lite fabric uses per-TRID barriers
+   and sentinel-based reads to avoid counter interference. Fabric router also uses
+   NOC0 but with different TRIDs (0-7). Verify no overlap.

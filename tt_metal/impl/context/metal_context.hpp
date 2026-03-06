@@ -138,6 +138,13 @@ public:
     // should not have Device objects or dispatch firmware.
     bool is_chip_unreachable(ChipId chip_id) const { return unreachable_chip_ids_.contains(chip_id); }
 
+    // Return the lite fabric hop count for a given chip (1 = direct, 2+ = multi-hop, 0 = MMIO/unknown).
+    int get_lite_fabric_hop_count(ChipId chip_id) const;
+
+    // Returns true if the given virtual core on an MMIO device has an active lite fabric tunnel.
+    // Used to prevent launching fabric router ERISC0 on cores where ERISC1 runs lite fabric relay.
+    bool is_lite_fabric_mmio_core(ChipId mmio_id, CoreCoord virtual_core) const;
+
     // Utilities
     bool is_coord_in_range(CoreCoord coord, CoreType core_type);
 
@@ -149,6 +156,11 @@ public:
     // (skipped during init_fw). This loads base ERISC firmware and deasserts
     // the cores so they can process fabric router kernel launch messages.
     void initialize_remote_eth_cores_for_fabric(ChipId device_id, const std::vector<CoreCoord>& logical_eth_cores);
+
+    // Returns true if fabric routers were actually launched (ERISC0 deasserted) on a remote device.
+    // For MMIO devices, always returns true.  For remote devices, returns true only if
+    // initialize_remote_eth_cores_for_fabric() successfully initialized at least one core.
+    bool has_fabric_routers_launched(ChipId device_id) const;
 
 private:
     friend class tt::stl::Indestructible<MetalContext>;
@@ -267,6 +279,12 @@ private:
     // whose remote peers lack fabric routers (MMIO-side router ETH handshake traffic
     // would corrupt the lite fabric relay on such peers).
     std::map<ChipId, std::set<uint32_t>> remote_fabric_eth_channels_;
+
+    // ETH cores where ERISC1 was launched as a downstream sender during Phase 2b
+    // BFS discovery.  Keyed by (chip_id, logical_eth_channel).  Used by
+    // initialize_remote_eth_cores_for_fabric to avoid killing ERISC1 when
+    // deasserting ERISC0 for the fabric router.
+    std::set<std::pair<ChipId, uint32_t>> downstream_sender_cores_;
 };
 
 }  // namespace tt::tt_metal

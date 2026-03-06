@@ -26,24 +26,27 @@ namespace lite_fabric {
 
 void BlackholeLiteFabricHal::set_reset_state(tt_cxy_pair virtual_core, bool assert_reset) {
     auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+    // Use direct register writes instead of UMD assert/deassert API.
+    // The UMD API has three problems on BH ETH tiles:
+    //   1. Read-modify-write races with running ERISC0 firmware that may
+    //      also modify the soft reset register (e.g. deassert_all_reset).
+    //   2. Deassert adds staggered_start (bit 31) which is a Tensix
+    //      mechanism — behavior on ETH tiles is undefined.
+    //   3. If ERISC0 cleared bits 13/14/18, the UMD's OR creates 0→1
+    //      transitions on those bits, which can corrupt the ERISC reset
+    //      PC debug registers (AERISC_RESET_PC / LITE_FABRIC_RESET_PC).
+    // Bits 13, 14, 18 control internal ETH tile subsystems and must
+    // always remain set.  This matches risc_interface.hpp and
+    // metal_context.cpp which also use direct writes.
+    constexpr uint32_t kSoftResetAddr = 0xFFB121B0;
     if (assert_reset) {
-        // Assert ALL cores including ERISC0.  Phase 1 loads base firmware on
-        // ERISC0 and deasserts it, so ERISC0 is running when we get here.
-        // ERISC0 and ERISC1 share the ethernet TX queue on the same ETH core;
-        // if ERISC0 is left running, its base firmware can:
-        //   - Send heartbeats / mailbox responses that stall ERISC1's
-        //     eth_txq_is_busy() loops, blocking lite fabric packet sends.
-        //   - Assert ERISC1's reset as part of a context-switch, killing
-        //     the lite fabric link mid-operation.
-        // Putting ERISC0 in reset for the duration of lite fabric avoids
-        // both issues.  ERISC0 is restored when Metal re-initializes
-        // (Phase 1 of the next init cycle).
-        cluster.assert_risc_reset_at_core(virtual_core, tt::umd::RiscType::ALL_TENSIX);
+        // Both ERISCs in reset: bits 11,12,13,14,18 set
+        constexpr uint32_t kBothInReset = 0x47800;
+        cluster.write_core(&kBothInReset, sizeof(kBothInReset), virtual_core, kSoftResetAddr);
     } else {
-        // Deassert only ERISC1.  ERISC0 stays in reset to avoid TX queue
-        // contention for the entire lite fabric lifetime.
-        tt::umd::RiscType reset_val = tt::umd::RiscType::ERISC1;
-        cluster.deassert_risc_reset_at_core(virtual_core, reset_val);
+        // ERISC1 deasserted, ERISC0 stays in reset: bits 11,13,14,18 set, bit 12 clear
+        constexpr uint32_t kErisc1OutErisc0InReset = 0x46800;
+        cluster.write_core(&kErisc1OutErisc0InReset, sizeof(kErisc1OutErisc0InReset), virtual_core, kSoftResetAddr);
     }
 }
 
@@ -160,7 +163,6 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
         config.routing_enabled = lite_fabric::RoutingEnabledState::ENABLED;
 
         set_reset_state(tunnel_1x.mmio_cxy_virtual(), true);
-        set_pc(tunnel_1x.mmio_cxy_virtual(), k_FirmwareStart);
 
         // Zero the host interface counters (d2h + h2d = 4 bytes) on device before
         // starting the firmware.  Phase 1's clear_l1_state only clears the "unreserved"
@@ -194,6 +196,14 @@ void BlackholeLiteFabricHal::launch(const std::filesystem::path& bin_path) {
     cluster.l1_barrier(0);
 
     for (auto tunnel_1x : system_descriptor_.tunnels_from_mmio) {
+        // Write the boot PC immediately before deassert to minimize the
+        // window for asynchronous PC corruption.  The assert in the loop
+        // above may cause 0→1 transitions on soft reset bits 13/14/18
+        // (if ERISC0 cleared them before being reset), which can reset
+        // the ERISC PC debug registers.  By setting PC here (after
+        // l1_barrier ensures all writes landed), any corruption from
+        // the assert is long settled and our PC write is final.
+        set_pc(tunnel_1x.mmio_cxy_virtual(), k_FirmwareStart);
         set_reset_state(tunnel_1x.mmio_cxy_virtual(), false);
     }
 

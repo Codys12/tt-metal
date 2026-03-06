@@ -5,6 +5,7 @@
 #pragma once
 
 #include <tt_stl/span.hpp>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -63,6 +64,11 @@ private:
     std::vector<std::unique_ptr<tt_metal::IDevice>> devices_;
 
     bool skip_remote_devices_{};
+
+    // Devices that need dispatch (MMIO + user-requested).  Intermediate tunnel
+    // devices activated for fabric routing are NOT in this set and must be
+    // excluded from dispatch core allocation / CQ initialization.
+    std::set<ChipId> dispatch_device_ids_;
 
     // Determine which CPU cores the worker threads need to be placed on for each device
     std::unordered_map<uint32_t, uint32_t> worker_thread_to_cpu_core_map_;
