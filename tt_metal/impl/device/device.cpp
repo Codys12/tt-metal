@@ -463,9 +463,10 @@ void Device::configure_fabric() {
     // hard reset via assert_risc_reset_at_core(ALL_TENSIX) and only deasserted
     // ERISC1.  ERISC0 must be restarted to process the fabric router go message.
     //
-    // Lite fabric uses TXQ2; fabric router uses TXQ0/TXQ1.  No TXQ contention,
-    // so ERISC0 can be safely deasserted on ALL cores including those where
-    // ERISC1 runs the lite fabric relay.
+    // WARNING: Lite fabric currently uses TXQ0 (DEFAULT_ETH_TXQ=0).  Fabric
+    // router also uses TXQ0/TXQ1.  Deasserting ERISC0 creates TXQ0 contention
+    // on MMIO cores where ERISC1 runs lite fabric.  This is a known issue that
+    // will be resolved when TXQ2 coexistence is debugged.
     if (cluster.mmio_chip_ids().count(this->id())) {
         constexpr uint32_t SOFT_RESET_REG_ADDR = 0xFFB121B0;
         // 0x46000: bits 13/14/18 set (standard for ETH tiles), ERISC0+ERISC1 out of reset.
@@ -492,8 +493,19 @@ void Device::configure_fabric() {
             for (const auto& logical_core : logical_cores_used_in_program[pct_idx]) {
                 auto vc = this->virtual_core_from_logical_core(logical_core, CoreType::ETH);
 
-                // Lite fabric uses TXQ2; fabric router uses TXQ0/TXQ1.
-                // No TXQ contention — ERISC0 can be safely deasserted on all cores.
+                // Skip ERISC0 deassert on MMIO cores with active lite fabric.
+                // Lite fabric (ERISC1) uses TXQ0; fabric router (ERISC0) also
+                // uses TXQ0/TXQ1.  Deasserting ERISC0 creates TXQ0 contention
+                // that causes permanent TXQ hang after ~115 operations.
+                if (MetalContext::instance().is_lite_fabric_mmio_core(this->id(), vc)) {
+                    log_info(
+                        tt::LogMetal,
+                        "Device {} configure_fabric: skipping ERISC0 deassert on core {} — "
+                        "lite fabric active (TXQ0 contention)",
+                        this->id_,
+                        vc.str());
+                    continue;
+                }
 
                 // Re-write syseng API table stubs (may have been overwritten by ConfigureDeviceWithProgram)
                 uint32_t ret_insn = RISCV_RET_INSN;

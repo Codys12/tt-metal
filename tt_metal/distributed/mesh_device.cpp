@@ -238,6 +238,19 @@ std::shared_ptr<MeshDevice> MeshDevice::create(
     const DispatchCoreConfig& dispatch_core_config,
     tt::stl::Span<const std::uint32_t> l1_bank_remap,
     size_t worker_l1_size) {
+    // Ensure MetalContext is initialized before accessing the control plane.
+    // MetalContext::initialize() runs BFS discovery which may find N-hop chips
+    // beyond what UMD's firmware topology discovered.  The control plane and
+    // SystemMesh are lazily constructed on first access — if we access them
+    // before BFS, they'll only see the initial (incomplete) set of chips.
+    // This call is idempotent: when ScopedDevices later triggers initialize()
+    // again with the same parameters, it returns immediately.
+    fprintf(stderr, "JROCK MeshDevice::create: calling early initialize()\n");
+    log_info(tt::LogMetal, "DEBUG MeshDevice::create: calling early initialize()");
+    MetalContext::instance().initialize(
+        dispatch_core_config, num_command_queues, {l1_bank_remap.begin(), l1_bank_remap.end()}, worker_l1_size);
+    log_info(tt::LogMetal, "DEBUG MeshDevice::create: early initialize() done, now getting control plane");
+
     const auto& mesh_graph = MetalContext::instance().get_control_plane().get_mesh_graph();
     auto [scoped_devices, fabric_node_ids, mesh_shape] =
         [&]() -> std::tuple<std::shared_ptr<ScopedDevices>, std::vector<tt::tt_fabric::FabricNodeId>, MeshShape> {

@@ -9,9 +9,9 @@ Every connected ETH core on every chip (MMIO and remote) simultaneously runs:
 They coexist on the same ETH tile because they use separate L1 regions, separate NOC
 TRIDs, and separate TXQs (fabric router: TXQ0/TXQ1, lite fabric: TXQ2).
 
-## Current State (what's already done)
+## Completed Work
 
-### Dual-channel architecture (Groups 1-5 complete)
+### Dual-channel architecture (Groups 1-5)
 - **Ch0**: outbound commands (host→remote writes + read commands)
 - **Ch1**: inbound read responses (remote→host)
 - 4 buffer slots per channel for pipelining
@@ -21,7 +21,7 @@ TRIDs, and separate TXQs (fabric router: TXQ0/TXQ1, lite fabric: TXQ2).
   `read_one_page()` uses ch1 receiver buffers
 - Memory layout: 56KB (base 0x62000), FW and UMD memory maps in sync
 
-### Lite fabric / fabric router separation
+### Lite fabric / fabric router resource separation
 - Lite fabric: TXQ2, TRIDs 8-15, stream regs 23-28, L1 region 0x62000-0x70000
 - Fabric router: TXQ0/TXQ1, TRIDs 0-7, stream regs 0-22+29-31, L1 below 0x62000
 
@@ -30,186 +30,79 @@ TRIDs, and separate TXQs (fabric router: TXQ0/TXQ1, lite fabric: TXQ2).
 - Forwarding stays on ch0 only; direct 1-hop reads use ch1
 - `downstream_sender_cores_` tracks which cores have ERISC1 running as downstream senders
 
+### Phase A: ERISC0 kill + TXQ0 init (DONE)
+**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
+
+- ERISC0 killed at boot via local RISC-V store (0x46800). Required because init-fsm
+  uses TXQ0, ERISC0 syseng FW also uses TXQ0 → contention causes hardware hang.
+- TXQ0 KEEPALIVE enabled after kill. After init, ERISC1 switches to TXQ2 steady-state.
+- Periodic keepalive on TXQ2 every ~65K iterations (safety net for Phase 2→4 window).
+- Keepalive in sentinel spin loop (channels.hpp NOC_READ) prevents ETH timeout during slow reads.
+
+### Phase B: L1-based notification counters (DONE)
+**Files: `channels.hpp`, `lite_fabric.cpp`**
+
+- COMMAND frames (stream register updates) are TXQ0-only on BH; lite fabric uses TXQ2.
+- Replaced with L1 DATA frame counters: `pkts_sent_notify[2][4]`, `pkts_completed_notify[2][4]`.
+- Read via `noc_self_read_word()` to bypass D-cache (BSS variables have stale cache lines).
+
+### Phase C: NOC cmd buffer separation (DONE)
+**Files: `channels.hpp`, `constants.hpp`, `lite_fabric.cpp`**
+
+- ERISC1: cmd buf 2 (write), cmd buf 3 (read). ERISC0: cmd buf 0/1.
+- `local_chip_data_cmd_buf = DYNAMIC_NOC_NCRISC_WR_CMD_BUF`, `LF_RD_CMD_BUF = 3`.
+- Initialized in main() mirroring noc_init's setup.
+
+### Phase D: TXQ2 MAC configuration (DONE)
+**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
+
+- TXPKT_CFG_SEL_SW (0x80) and TXPKT_CFG_SEL_HW (0x84) set to entry 0 (broadcast MAC DA).
+- Without this, TXQ2 uses undefined config → remote MAC drops frames silently.
+
+### Phase E: Init-fsm TXQ0 serialization (DONE)
+**File: `tt_metal/lite_fabric/hw/inc/init-fsm-basic.hpp`**
+
+- `k_DataTxq = 0`: data + handshake on same TXQ as COMMAND frames (deassert).
+- Natural serialization, no cross-TXQ race. TXQ busy barrier after binary send.
+
+### Phase F: Per-core erisc1_running detection (DONE)
+**File: `tt_metal/impl/context/metal_context.cpp`**
+
+- erisc1_running=true only for: MMIO-peering, downstream senders, tunnel endpoints.
+- Non-tunnel cores keep ERISC1 in POR (0x47000). Prevents syseng subordinate FW conflicts.
+
+### Phase G: Early MetalContext::initialize (DONE)
+**File: `tt_metal/distributed/mesh_device.cpp`**
+
+- MeshDevice::create calls initialize() before control plane access.
+- Ensures BFS discovery completes before SystemMesh construction.
+
+### device.cpp configure_fabric (DONE — no changes needed)
+- SOFT_RESET_BOTH_RUNNING = 0x46000. TXQ partitioning eliminates contention.
+
 ---
 
 ## Remaining Work
 
-### Phase A: Remove ERISC0 Kill from Lite Fabric FW
+### Build + Test (NEXT)
+
+1. Clear FW cache: `rm -rf ~/.cache/tt-metal-cache/`
+2. Build: `cmake --build build -- -j$(nproc) tt_metal`
+3. Run test script (see Test Plan below)
+4. Debug any failures
+
+### Phase H: D-Cache Optimization (Nice-to-Have, DEFERRED)
 
 **File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
 
-Currently `main()` (lines 362-382) kills ERISC0 immediately on boot:
-```cpp
-*reinterpret_cast<volatile uint32_t*>(kSoftResetAddr) = 0x46800;  // ERISC0 in reset
-*reinterpret_cast<volatile uint32_t*>(0xFFB90000) = 0x1;          // TXQ0 KEEPALIVE
-```
-
-This was needed because:
-1. ERISC0 syseng FW from POR uses TXQ0 — conflicts with lite fabric
-2. ETH link needs keepalive frames; killing ERISC0 removes its natural keepalive
-
-With fabric router running on ERISC0:
-1. Fabric router uses TXQ0/TXQ1 — no conflict with lite fabric's TXQ2
-2. Fabric router generates regular ETH traffic — natural keepalive
-
-**Changes:**
-- Remove the ERISC0 kill block (lines 362-382)
-- Remove TXQ0 KEEPALIVE enable (line 467): `*reinterpret_cast<volatile uint32_t*>(ETH_TXQ0_REGS_START + ETH_TXQ_CTRL) = ETH_TXQ_CTRL_KEEPALIVE;`
-  - TXQ0 is now managed by ERISC0's fabric router, not ERISC1
-  - Keep TXQ2 enable (line 468) — that's lite fabric's own TXQ
-- Remove periodic keepalive in `service_lite_fabric()` (lines 228-234):
-  ```cpp
-  if ((diag_loop_counter & 0xFFFF) == 0 && diag_loop_counter > 0) { ... }
-  ```
-
-**Caveat — boot ordering:** Lite fabric (ERISC1) boots in Phase 2, fabric router
-(ERISC0) boots in Phase 4 (init_fabric). There's a window where ERISC1 is running
-but ERISC0 hasn't started yet. During this window, there's no ETH keepalive from
-ERISC0. Options:
-1. **Keep software keepalive until ERISC0 is confirmed running** — check a flag/register
-2. **Accept the gap** — the window is short (seconds), BH MAC timeout is ~10s
-3. **Start ERISC0 earlier** — move fabric router init before Phase 2b BFS
-
-Recommendation: option 2. The boot window is short and BFS operations provide
-ETH traffic anyway. If we see link timeouts during boot, add a conditional keepalive
-that checks whether ERISC0 is running (read TXQ0 CTRL register or a shared flag).
-
-### Phase B: Remove Defensive ERISC0 Re-kill
-
-**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
-
-Currently (not visible in recent reads but was added previously) there may be a
-defensive ERISC0 re-kill every ~128K iterations in `service_lite_fabric()`. With
-fabric router running, this would kill it. Remove any such logic.
-
-Also verify no other code path in `lite_fabric.cpp` or `channels.hpp` touches
-the soft reset register (0xFFB121B0) or puts ERISC0 in reset.
-
-Search patterns:
-```
-grep -n "0xFFB121B0\|0x46800\|kSoftResetAddr\|soft_reset\|assert.*risc.*reset" \
-  tt_metal/lite_fabric/hw/src/lite_fabric.cpp \
-  tt_metal/lite_fabric/hw/inc/channels.hpp
-```
-
-### Phase C: Keepalive Simplification
-
-**File: `tt_metal/lite_fabric/hw/inc/channels.hpp`**
-
-The sentinel spin loop in `service_fabric_request` (around line 460) may have
-keepalive logic inside. Remove it — fabric router traffic keeps the link alive.
-
-**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
-
-Remove the periodic keepalive block in `service_lite_fabric()` (lines 228-234).
-
-### Phase D: Configure Fabric — Launch ERISC0 on ALL Cores
-
-**File: `tt_metal/impl/device/device.cpp` — `Device::configure_fabric()`**
-
-The MMIO section (lines 461-536) already deasserts ERISC0 on all fabric program
-ETH cores. This is correct — it handles ERISC0 deassert with ERISC1 kept alive
-(soft reset 0x46000). No changes needed here if it already covers all connected cores.
-
-Verify: the fabric program's `logical_cores()` includes ALL connected ETH cores,
-not just a subset. If the fabric program only uses some cores, we need to ensure
-that those cores include all cores where lite fabric (ERISC1) is running.
-
-**File: `tt_metal/impl/context/metal_context.cpp` — `initialize_remote_eth_cores_for_fabric()`**
-
-Lines 3449-3463: the `erisc1_running` detection currently checks:
-1. `peer_is_mmio` — 1-hop cores peering with MMIO
-2. Tunnel endpoints — cores in `tunnels_from_mmio`
-3. Downstream senders — cores in `downstream_sender_cores_`
-
-With full coexistence, ALL connected ETH cores on ALL remote chips have ERISC1
-running (launched in Phase 2 for MMIO-peering cores, Phase 2b BFS for everything
-else). The current detection logic may miss some cores.
-
-**Change:** Simplify to `erisc1_running = true` for all cores where lite fabric is
-active. Since we launch lite fabric on all connected MMIO ETH cores (Phase 2) and
-their neighbors propagate it via init-fsm (Phase 2/2b), all connected remote ETH
-cores have ERISC1. Set `erisc1_running = true` unconditionally when `lite_fabric_hal_`
-is present.
-
-The soft reset values:
-- `0x46000`: ERISC0 out of reset + ERISC1 out of reset + bits 13/14/18
-- `0x47000`: ERISC0 out of reset + ERISC1 in reset + bits 13/14/18
-
-With full coexistence, always use `0x46000` (both running).
-
-### Phase E: Update Lite Fabric Bindings
-
-**File: `tt_metal/impl/context/metal_context.cpp` — `update_lite_fabric_bindings_for_fabric_routers()`**
-
-Currently (lines 2459-2538) this rebinds 1-hop chips to channels where the fabric
-router's remote peer has been launched. It skips chips with forwarding chains.
-
-With full coexistence, ALL ETH cores have both ERISC0 and ERISC1 running. The
-binding logic should still work because:
-- Forwarding channels are still excluded (multi-hop chains must not be disturbed)
-- `remote_fabric_eth_channels_` tracks cores where fabric router was launched
-
-Verify this function doesn't break when ALL cores have fabric routers. The current
-filtering (skip forwarding channels, only include cores in `remote_fabric_eth_channels_`)
-should be sufficient.
-
-### Phase F: TXQ0 Boot Ordering
-
-**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
-
-After removing the ERISC0 kill, the TXQ0 self-healing check (lines 425-463) needs
-adjustment. Currently it:
-1. Checks TXQ2 status and recovers if stuck
-2. Enables TXQ0 KEEPALIVE for init handshake
-
-With ERISC0 running fabric router:
-- TXQ0 is managed by ERISC0 — ERISC1 must NOT touch it
-- Remove TXQ0 CTRL write (line 467)
-- Keep TXQ2 self-healing (lines 425-451) — that's lite fabric's own TXQ
-- The init handshake (`ConnectedRiscInterface` in `risc_interface.hpp`) currently
-  uses TXQ0 for `eth_write_remote_reg`. This conflicts with fabric router's TXQ0.
-
-**Resolution:** The init handshake only runs during Phase 2 boot, before fabric
-router starts. Once routing_init completes, TXQ0 is not used by lite fabric again.
-The fabric router starts later (Phase 4). So there's no actual TXQ0 contention
-during normal operation — the concern is only if lite fabric restarts while
-fabric router is running (which doesn't happen in normal flow).
-
-If we want to be safe: change ConnectedRiscInterface to use TXQ2 for the init
-handshake as well. But this is low priority since the timing doesn't overlap.
-
-### Phase G: TXQ Diagnostic on Non-MMIO Cores
-
-Lines 454-462 in `main()` send a diagnostic breadcrumb to the MMIO side via TXQ0:
-```cpp
-if (!structs->config.is_mmio && !cmd_ongoing) {
-    internal_::eth_send_packet<false>(0, src_addr >> 4, dst_addr >> 4, 1);
-}
-```
-
-This uses TXQ0 which will be used by fabric router. Remove or change to TXQ2.
-
-### Phase H: D-Cache Optimization (Nice-to-Have)
-
-**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
-
-The `noc_self_read_word()` calls in `service_lite_fabric()` (mailbox polling, lines
-178-215) and `object_init()` (is_mmio check, lines 322-328) are slow because they
-do a full NOC DMA read to bypass the D-cache.
-
-Optimization ideas:
-1. **Stream register notification**: Host writes to a stream register instead of L1.
-   Stream registers bypass D-cache. Lite fabric reads the stream register directly.
-2. **RISC-V CSR uncacheable region**: Mark the forwarding config region as uncacheable
-   via CSR 0x7c0 settings.
-3. **RISC-V volatile + invalidate_l1_cache()**: The `invalidate_l1_cache()` at the
-   top of `service_lite_fabric()` should flush stale D-cache lines. Verify this
-   works for the specific L1 addresses being polled.
+The `noc_self_read_word()` calls are slow (NOC DMA self-read to bypass D-cache).
+Note: `invalidate_l1_cache()` on BH is just `asm("fence")` — it does NOT invalidate
+D-cache lines. CSR 0x7c0 bit 3 prevents NEW allocations but existing stale lines
+from `data_init()` (which runs before CSR set on second boot) persist.
 
 Deferred until coexistence is working.
 
-### Phase I: Multi-Path Tunnels (Nice-to-Have)
+### Phase I: Multi-Path Tunnels (Nice-to-Have, DEFERRED)
 
 Allow multiple tunnels to the same remote device through different ETH links for
 redundancy and load balancing. Requires:
@@ -221,32 +114,30 @@ Deferred until coexistence is working.
 
 ---
 
-## Implementation Order
+## 6-Phase Initialization Order
 
-1. **Phase A+B+C**: Remove ERISC0 kill, remove keepalive, remove defensive re-kill
-   (all in lite_fabric FW — single coherent change)
-2. **Phase G**: Fix TXQ0 diagnostic to use TXQ2 (part of same FW change)
-3. **Phase F**: Remove TXQ0 CTRL write from boot sequence
-4. **Phase D**: Ensure `initialize_remote_eth_cores_for_fabric` always sets
-   `erisc1_running=true` when lite fabric is active
-5. **Phase E**: Verify `update_lite_fabric_bindings_for_fabric_routers` works
-   correctly with all cores having fabric routers
-6. **Build + test**: Clear FW cache, rebuild, run test script
-7. **Phase H+I**: D-cache optimization and multi-path tunnels (future)
+1. **Phase 1**: MMIO FW — launch Metal FW on MMIO device ETH cores (ERISC0)
+2. **Phase 2**: Lite fabric — launch ERISC1 on all connected MMIO ETH cores, init-fsm handshake with neighbors
+3. **Phase 2a**: Upgrade remote SoC — read boot_results, populate SoC descriptor
+4. **Phase 2b**: BFS + downstream tunnels — discover N-hop chips, launch downstream senders/receivers
+5. **Phase 3**: Remote FW — launch ERISC0 (Metal active erisc) on all remote device ETH cores via `initialize_remote_eth_cores_for_fabric()`
+6. **Phase 4**: Fabric router — `configure_fabric()` on all devices (deep-hop first, 1-hop second, MMIO last)
+
+After Phase 4, every connected ETH core has ERISC0 (fabric router) + ERISC1 (lite fabric relay) running simultaneously.
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `tt_metal/lite_fabric/hw/src/lite_fabric.cpp` | FW main loop, ERISC0 kill, keepalive, TXQ init |
-| `tt_metal/lite_fabric/hw/inc/channels.hpp` | Sender/receiver logic, sentinel loop keepalive |
-| `tt_metal/lite_fabric/hw/inc/constants.hpp` | TXQ assignments, TRID offsets, stream reg IDs |
+| `tt_metal/lite_fabric/hw/src/lite_fabric.cpp` | FW main loop — ERISC1 only touches TXQ2 |
+| `tt_metal/lite_fabric/hw/inc/channels.hpp` | Sender/receiver logic, TXQ2 recovery |
+| `tt_metal/lite_fabric/hw/inc/constants.hpp` | TXQ assignments (DEFAULT_ETH_TXQ=2), TRID offsets, stream reg IDs |
 | `tt_metal/lite_fabric/hw/inc/host_interface.hpp` | FabricLiteConfig, FabricLiteMemoryMap |
-| `tt_metal/lite_fabric/hw/inc/init-fsm-basic.hpp` | Init handshake (uses TXQ0 via ConnectedRiscInterface) |
-| `tt_metal/lite_fabric/hw/inc/blackhole/risc_interface.hpp` | ConnectedRiscInterface (TXQ0 for remote reg writes) |
-| `tt_metal/impl/device/device.cpp` | `configure_fabric()` — ERISC0 deassert on MMIO cores |
-| `tt_metal/impl/device/device_manager.cpp` | `init_fabric()` ordering — deep-hop first |
-| `tt_metal/impl/context/metal_context.cpp` | `initialize_remote_eth_cores_for_fabric()`, `update_lite_fabric_bindings_for_fabric_routers()` |
+| `tt_metal/lite_fabric/hw/inc/init-fsm-basic.hpp` | Init handshake (uses TXQ0 via ConnectedRiscInterface — Phase 2 only) |
+| `tt_metal/lite_fabric/hw/inc/blackhole/risc_interface.hpp` | ConnectedRiscInterface (TXQ0 for remote reg writes — Phase 2 only) |
+| `tt_metal/impl/device/device.cpp` | `configure_fabric()` — ERISC0 deassert with 0x46000 on all cores |
+| `tt_metal/impl/device/device_manager.cpp` | `init_fabric()` ordering — deep-hop first, 1-hop second, MMIO last |
+| `tt_metal/impl/context/metal_context.cpp` | `initialize_remote_eth_cores_for_fabric()` (erisc1_running=true when lite fabric active), `update_lite_fabric_bindings_for_fabric_routers()` |
 | `tt_metal/third_party/umd/.../lite_fabric.hpp` | UMD-side host interface and memory map |
 | `tt_metal/third_party/umd/.../remote_communication_lite_fabric.cpp` | UMD read/write/rebind |
 
@@ -324,20 +215,39 @@ DO NOT BUILD THE CHANGES OR RUN THEM WHEN YOU ARE DONE. I will do this from an e
 Start this session by checking your memory for progress and bugs from previous runs.
 
 
-## Risks
+## Risks and Known Caveats
 
-1. **Boot window**: Between Phase 2 (lite fabric starts) and Phase 4 (fabric router
-   starts), ERISC0 is in reset. No natural keepalive. BH MAC timeout is ~10s;
-   boot window is ~2-5s. Should be fine but monitor.
+1. **Boot window (Phase 2 → Phase 4)**: Between lite fabric start and fabric router
+   start, ERISC0 is in POR/reset state. No natural keepalive from ERISC0. BH MAC
+   timeout is ~10s; boot window is ~2-5s. BFS traffic provides some ETH activity.
+   If link timeouts are observed during boot, add a conditional keepalive in ERISC1
+   that checks whether ERISC0 is running (e.g., read TXQ0 CTRL or a shared flag).
 
-2. **Init handshake TXQ0**: `ConnectedRiscInterface` uses TXQ0 during Phase 2 init.
-   Fabric router hasn't started yet, so no conflict. But if lite fabric re-inits
-   after fabric router is running, TXQ0 would conflict. This shouldn't happen in
-   normal flow.
+2. **Init handshake TXQ0**: `ConnectedRiscInterface` uses TXQ0 during Phase 2 init
+   (before fabric router starts in Phase 4). No conflict in normal flow. Would
+   conflict if lite fabric re-initializes after fabric router is running — this
+   doesn't happen in normal operation. Low-priority future fix: migrate
+   ConnectedRiscInterface to TXQ2.
 
 3. **L1 overlap**: Fabric router's L1 must not extend into 0x62000-0x70000 (lite
-   fabric region). Verify via `MEM_ERISC_MAX_SIZE < 0x62000` (currently ~0x61260).
+   fabric region). Currently safe: `MEM_ERISC_MAX_SIZE` is ~0x61260. Monitor if
+   fabric router grows.
 
 4. **NOC contention**: Both ERISCs share NOC0. Lite fabric uses per-TRID barriers
-   and sentinel-based reads to avoid counter interference. Fabric router also uses
-   NOC0 but with different TRIDs (0-7). Verify no overlap.
+   (TRIDs 8-15) and sentinel-based reads to avoid counter interference with
+   fabric router (TRIDs 0-7). No overlap verified.
+
+5. **ERISC0 killed at boot**: ERISC1 kills ERISC0 at boot (local store to 0x46800)
+   to prevent TXQ0 contention during init-fsm. ERISC0 remains in reset until
+   Phase 3 (remote FW) or Phase 4 (configure_fabric on MMIO) relaunches it.
+   During Phase 2→4 window, no fabric router traffic exists — the periodic
+   keepalive on TXQ2 prevents ETH link timeout.
+
+
+IMPORTANT:
+You need to make sure lite_fabric deployment is working first across at least 8 total devices (there are at least 7 remote for you to used cabled up)
+Then you need to make sure fabric router is working across those ETH tiles for all ERISC0s in tandem with the lite fabric logic.
+
+Use for context the commit "working!" for single ttnn.open_device bringup. That successfully loaded lite_fabric across all remote chips and should be used as a baseline/reference for debugging why lite fabric is not working for n-hop. Study it carefully when you need to. Lite fabric should be fully deployed before you go on to fabric router for maximum simplicity. You must be very attentive to the lite fabric setup/bringup across n-hop devices, as even the slightest mistake can lead to a hang. This lite fabric will be a persistant control plane once set up -- ideally all through TXQ2.
+
+YOU REALLY DO WANT TXQ2 AFTER YOU REACH STEADY STATE (AFTER ALL LITE FABRIC IS SET UP BUT BEFORE FABRIC ROUTER IS LAUNCHED)

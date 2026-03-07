@@ -70,12 +70,13 @@ constexpr uint32_t CHANNEL_BUFFER_SIZE = 2048 + ALIGNMENT_BUFFER_SIZE + sizeof(l
 constexpr size_t RECEIVER_CHANNEL_BASE_ID = NUM_SENDER_CHANNELS;
 constexpr size_t SENDER_CHANNEL_BASE_ID = 0;
 
-// Lite fabric uses TXQ2 so it can coexist with the fabric router (ERISC0)
-// which uses TXQ0 (sender) and TXQ1 (receiver).  ETH_TXQ_CMD_START_REG
-// (remote register writes) is TXQ0-only, so WRITE_REG is handled by the
-// receiver doing a local RISC-V store instead of the sender using
-// eth_write_remote_reg.
-constexpr uint32_t DEFAULT_ETH_TXQ = 2;
+// Lite fabric uses TXQ0 (ERISC0 is killed at boot, so no contention).
+// TODO: Move to TXQ2 for coexistence with fabric router (ERISC0) once
+// TXQ2 DATA frame delivery issues are resolved.
+// ETH_TXQ_CMD_START_REG (remote register writes) is TXQ0-only, so
+// WRITE_REG is handled by the receiver doing a local RISC-V store
+// instead of the sender using eth_write_remote_reg.
+constexpr uint32_t DEFAULT_ETH_TXQ = 0;
 constexpr bool multi_txq_enabled = false;
 constexpr uint32_t sender_txq_id = DEFAULT_ETH_TXQ;
 constexpr uint32_t receiver_txq_id = DEFAULT_ETH_TXQ;
@@ -86,7 +87,9 @@ constexpr std::array<size_t, NUM_RECEIVER_CHANNELS> to_sender_remote_completion_
 constexpr std::array<size_t, NUM_RECEIVER_CHANNELS> to_sender_remote_ack_counter_addrs = {0, 0};
 
 #if defined(KERNEL_BUILD) || defined(FW_BUILD)
-constexpr uint8_t local_chip_data_cmd_buf = BRISC_WR_CMD_BUF;
+// ERISC1 uses NOC cmd buffer 2 for writes (DYNAMIC_NOC_NCRISC_WR_CMD_BUF)
+// to avoid contention with ERISC0's cmd buffer 0 (BRISC_WR_CMD_BUF).
+constexpr uint8_t local_chip_data_cmd_buf = DYNAMIC_NOC_NCRISC_WR_CMD_BUF;
 #endif
 
 // Default NoC to use for Reads/Writes

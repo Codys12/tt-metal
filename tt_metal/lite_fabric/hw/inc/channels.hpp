@@ -57,6 +57,25 @@ FORCE_INLINE auto& get_trid_tracker() {
 // Count of TXQ0 recoveries during the main loop (diagnostic)
 extern uint32_t txq_recovery_count;
 
+// Ch1 reverse forwarding: downstream sender writes responses to the upstream_rx's
+// ch1 sender buffer and signals via this mailbox.  The upstream_rx polls it and
+// updates h2d_ch1.sender so run_sender_channel_step<1> picks up the response.
+// Must be 16B-aligned for NOC writes and in L1 SRAM (BSS) for NOC DMA.
+extern volatile uint32_t ch1_fwd_mailbox[4];
+// Tracks which ch1 sender buffer slot on the upstream_rx to write to next.
+extern uint8_t ch1_reverse_wr_idx;
+
+// L1-based notification counters — replaces stream register COMMAND frames.
+// ETH_TXQ_CMD_START_REG is TXQ0-only on BH (see risc_interface.hpp k_Txq).
+// Lite fabric uses TXQ2, so notifications are sent as DATA frames to these
+// L1 counters instead.  Must be in L1 SRAM (BSS), NOT on the stack (DMEM).
+extern volatile uint32_t pkts_sent_notify[2][4];       // sender→receiver: "packets sent"
+extern volatile uint32_t pkts_completed_notify[2][4];  // receiver→sender: "packets completed"
+extern uint32_t pkts_sent_writer[2];                   // sender-side monotonic counter
+extern uint32_t pkts_completed_writer[2];              // receiver-side monotonic counter
+extern uint32_t pkts_sent_reader[2];                   // receiver-side last-seen value
+extern uint32_t pkts_completed_reader[2];              // sender-side last-seen value
+
 // Bounded wait for TXQ to be ready, with recovery if stuck.
 // TXQ can get stuck from interrupted DMA operations or transient ETH link
 // issues.  Without recovery, the FW hangs forever in the spin loop.
@@ -85,6 +104,21 @@ FORCE_INLINE bool eth_txq_wait_or_recover(uint32_t txq_id) {
     return !internal_::eth_txq_is_busy(txq_id);
 }
 
+// ERISC1 uses NOC cmd buffers 2 (write) and 3 (read) to avoid contention
+// with ERISC0 (syseng FW or fabric router) which uses cmd buffers 0/1.
+// These match DYNAMIC_NOC_NCRISC_{WR,RD}_CMD_BUF from noc_nonblocking_api.h.
+static constexpr uint32_t LF_RD_CMD_BUF = 3;  // DYNAMIC_NOC_NCRISC_RD_CMD_BUF
+static constexpr uint32_t LF_WR_CMD_BUF = 2;  // DYNAMIC_NOC_NCRISC_WR_CMD_BUF
+
+// NOC async read using cmd buffer 3 (instead of default cmd buffer 1).
+// Same logic as noc_async_read_one_packet but with explicit cmd buffer.
+FORCE_INLINE void lf_noc_async_read(
+    uint64_t src_noc_addr, uint32_t dst_local_l1_addr, uint32_t size, uint8_t noc = noc_index) {
+    while (!noc_cmd_buf_ready(noc, LF_RD_CMD_BUF)) {
+    }
+    ncrisc_noc_fast_read<DM_DEDICATED_NOC>(noc, LF_RD_CMD_BUF, src_noc_addr, dst_local_l1_addr, size);
+}
+
 // Read a 32-bit word from a 16B-aligned L1 address via NOC self-read,
 // bypassing the BH ERISC D-cache.  The D-cache survives soft resets and
 // the CSR 0x7c0 disable only prevents new allocations — stale lines from
@@ -104,11 +138,22 @@ FORCE_INLINE uint32_t noc_self_read_word(uint32_t aligned_l1_addr, uint32_t word
     static volatile uint32_t buf[4] __attribute__((aligned(16)));
     buf[word_index] = SENTINEL;
     uint64_t noc_addr = get_noc_addr(my_x[0], my_y[0], aligned_l1_addr);
-    noc_async_read(noc_addr, reinterpret_cast<uint32_t>(&buf[0]), 16, lite_fabric::edm_to_local_chip_noc);
+    lf_noc_async_read(noc_addr, reinterpret_cast<uint32_t>(&buf[0]), 16, lite_fabric::edm_to_local_chip_noc);
     while (buf[word_index] == SENTINEL) {
         invalidate_l1_cache();
     }
     return buf[word_index];
+}
+
+// Read h2d.sender_host_write_index from a HostToFabricLiteInterface via NOC
+// self-read, bypassing D-cache.  Host writes h2d via PCIe → updates L1 SRAM
+// but NOT D-cache.  h2d is at offset 4 within the 16B-aligned struct, so
+// word_index=1 and the low byte is sender_host_write_index (little-endian).
+template <typename HI>
+FORCE_INLINE uint8_t read_h2d_sender_via_noc(volatile HI* hi) {
+    uint32_t hi_base = reinterpret_cast<uint32_t>(hi) & ~0xFu;
+    uint32_t word = noc_self_read_word(hi_base, 1);
+    return static_cast<uint8_t>(word & 0xFF);
 }
 
 /////////////////////
@@ -149,11 +194,22 @@ FORCE_INLINE void send_next_data(
     // Wait for data send to complete, then notify receiver BEFORE advancing
     // local pointers.  If TXQ is stuck, bail out — pointers haven't advanced,
     // so the same packet will be retried on the next iteration.
-    static constexpr uint32_t packets_to_forward = 1;
     if (!eth_txq_wait_or_recover(sender_txq_id)) {
         return;
     }
-    remote_update_ptr_val<to_receiver_pkts_sent_ids[CHANNEL_INDEX], sender_txq_id>(packets_to_forward);
+    // Send packet arrival notification via DATA frame to receiver's L1 counter.
+    // ETH_TXQ_CMD_START_REG (COMMAND frame) is TXQ0-only on BH, so we write
+    // a monotonic counter to a known L1 address instead of
+    // remote_update_ptr_val (which sends a COMMAND frame).
+    {
+        static volatile uint32_t sent_notify_scratch[4] __attribute__((aligned(16)));
+        sent_notify_scratch[0] = ++pkts_sent_writer[CHANNEL_INDEX];
+        internal_::eth_send_packet_bytes_unsafe(
+            sender_txq_id,
+            reinterpret_cast<uint32_t>(&sent_notify_scratch[0]),
+            reinterpret_cast<uint32_t>(&pkts_sent_notify[CHANNEL_INDEX][0]),
+            16);
+    }
 
     auto& send_hi = get_host_interface_ref<CHANNEL_INDEX>();
     send_hi.d2h.fabric_sender_channel_index =
@@ -175,7 +231,16 @@ FORCE_INLINE void run_sender_channel_step() {
     auto& remote_receiver_channel = remote_receiver_channels.template get<CHANNEL_INDEX>();
     auto& sender_hi = get_host_interface_ref<CHANNEL_INDEX>();
     bool receiver_has_space_for_packet = outbound_to_receiver_channel_pointers.has_space_for_packet();
-    bool has_unsent_packet = sender_hi.h2d.sender_host_write_index != sender_hi.d2h.fabric_sender_channel_index;
+    // Channel 0: host writes h2d via PCIe → must NOC self-read to bypass D-cache.
+    // Channel 1: FW writes h2d locally (RISC-V store in NOC_READ handler) → D-cache
+    // has the latest value; NOC self-read would miss write-back data still in cache.
+    uint8_t h2d_sender;
+    if constexpr (CHANNEL_INDEX == 1) {
+        h2d_sender = sender_hi.h2d.sender_host_write_index;
+    } else {
+        h2d_sender = read_h2d_sender_via_noc(&sender_hi);
+    }
+    bool has_unsent_packet = h2d_sender != sender_hi.d2h.fabric_sender_channel_index;
     bool can_send = receiver_has_space_for_packet && has_unsent_packet;
 
     if (can_send) {
@@ -183,11 +248,17 @@ FORCE_INLINE void run_sender_channel_step() {
             local_sender_channel, outbound_to_receiver_channel_pointers, remote_receiver_channel);
     }
 
-    // Process COMPLETIONs from receiver
-    int32_t completions_since_last_check = get_ptr_val(to_sender_pkts_completed_ids[CHANNEL_INDEX]);
-    if (completions_since_last_check) {
-        outbound_to_receiver_channel_pointers.num_free_slots += completions_since_last_check;
-        increment_local_update_ptr_val(to_sender_pkts_completed_ids[CHANNEL_INDEX], -completions_since_last_check);
+    // Process COMPLETIONs from receiver via L1 counter (replaces stream register).
+    // Must use noc_self_read_word() to bypass D-cache (same reason as pkts_sent_notify above).
+    {
+        uint32_t current_completed =
+            noc_self_read_word(reinterpret_cast<uint32_t>(&pkts_completed_notify[CHANNEL_INDEX][0]), 0);
+        int32_t completions_since_last_check =
+            static_cast<int32_t>(current_completed - pkts_completed_reader[CHANNEL_INDEX]);
+        if (completions_since_last_check > 0) {
+            outbound_to_receiver_channel_pointers.num_free_slots += completions_since_last_check;
+            pkts_completed_reader[CHANNEL_INDEX] = current_completed;
+        }
     }
 }
 
@@ -352,7 +423,7 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
                         resync_buf[word_offset] = RESYNC_SENTINEL;
                         uint64_t upstream_h2d_noc = get_noc_addr(
                             forwarding_config->downstream_noc_x, forwarding_config->downstream_noc_y, aligned_addr);
-                        noc_async_read(
+                        lf_noc_async_read(
                             upstream_h2d_noc,
                             reinterpret_cast<uint32_t>(&resync_buf[0]),
                             16,
@@ -449,25 +520,41 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
                     diag_map->config.padding1[1] = static_cast<uint32_t>(src_address);
                     diag_map->config.padding1[2] = static_cast<uint32_t>(src_address >> 32);
 
-                    // Sentinel-based read barrier: ERISC0 and ERISC1 share NOC0 HW
-                    // read counters, so we use sentinel polling instead of
-                    // ncrisc_noc_reads_flushed().
-                    volatile uint32_t* sentinel_ptr = reinterpret_cast<volatile uint32_t*>(payload_dst_address);
-                    constexpr uint32_t SENTINEL = 0xFACECA5E;
-                    *sentinel_ptr = SENTINEL;
+                    // NOC read completion barrier using cmd buf ready check.
+                    // ERISC0 and ERISC1 share NOC0 HW read counters, so
+                    // ncrisc_noc_reads_flushed() is unsafe.  We use ERISC1's
+                    // dedicated cmd buf 3 (LF_RD_CMD_BUF) — once the cmd buf
+                    // is no longer busy, the read response has been fully
+                    // written to L1.  Unlike sentinel-based polling, this does
+                    // NOT go through D-cache (cmd buf status is an MMIO register
+                    // at 0xFFBxxxxx, not L1 SRAM).
+                    //
+                    // Note: we DON'T use sentinel-based polling because volatile
+                    // reads of the payload address go through D-cache.  The NOC
+                    // DMA write updates L1 SRAM but does NOT snoop-invalidate
+                    // the D-cache, so the stale sentinel would be read forever.
 
                     // Resync SW counter for bookkeeping (not used for barrier)
                     noc_reads_num_issued[noc_index] = NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_RESP_RECEIVED);
 
-                    noc_async_read(src_address, payload_dst_address, payload_size_bytes, noc_index);
+                    lf_noc_async_read(src_address, payload_dst_address, payload_size_bytes, noc_index);
 
                     bool read_completed = false;
                     {
                         constexpr uint32_t k_MaxBarrierIters = 5000000;
                         for (uint32_t i = 0; i < k_MaxBarrierIters; i++) {
-                            if (*sentinel_ptr != SENTINEL) {
+                            if (noc_cmd_buf_ready(noc_index, LF_RD_CMD_BUF)) {
                                 read_completed = true;
                                 break;
+                            }
+                            // Software keepalive: this loop can block for millions of
+                            // iterations during slow NOC reads.  Send a DATA frame every
+                            // ~64K iterations to prevent BH MAC RX timeout (~300ms).
+                            if ((i & 0xFFFF) == 0 && i > 0) {
+                                auto* diag = reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(
+                                    LITE_FABRIC_CONFIG_START);
+                                auto addr = reinterpret_cast<uintptr_t>(&diag->config.primary_local_handshake);
+                                internal_::eth_send_packet<false>(DEFAULT_ETH_TXQ, addr >> 4, addr >> 4, 1);
                             }
                         }
                         invalidate_l1_cache();
@@ -482,11 +569,77 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
                         host_interface_ch1->h2d.sender_host_write_index =
                             tt::tt_fabric::wrap_increment<SENDER_NUM_BUFFERS_ARRAY[1]>(
                                 host_interface_ch1->h2d.sender_host_write_index);
+                        // Keep ch1_fwd_mailbox in sync with h2d.sender.  On upstream_rx
+                        // cores with forwarding active (!cached_is_reverse_relay), the
+                        // ch1 mailbox polling in service_lite_fabric reads ch1_fwd_mailbox
+                        // and SETS h2d.sender to that value.  Without this sync, a direct
+                        // NOC read (advancing h2d.sender) is reverted by the polling code
+                        // reading the stale mailbox value (still 0 from BSS init), causing
+                        // the ch1 sender to never pick up the response.
+                        ch1_fwd_mailbox[0] = host_interface_ch1->h2d.sender_host_write_index;
                     }
                     // else: read timed out, don't signal — host will time out too
                 }
                 // else: real MMIO chip without forwarding — host reads from receiver buffer directly
-            }  // if constexpr (CHANNEL_INDEX == 0)
+            } else if constexpr (CHANNEL_INDEX == 1) {
+                // Ch1 reverse forwarding: a read response arrived on ch1 from the
+                // 2-hop target.  Forward it to the upstream_rx's ch1 sender buffer
+                // via intra-chip NOC write so the upstream_rx can send it back to
+                // the MMIO ch1 receiver for the host to read.
+                if (forwarding_downstream_wr_idx != 0xFF && cached_is_reverse_relay) {
+                    // Compute upstream_rx ch1 sender buffer slot address.
+                    // FabricLiteMemoryMap is at the same L1 address on all ERISC1 cores.
+                    constexpr uint32_t kCh1SenderBufBase =
+                        LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteMemoryMap, sender_ch1_buffer);
+                    uint32_t upstream_buf = kCh1SenderBufBase + ch1_reverse_wr_idx * CHANNEL_BUFFER_SIZE;
+                    uint64_t upstream_noc_addr = get_noc_addr(
+                        forwarding_config->downstream_noc_x, forwarding_config->downstream_noc_y, upstream_buf);
+
+                    // Copy the full response packet to upstream sender buffer
+                    uint32_t total_size =
+                        sizeof(lite_fabric::FabricLiteHeader) + header.unaligned_offset + payload_size_bytes;
+                    total_size = (total_size + 15) & ~15;
+                    noc_async_write_one_packet_with_trid<true, false>(
+                        reinterpret_cast<uint32_t>(packet_start),
+                        upstream_noc_addr,
+                        total_size,
+                        transaction_id,
+                        lite_fabric::local_chip_data_cmd_buf,
+                        lite_fabric::edm_to_local_chip_noc,
+                        lite_fabric::forward_and_local_write_noc_vc);
+                    while (!ncrisc_noc_nonposted_write_with_transaction_id_sent(
+                        lite_fabric::edm_to_local_chip_noc, transaction_id)) {
+                        invalidate_l1_cache();
+                    }
+
+                    // Signal upstream via ch1_fwd_mailbox (16B-aligned BSS variable)
+                    uint8_t new_ch1_wr = lite_fabric::wrap_increment<SENDER_NUM_BUFFERS_ARRAY[1]>(ch1_reverse_wr_idx);
+                    volatile uint32_t* ch1_scratch =
+                        reinterpret_cast<volatile uint32_t*>(reinterpret_cast<uint32_t>(packet_start) + total_size);
+                    ch1_scratch[0] = static_cast<uint32_t>(new_ch1_wr);
+                    ch1_scratch[1] = 0;
+                    ch1_scratch[2] = 0;
+                    ch1_scratch[3] = 0;
+                    asm volatile("fence w,w" ::: "memory");
+                    uint32_t mailbox_l1 = reinterpret_cast<uint32_t>(&ch1_fwd_mailbox[0]);
+                    uint64_t mailbox_noc = get_noc_addr(
+                        forwarding_config->downstream_noc_x, forwarding_config->downstream_noc_y, mailbox_l1);
+                    noc_async_write_one_packet_with_trid<true, false>(
+                        reinterpret_cast<uint32_t>(ch1_scratch),
+                        mailbox_noc,
+                        16,
+                        transaction_id,
+                        lite_fabric::local_chip_data_cmd_buf,
+                        lite_fabric::edm_to_local_chip_noc,
+                        lite_fabric::forward_and_local_write_noc_vc);
+                    while (!ncrisc_noc_nonposted_write_with_transaction_id_sent(
+                        lite_fabric::edm_to_local_chip_noc, transaction_id)) {
+                        invalidate_l1_cache();
+                    }
+
+                    ch1_reverse_wr_idx = new_ch1_wr;
+                }
+            }  // if constexpr (CHANNEL_INDEX == 0 / 1)
         } break;
 
         case lite_fabric::NocSendTypeEnum::WRITE_REG: {
@@ -511,9 +664,15 @@ FORCE_INLINE void run_receiver_channel_step() {
     auto& local_sender_channel = lite_fabric::local_sender_channels.template get<CHANNEL_INDEX>();
     auto& remote_receiver_channel = remote_receiver_channels.template get<CHANNEL_INDEX>();
     auto& trid_tracker = get_trid_tracker<CHANNEL_INDEX>();
-    auto pkts_received_since_last_check = get_ptr_val<to_receiver_pkts_sent_ids[CHANNEL_INDEX]>();
+    // Check for new packets from remote sender via L1 counter (replaces stream register).
+    // Must use noc_self_read_word() to bypass BH ERISC D-cache: data_init() zeroes BSS
+    // (populating D-cache with zeros), then CSR 0x7c0 prevents new allocations but keeps
+    // existing lines.  ETH DMA writes update L1 SRAM but do NOT snoop-invalidate the
+    // D-cache, so volatile reads return stale zeros forever.
+    uint32_t current_sent = noc_self_read_word(reinterpret_cast<uint32_t>(&pkts_sent_notify[CHANNEL_INDEX][0]), 0);
+    int32_t pkts_received_since_last_check = static_cast<int32_t>(current_sent - pkts_sent_reader[CHANNEL_INDEX]);
     auto& wr_sent_counter = receiver_channel_pointers.wr_sent_counter;
-    bool unwritten_packets = pkts_received_since_last_check != 0;
+    bool unwritten_packets = pkts_received_since_last_check > 0;
 
     if (unwritten_packets) {
         invalidate_l1_cache();
@@ -528,7 +687,7 @@ FORCE_INLINE void run_receiver_channel_step() {
             packet_header, packet_header->payload_size_bytes, trid, local_sender_channel);
 
         wr_sent_counter.increment();
-        increment_local_update_ptr_val<to_receiver_pkts_sent_ids[CHANNEL_INDEX]>(-1);
+        pkts_sent_reader[CHANNEL_INDEX]++;
     }
 
     // flush and completion are fused, so we only need to update one of the counters
@@ -551,7 +710,16 @@ FORCE_INLINE void run_receiver_channel_step() {
         if (!eth_txq_wait_or_recover(DEFAULT_ETH_TXQ)) {
             return;
         }
-        remote_update_ptr_val<DEFAULT_ETH_TXQ>(to_sender_pkts_completed_ids[CHANNEL_INDEX], 1);
+        // Send completion notification via DATA frame to sender's L1 counter.
+        {
+            static volatile uint32_t comp_notify_scratch[4] __attribute__((aligned(16)));
+            comp_notify_scratch[0] = ++pkts_completed_writer[CHANNEL_INDEX];
+            internal_::eth_send_packet_bytes_unsafe(
+                DEFAULT_ETH_TXQ,
+                reinterpret_cast<uint32_t>(&comp_notify_scratch[0]),
+                reinterpret_cast<uint32_t>(&pkts_completed_notify[CHANNEL_INDEX][0]),
+                16);
+        }
 
         trid_tracker.clear_trid_at_buffer_slot(receiver_buffer_index);
         completion_counter.increment();

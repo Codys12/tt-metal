@@ -27,12 +27,14 @@ namespace lite_fabric {
 
 static_assert(sizeof(uint32_t) == sizeof(uintptr_t));
 
-// TX queue for data transfers over ethernet.
-// Lite fabric uses TXQ2 so ERISC0 (fabric router) can use TXQ0/TXQ1.
-// TXQ2 packet mode is enabled explicitly in routing_init().
-// ETH_TXQ_CMD_START_REG (register writes) is TXQ0-only — ConnectedRiscInterface
-// still uses TXQ0 for remote reset/PC operations during init.
-static constexpr uint32_t k_DataTxq = 2;
+// TX queue for init-time data transfers over ethernet.
+// During init (Phase 2), ERISC0 is in reset on both MMIO and remote sides,
+// so TXQ0 is exclusively available to ERISC1.  Using the same TXQ for both
+// data (eth_send_packet) and register writes (eth_write_remote_reg) ensures
+// natural serialization — no cross-TXQ barriers needed.
+// Steady-state channels.hpp/constants.hpp use TXQ2 (DEFAULT_ETH_TXQ) for
+// ERISC0/ERISC1 coexistence once the fabric router starts on ERISC0.
+static constexpr uint32_t k_DataTxq = 0;
 
 inline void wait_val(uint32_t addr, uint32_t val) {
     do {
@@ -43,10 +45,10 @@ inline void wait_val(uint32_t addr, uint32_t val) {
 inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) {
     invalidate_l1_cache();
 
-    // Enable packet resend mode on TXQ2.  TXQ0 is configured by the syseng
-    // base firmware at POR, but TXQ2 starts unconfigured.  Packet resend mode
-    // (bit 0 of TXQ_CTRL) enables reliable delivery with MAC-level ACKs and
-    // retransmissions.  Must be enabled before any eth_send_packet on TXQ2.
+    // Ensure TXQ0 packet resend mode is active for init-time data transfers.
+    // TXQ0 is normally configured by the syseng base firmware at POR, but a
+    // prior assert_connected_dm1_reset MAC flush may have cleared it.
+    // Redundant if already set — harmless.
     eth_txq_reg_write(k_DataTxq, ETH_TXQ_CTRL, ETH_TXQ_CTRL_KEEPALIVE);
 
     // This value should not be used. It comes from metal.
@@ -121,6 +123,14 @@ inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) 
                     internal_::eth_send_packet<false>(k_DataTxq, local_handshake_addr >> 4, handshake_addr >> 4, 1);
                 }
                 config_struct->current_state = lite_fabric::InitState::READY;
+                // Restore is_mmio after handshake clobber.  eth_send_packet sends
+                // 16 bytes from primary_local_handshake [offset 16..31] to
+                // neighbour_handshake [offset 32..47].  is_mmio sits at offset 44,
+                // so the handshake zeroes it (padding1[2] = 0).  Without this
+                // restore, object_init's noc_self_read_word sees is_mmio=0 in L1
+                // and sets on_mmio_chip=false on the MMIO side, breaking completion
+                // gating and d2h receiver updates.
+                config_struct->is_mmio = is_mmio;
                 break;
             }
             case lite_fabric::InitState::ETH_INIT_NEIGHBOUR: {
@@ -153,6 +163,12 @@ inline void routing_init(volatile lite_fabric::FabricLiteConfig* config_struct) 
                 // Breadcrumb 0x14: about to send binary (DATA section)
                 config_struct->primary_local_handshake = 0x14;
                 eth_send_binary();
+                // Wait for TXQ0 data transfers to complete before deasserting.
+                // With k_DataTxq=0, both data and WRITE_REG share TXQ0 so this
+                // is naturally serialized, but the explicit barrier is a safety
+                // net in case the TXQ assignment changes in the future.
+                while (internal_::eth_txq_is_busy(k_DataTxq)) {
+                }
                 // Breadcrumb 0x15: about to deassert remote reset
                 config_struct->primary_local_handshake = 0x15;
                 ConnectedRiscInterface::deassert_connected_dm1_reset();

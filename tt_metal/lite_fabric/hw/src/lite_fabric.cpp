@@ -97,6 +97,23 @@ uint32_t diag_loop_counter __attribute__((used));
 
 uint32_t txq_recovery_count __attribute__((used));
 
+// L1-based notification counters — replaces stream register COMMAND frames.
+// ETH_TXQ_CMD_START_REG is TXQ0-only on BH, so notifications are sent as
+// DATA frames to these L1 counters instead of COMMAND frame register writes.
+// Must be in L1 SRAM (BSS), NOT on the stack (DMEM), for NOC DMA access.
+volatile uint32_t pkts_sent_notify[2][4] __attribute__((aligned(16), used));
+volatile uint32_t pkts_completed_notify[2][4] __attribute__((aligned(16), used));
+uint32_t pkts_sent_writer[2] __attribute__((used));
+uint32_t pkts_completed_writer[2] __attribute__((used));
+uint32_t pkts_sent_reader[2] __attribute__((used));
+uint32_t pkts_completed_reader[2] __attribute__((used));
+
+// Ch1 reverse forwarding mailbox and write index.
+// The downstream sender writes responses to the upstream_rx's ch1 sender buffer
+// and signals via ch1_fwd_mailbox.  The upstream_rx polls it via noc_self_read.
+volatile uint32_t ch1_fwd_mailbox[4] __attribute__((aligned(16), used));
+uint8_t ch1_reverse_wr_idx __attribute__((used));
+
 // object_init and routing_init are expected to be called before this
 __attribute__((noinline)) void service_lite_fabric() {
     invalidate_l1_cache();
@@ -132,42 +149,39 @@ __attribute__((noinline)) void service_lite_fabric() {
             {
                 constexpr uint32_t routing_enabled_address =
                     LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteConfig, routing_enabled);
+                // Use DEFAULT_ETH_TXQ for steady-state sends.
                 internal_::eth_send_packet<false>(
-                    lite_fabric::k_DataTxq, routing_enabled_address >> 4, routing_enabled_address >> 4, 1);
+                    lite_fabric::DEFAULT_ETH_TXQ, routing_enabled_address >> 4, routing_enabled_address >> 4, 1);
             }
             return;
     }
 
     // Self-healing: if num_free_slots is 0 but there are no pending packets
     // (h2d == d2h), force-init to RECEIVER_NUM_BUFFERS.
+    // Read h2d via NOC self-read to bypass D-cache (host writes via PCIe).
     // Channel 0
     {
         volatile uint32_t* nfs_ptr = &outbound_to_receiver_channel_pointers_tuple.template get<0>().num_free_slots;
-        bool no_pending_packets =
-            host_interface->h2d.sender_host_write_index == host_interface->d2h.fabric_sender_channel_index;
+        uint8_t h2d_s = read_h2d_sender_via_noc(host_interface);
+        bool no_pending_packets = h2d_s == host_interface->d2h.fabric_sender_channel_index;
         if (*nfs_ptr == 0 && no_pending_packets) {
             *nfs_ptr = RECEIVER_NUM_BUFFERS_ARRAY[0];
         }
-    }
-    // Channel 1
-    {
-        volatile uint32_t* nfs_ptr = &outbound_to_receiver_channel_pointers_tuple.template get<1>().num_free_slots;
-        bool no_pending_packets =
-            host_interface_ch1->h2d.sender_host_write_index == host_interface_ch1->d2h.fabric_sender_channel_index;
-        if (*nfs_ptr == 0 && no_pending_packets) {
-            *nfs_ptr = RECEIVER_NUM_BUFFERS_ARRAY[1];
-        }
-    }
-
-    // Defensive: sanitize h2d.sender_host_write_index for both channels
-    {
-        uint8_t h2d_s = host_interface->h2d.sender_host_write_index;
+        // Defensive: sanitize h2d.sender_host_write_index
         if (h2d_s >= SENDER_NUM_BUFFERS_ARRAY[0]) {
             host_interface->h2d.sender_host_write_index = host_interface->d2h.fabric_sender_channel_index;
         }
     }
+    // Channel 1: h2d written by local FW only (NOC_READ handler), so direct
+    // volatile load is correct — NOC self-read would miss write-back cache data.
     {
+        volatile uint32_t* nfs_ptr = &outbound_to_receiver_channel_pointers_tuple.template get<1>().num_free_slots;
         uint8_t h2d_s = host_interface_ch1->h2d.sender_host_write_index;
+        bool no_pending_packets = h2d_s == host_interface_ch1->d2h.fabric_sender_channel_index;
+        if (*nfs_ptr == 0 && no_pending_packets) {
+            *nfs_ptr = RECEIVER_NUM_BUFFERS_ARRAY[1];
+        }
+        // Defensive: sanitize h2d.sender_host_write_index
         if (h2d_s >= SENDER_NUM_BUFFERS_ARRAY[1]) {
             host_interface_ch1->h2d.sender_host_write_index = host_interface_ch1->d2h.fabric_sender_channel_index;
         }
@@ -189,7 +203,7 @@ __attribute__((noinline)) void service_lite_fabric() {
                 uint32_t fwd_l1 = reinterpret_cast<uint32_t>(forwarding_config);
                 fwd_buf[0] = SENTINEL;
                 uint64_t fwd_noc = get_noc_addr(my_x[0], my_y[0], fwd_l1);
-                noc_async_read(
+                lite_fabric::lf_noc_async_read(
                     fwd_noc, reinterpret_cast<uint32_t>(&fwd_buf[0]), 16, lite_fabric::edm_to_local_chip_noc);
                 while (fwd_buf[0] == SENTINEL) {
                     invalidate_l1_cache();
@@ -200,7 +214,7 @@ __attribute__((noinline)) void service_lite_fabric() {
                 fwd_raw[2] = fwd_buf[2];
                 fwd_raw[3] = fwd_buf[3];
             }
-            forwarding_config->initial_wr_idx = host_interface->h2d.sender_host_write_index;
+            forwarding_config->initial_wr_idx = read_h2d_sender_via_noc(host_interface);
         }
     }
 
@@ -215,6 +229,19 @@ __attribute__((noinline)) void service_lite_fabric() {
         }
     }
 
+    // Ch1 mailbox polling: when this core is an upstream_rx (outbound forwarder,
+    // NOT reverse-relay), the downstream sender writes ch1 read responses to our
+    // ch1 sender buffer and signals via ch1_fwd_mailbox.  Update h2d_ch1.sender
+    // so run_sender_channel_step<1> picks up the response and sends it via ETH.
+    if (forwarding_downstream_wr_idx != 0xFF && !cached_is_reverse_relay) {
+        uint32_t mb_l1 = reinterpret_cast<uint32_t>(&ch1_fwd_mailbox[0]);
+        uint32_t word = noc_self_read_word(mb_l1 & ~0xFu, (mb_l1 & 0xFu) / 4);
+        uint8_t mb_val = static_cast<uint8_t>(word & 0xFF);
+        if (mb_val != host_interface_ch1->h2d.sender_host_write_index) {
+            host_interface_ch1->h2d.sender_host_write_index = mb_val;
+        }
+    }
+
     // Run both sender channels before receiver channels so that any pending
     // responses (sender ch1) are flushed before processing new commands
     // (receiver ch0) that may fill more response slots.
@@ -223,23 +250,12 @@ __attribute__((noinline)) void service_lite_fabric() {
     lite_fabric::run_receiver_channel_step<0>();
     lite_fabric::run_receiver_channel_step<1>();
 
-    // Periodic ETH keepalive: send DATA frame to keep ETH link alive.
-    // With full coexistence (ERISC0 running fabric router), this can be
-    // removed since fabric router traffic acts as keepalive.  For now,
-    // keep it as a safety net until full coexistence is confirmed.
-    if ((diag_loop_counter & 0xFFFF) == 0 && diag_loop_counter > 0) {
-        if (!internal_::eth_txq_is_busy(lite_fabric::k_DataTxq)) {
-            uint32_t ka_addr = reinterpret_cast<uint32_t>(&mem_map->config.neighbour_handshake);
-            internal_::eth_send_packet<false>(lite_fabric::k_DataTxq, ka_addr >> 4, ka_addr >> 4, 1);
-        }
-    }
-
     // Diagnostic: write sender ch0 flow-control state
     {
         auto& optr = outbound_to_receiver_channel_pointers_tuple.template get<0>();
         bool has_unsent =
             host_interface->h2d.sender_host_write_index != host_interface->d2h.fabric_sender_channel_index;
-        int32_t completion_reg = get_ptr_val(to_sender_pkts_completed_ids[0]);
+        int32_t completion_reg = static_cast<int32_t>(pkts_completed_notify[0][0] - pkts_completed_reader[0]);
         mem_map->config.primary_local_handshake = (static_cast<uint32_t>(optr.num_free_slots & 0xFF) << 24) |
                                                   (static_cast<uint32_t>(completion_reg & 0xFF) << 16) |
                                                   (static_cast<uint32_t>(has_unsent) << 8) |
@@ -262,6 +278,18 @@ __attribute__((noinline)) void service_lite_fabric() {
         (txq_recovery_count & 0xFFFF) | (static_cast<uint32_t>(cached_is_reverse_relay) << 16);
     // Loop counter so the host can verify firmware is alive
     mem_map->config.neighbour_handshake = ++diag_loop_counter;
+
+    // Software keepalive safety net: BH MAC may time out (~300ms) if ERISC0
+    // stops generating traffic (e.g., during Phase 3 reset/relaunch).  Send a
+    // harmless DATA frame every ~65K iterations as extra insurance.
+    // Use primary_local_handshake region (offsets 16-31: handshake + padding1)
+    // instead of neighbour_handshake — the latter's 16B span covers is_mmio
+    // and initial_state at offsets 44-47, clobbering important config fields.
+    if ((diag_loop_counter & 0xFFFF) == 0) {
+        auto* cfg = &mem_map->config;
+        auto addr = reinterpret_cast<uintptr_t>(&cfg->primary_local_handshake);
+        internal_::eth_send_packet<false>(lite_fabric::DEFAULT_ETH_TXQ, addr >> 4, addr >> 4, 1);
+    }
 }
 
 inline void object_init(volatile lite_fabric::FabricLiteMemoryMap* mem_map) {
@@ -359,41 +387,74 @@ int main() {
     invalidate_l1_cache();
     configure_csr();
 
-    // Put ERISC0 in reset immediately to prevent TXQ0/NOC interference.
-    // On downstream tunnel cores (launched via lite fabric NOC writes to
-    // remote chips), the host's write to the soft reset register at
-    // 0xFFB121B0 is silently dropped because 0xFFBxxxxx debug/control
-    // registers are not reachable via NOC unicast writes.  ERISC0 may
-    // still be running syseng FW from POR, which uses TXQ0 and can
-    // corrupt TXQ0 state when ERISC1 also uses it, causing a permanent
-    // hardware hang (register read stall).  This local RISC-V store
-    // writes directly to the tile's own register — no NOC needed.
-    // Safe on all cores: MMIO-side and 1-hop remote cores already have
-    // ERISC0 in reset, so this is a no-op for them.
+    // Disable L1 data cache allocations BEFORE data_init and ERISC0 kill.
+    // data_init() zeroes BSS via RISC-V stores.  With the D-cache in normal
+    // allocating mode, each store creates a D-cache line.  Later, ETH DMA
+    // reads from L1 SRAM (NOT D-cache), so RISC-V writes to BSS variables
+    // used as ETH DMA sources (sent_notify_scratch, comp_notify_scratch)
+    // would never reach L1 — the ETH DMA reads stale zeros, and remote
+    // receivers never detect incoming packets.
+    //
+    // Setting CSR 0x7c0 bit 3 BEFORE data_init prevents D-cache line
+    // allocation.  All BSS writes (by data_init and the FW) go directly
+    // to L1 SRAM (write miss with no-allocate → write-through to L1).
+    // ETH DMA reads then see the correct values.
+#if defined(ARCH_BLACKHOLE)
+    asm volatile("li t1, 0x8\n\tcsrs 0x7c0, t1" ::: "t1", "memory");
+#endif
+
+    // Kill ERISC0 to prevent TXQ0 contention during init-fsm and steady-state.
+    // ERISC0 syseng FW shares TXQ0 with ERISC1.  With ERISC0 dead, TXQ0 is
+    // exclusively ERISC1's for both init (k_DataTxq=0) and steady-state
+    // (DEFAULT_ETH_TXQ=0).  ERISC0 will be relaunched for fabric router
+    // (Phase 3/4); NOC cmd buffer contention is prevented by ERISC1 using
+    // cmd buffers 2/3 (vs ERISC0's 0/1).
     {
         constexpr uint32_t kSoftResetAddr = 0xFFB121B0;
-        // 0x46800 = ERISC1 running (bit 12 clear), ERISC0 in reset (bit 11),
-        // plus bits 13, 14, 18 for other processor resets (standard for ETH tiles).
-        *reinterpret_cast<volatile uint32_t*>(kSoftResetAddr) = 0x46800;
-        // Immediately enable TXQ0 KEEPALIVE after ERISC0 kill.
-        *reinterpret_cast<volatile uint32_t*>(0xFFB90000) = 0x1;
-        // Brief delay for ERISC0's in-flight TXQ0 operations to drain.
+        *reinterpret_cast<volatile uint32_t*>(kSoftResetAddr) = 0x46800;  // ERISC0 in reset
+        *reinterpret_cast<volatile uint32_t*>(0xFFB90000) = 0x1;          // TXQ0 enable
         for (volatile uint32_t i = 0; i < 50000; i++) {
-        }
+        }  // Wait for reset
     }
 
     noc_index = NOC_INDEX;
     lite_fabric::data_init();
 
-    // Disable L1 data cache as early as possible.
-#if defined(ARCH_BLACKHOLE)
-    asm volatile("li t1, 0x8\n\tcsrs 0x7c0, t1" ::: "t1", "memory");
-#endif
-
     risc_init();
     noc_init(MEM_LITE_FABRIC_NOC_ATOMIC_RET_VAL_ADDR);
     for (uint32_t n = 0; n < NUM_NOCS; n++) {
         noc_local_state_init(n);
+    }
+
+    // Initialize NOC cmd buffers 2 (write) and 3 (read) for ERISC1.
+    // ERISC0 uses cmd buffers 0/1, ERISC1 uses 2/3 to avoid contention.
+    // Mirror noc_init() setup for cmd buffers 0/1 onto 2/3.
+    {
+        for (uint32_t n = 0; n < NUM_NOCS; n++) {
+            uint32_t noc_id_reg = NOC_CMD_BUF_READ_REG(n, 0, NOC_CFG(NOC_ID_LOGICAL));
+            uint32_t mx = noc_id_reg & NOC_NODE_ID_MASK;
+            uint32_t my_noc = (noc_id_reg >> NOC_ADDR_NODE_ID_BITS) & NOC_NODE_ID_MASK;
+            uint64_t xy_local = NOC_XY_ADDR(mx, my_noc, 0);
+
+            // Cmd buf 3 (read): same as cmd buf 1 in noc_init()
+            uint32_t noc_rd_cmd_field =
+                NOC_CMD_CPY | NOC_CMD_RD | NOC_CMD_RESP_MARKED | NOC_CMD_VC_STATIC | NOC_CMD_STATIC_VC(1);
+            NOC_CMD_BUF_WRITE_REG(n, lite_fabric::LF_RD_CMD_BUF, NOC_CTRL, noc_rd_cmd_field);
+            NOC_CMD_BUF_WRITE_REG(n, lite_fabric::LF_RD_CMD_BUF, NOC_RET_ADDR_MID, 0x0);
+            NOC_CMD_BUF_WRITE_REG(
+                n,
+                lite_fabric::LF_RD_CMD_BUF,
+                NOC_RET_ADDR_COORDINATE,
+                (uint32_t)(xy_local >> NOC_ADDR_COORD_SHIFT) & NOC_COORDINATE_MASK);
+
+            // Cmd buf 2 (write): same as cmd buf 0 in noc_init()
+            NOC_CMD_BUF_WRITE_REG(n, lite_fabric::LF_WR_CMD_BUF, NOC_TARG_ADDR_MID, 0x0);
+            NOC_CMD_BUF_WRITE_REG(
+                n,
+                lite_fabric::LF_WR_CMD_BUF,
+                NOC_TARG_ADDR_COORDINATE,
+                (uint32_t)(xy_local >> NOC_ADDR_COORD_SHIFT) & NOC_COORDINATE_MASK);
+        }
     }
 
     // Drain stale per-TRID HW counters left from a previous ERISC1 incarnation.
@@ -417,6 +478,28 @@ int main() {
                 if (ncrisc_noc_nonposted_write_with_transaction_id_sent(noc, trid)) {
                     break;
                 }
+            }
+        }
+    }
+
+    // Sweep FabricLiteMemoryMap to invalidate stale D-cache lines from previous
+    // FW incarnation.  BH ERISC D-cache is write-back and survives soft resets
+    // and FLR.  CSR 0x7c0 bit 3 prevents NEW allocations but stale dirty lines
+    // from the prior incarnation still accept RISC-V stores (write-back, not
+    // reaching L1).  ETH DMA reads from L1 → sends stale data.  NOC self-read
+    // completions snoop-invalidate D-cache lines.  After this sweep, all RISC-V
+    // stores to FabricLiteMemoryMap go directly to L1 (write miss, no allocate).
+    {
+        constexpr uint32_t sweep_start = LITE_FABRIC_CONFIG_START;
+        constexpr uint32_t sweep_size = LITE_FABRIC_CONFIG_SIZE;
+        constexpr uint32_t chunk = 256;
+        constexpr uint8_t noc = lite_fabric::edm_to_local_chip_noc;
+        for (uint32_t off = 0; off < sweep_size; off += chunk) {
+            uint32_t addr = sweep_start + off;
+            uint32_t sz = ((sweep_size - off) < chunk) ? (sweep_size - off) : chunk;
+            uint64_t noc_addr = get_noc_addr(my_x[0], my_y[0], addr);
+            lite_fabric::lf_noc_async_read(noc_addr, addr, sz, noc);
+            while (!noc_cmd_buf_ready(noc, lite_fabric::LF_RD_CMD_BUF)) {
             }
         }
     }
@@ -450,24 +533,46 @@ int main() {
             status = *reinterpret_cast<volatile uint32_t*>(TXQ2_STATUS);
             cmd_ongoing = (status >> 16) & 1;
         }
+    }
 
-        // For non-MMIO cores, send diagnostic breadcrumb to MMIO side on TXQ0.
-        if (!structs->config.is_mmio && !cmd_ongoing) {
-            auto* cfg = &structs->config;
-            auto src_addr = (uintptr_t)&cfg->primary_local_handshake;
-            auto dst_addr = (uintptr_t)&cfg->neighbour_handshake;
-            cfg->primary_local_handshake = 0xA0;  // "Remote alive, TXQ2 OK"
-            cfg->padding1[0] = status;
-            cfg->padding1[1] = ctrl;
-            internal_::eth_send_packet<false>(0, src_addr >> 4, dst_addr >> 4, 1);
+    // Enable TXQ2 packet resend mode.  Harmless when DEFAULT_ETH_TXQ=0;
+    // keeps TXQ2 ready in case future coexistence work moves back to TXQ2.
+    *reinterpret_cast<volatile uint32_t*>(ETH_TXQ0_REGS_START + 2 * ETH_TXQ_REGS_SIZE + ETH_TXQ_CTRL) =
+        ETH_TXQ_CTRL_KEEPALIVE;
+
+    // Clone all configuration registers from TXQ0 to TXQ2.
+    // The POR syseng firmware configures TXQ0 with the correct MAC DA, timeouts,
+    // packet sizes, and pipelining depth.  TXQ2 starts with hardware defaults
+    // (often 0) which can cause silent frame drops.
+    {
+        static constexpr uint32_t regs_to_copy[] = {
+            0x0C,  // MAX_PKT_SIZE_BYTES
+            0x10,  // BURST_LEN
+            0x48,  // REMOTE_SEQ_TIMEOUT
+            0x4C,  // LOCAL_SEQ_UPDATE_TIMEOUT
+            0x50,  // DEST_MAC_ADDR_HI
+            0x54,  // DEST_MAC_ADDR_LO
+            0x58,  // SRC_MAC_ADDR_HI
+            0x5C,  // SRC_MAC_ADDR_LO
+            0x60,  // ETH_TYPE
+            0x64,  // MIN_PACKET_SIZE_WORDS
+            0x6C,  // DATA_PACKET_ACCEPT_AHEAD
+            0x80,  // TXPKT_CFG_SEL_SW
+            0x84,  // TXPKT_CFG_SEL_HW
+        };
+        for (uint32_t reg : regs_to_copy) {
+            eth_txq_reg_write(2, reg, eth_txq_reg_read(0, reg));
         }
     }
 
-    // Enable TXQ2 packet resend mode.  Also enable TXQ0 for the init
-    // handshake (ConnectedRiscInterface uses TXQ0 for ETH_TXQ_CMD_START_REG).
-    *reinterpret_cast<volatile uint32_t*>(ETH_TXQ0_REGS_START + ETH_TXQ_CTRL) = ETH_TXQ_CTRL_KEEPALIVE;
-    *reinterpret_cast<volatile uint32_t*>(ETH_TXQ0_REGS_START + 2 * ETH_TXQ_REGS_SIZE + ETH_TXQ_CTRL) =
-        ETH_TXQ_CTRL_KEEPALIVE;
+    // Diagnostic breadcrumb: send on TXQ2 (now configured) for non-MMIO cores.
+    if (!structs->config.is_mmio) {
+        auto* cfg = &structs->config;
+        auto src_addr = (uintptr_t)&cfg->primary_local_handshake;
+        auto dst_addr = (uintptr_t)&cfg->neighbour_handshake;
+        cfg->primary_local_handshake = 0xA0;  // "Remote alive, TXQ2 OK"
+        internal_::eth_send_packet<false>(lite_fabric::DEFAULT_ETH_TXQ, src_addr >> 4, dst_addr >> 4, 1);
+    }
 
     lite_fabric::object_init(structs);
     lite_fabric::routing_init(&structs->config);

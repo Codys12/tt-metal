@@ -170,17 +170,24 @@ struct HostToFabricLiteInterface {
         volatile uint8_t receiver_host_read_index = 0;
     } __attribute((packed)) h2d;
 
-    // Host only fields
+    // Host only fields — must match UMD HostToLiteFabricInterface layout exactly
+    // so that sizeof() is identical and host_interface_ch1 offset matches.
     uint32_t host_interface_on_device_addr = 0;
     uint32_t sender_channel_base = 0;
     uint32_t receiver_channel_base = 0;
     uint32_t eth_barrier_addr = 0;
     uint32_t tensix_barrier_addr = 0;
-    uint32_t l1_alignment_bytes = 0;  // Assumed to be 16B
+    uint32_t l1_alignment_bytes = 0;
+    uint32_t config_on_device_addr = 0;  // UMD: diagnostic readback address
     // The core to process requests
     uint32_t mmio_device_id = 0;
     uint32_t mmio_eth_core_x = 0;
     uint32_t mmio_eth_core_y = 0;
+    // Padding to match UMD-only fields: TTDevice*(8) + num_hops(4) +
+    // read_event_counter(8) + receiver_host_interface_on_device_addr(4) +
+    // recv_ch1(2) = 26 bytes.  These are host-only but their presence in the
+    // struct affects sizeof() which determines host_interface_ch1 offset.
+    uint8_t _umd_compat_pad[26]{};
 
     explicit HostToFabricLiteInterface() = default;
 

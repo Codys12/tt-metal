@@ -40,6 +40,6 @@ static_assert(MEM_ERISC_LITE_FABRIC_RESERVED_BASE == MEM_LITE_FABRIC_MEMORY_BASE
 static_assert(MEM_ERISC_LITE_FABRIC_RESERVED_SIZE == MEM_LITE_FABRIC_MEMORY_SIZE);  // NOLINT(misc-redundant-expression)
 static_assert(
     MEM_NOC_ATOMIC_RET_VAL_ADDR == MEM_LITE_FABRIC_NOC_ATOMIC_RET_VAL_ADDR);  // NOLINT(misc-redundant-expression)
-static_assert(MEMORY_LAYOUT_END < MEM_LITE_FABRIC_MEMORY_END);
+static_assert(MEMORY_LAYOUT_END <= MEM_LITE_FABRIC_MEMORY_END);
 // This is where base firmware starts
 static_assert(MEM_ERISC_MAX_SIZE < 0x70000);

@@ -130,6 +130,11 @@ std::vector<DiscoveredChipInfo> discover_nhop_chips(
     for (ChipId cid : cluster_desc->get_all_chips()) {
         next_chip_id = std::max(next_chip_id, cid + 1);
     }
+    // Also account for chips in the UMD driver that may have been removed from
+    // the descriptor (e.g., unreachable chips from a previous init cycle).
+    for (ChipId cid : driver->get_target_device_ids()) {
+        next_chip_id = std::max(next_chip_id, cid + 1);
+    }
 
     std::vector<DiscoveredChipInfo> all_discovered;
     std::set<ChipId> current_frontier = frontier_chips;
@@ -341,19 +346,28 @@ std::vector<DiscoveredChipInfo> discover_nhop_chips(
                 // Record ethernet connections (bidirectional)
                 cluster_desc->add_ethernet_connection(chip_id, static_cast<uint32_t>(chan), new_chip_id, remote_eth_id);
 
-                // Create a RemoteChip in UMD with the gateway's ETH channels
-                auto gateway_channels = cluster_desc->get_active_eth_channels(gateway_id);
-                if (gateway_channels.empty()) {
-                    gateway_channels = cluster_desc->get_idle_eth_channels(gateway_id);
-                }
-                auto proxy_soc_desc = driver->get_soc_descriptor(gateway_id);
-                driver->register_remote_chip(new_chip_id, gateway_id, gateway_channels, proxy_soc_desc);
+                // Create a RemoteChip in UMD with the gateway's ETH channels.
+                // On reinit, the chip may already exist in the driver (if it was
+                // discovered in a previous init cycle but later removed from the
+                // cluster descriptor as unreachable).  In that case, reuse the
+                // existing driver entry.
+                if (!driver->get_target_device_ids().count(new_chip_id)) {
+                    auto gateway_channels = cluster_desc->get_active_eth_channels(gateway_id);
+                    if (gateway_channels.empty()) {
+                        gateway_channels = cluster_desc->get_idle_eth_channels(gateway_id);
+                    }
+                    auto proxy_soc_desc = driver->get_soc_descriptor(gateway_id);
+                    driver->register_remote_chip(new_chip_id, gateway_id, gateway_channels, proxy_soc_desc);
 
-                // Add Metal-layer SOC descriptor (proxy from gateway)
-                cluster.add_soc_descriptor(
-                    new_chip_id,
-                    metal_SocDescriptor(
-                        driver->get_soc_descriptor(new_chip_id), cluster_desc->get_board_type(new_chip_id)));
+                    // Add Metal-layer SOC descriptor (proxy from gateway)
+                    cluster.add_soc_descriptor(
+                        new_chip_id,
+                        metal_SocDescriptor(
+                            driver->get_soc_descriptor(new_chip_id), cluster_desc->get_board_type(new_chip_id)));
+                } else {
+                    log_info(
+                        tt::LogMetal, "BFS: chip {} already exists in driver, reusing existing entry", new_chip_id);
+                }
 
                 all_discovered.push_back(DiscoveredChipInfo{
                     .chip_id = new_chip_id,
@@ -463,6 +477,12 @@ void MetalContext::initialize(
     size_t worker_l1_size,
     bool minimal) {
     ZoneScoped;
+
+    log_info(
+        tt::LogMetal,
+        "DEBUG: MetalContext::initialize() called, initialized_={}, force_reinit_={}",
+        initialized_,
+        force_reinit_);
 
     if (cluster_->get_target_device_type() == tt::TargetDevice::Mock) {
         TT_THROW(
@@ -1399,16 +1419,16 @@ void MetalContext::initialize(
                         auto ds_cxy = tt_cxy_pair(
                             static_cast<size_t>(info.intermediate_chip), ds_core_translated.x, ds_core_translated.y);
 
-                        // Assert both ERISCs in reset before writing config/binary.
-                        // RiscType::ALL_TENSIX doesn't include ERISC bits on BH, so
-                        // write the soft reset register directly.  On reinit, ERISC1
-                        // may still be running from the previous iteration; failing to
-                        // reset it corrupts forwarding_downstream_wr_idx (lazy-init
-                        // sentinel 0xFF is never restored) and causes 2-hop read
-                        // response loss.
+                        // Reset ERISC1 only (keep ERISC0 running for ETH keepalive).
+                        // On reinit, ERISC1 may still be running the old downstream
+                        // sender FW; resetting it prevents stale FW from corrupting
+                        // the config/binary we're about to write.  ERISC0 stays alive
+                        // so the ETH MAC link doesn't time out during the multi-hop
+                        // write sequence (which can take >1s through 3+ hops).
                         constexpr uint32_t kSoftResetAddr = 0xFFB121B0;
-                        constexpr uint32_t kBothEriscsInReset = 0x47800;
-                        cluster_->write_core(&kBothEriscsInReset, sizeof(kBothEriscsInReset), ds_cxy, kSoftResetAddr);
+                        constexpr uint32_t kErisc1InResetErisc0Running = 0x47000;
+                        cluster_->write_core(
+                            &kErisc1InResetErisc0Running, sizeof(kErisc1InResetErisc0Running), ds_cxy, kSoftResetAddr);
 
                         // Zero entire host interface (d2h, pad, AND h2d) on downstream
                         // core.  The FW zeros h2d during object_init, but on reinit
@@ -1418,7 +1438,8 @@ void MetalContext::initialize(
                         uint64_t zero = 0;
                         cluster_->write_core(&zero, sizeof(zero), ds_cxy, host_iface_addr);
 
-                        // Write config and binary
+                        // Write config and binary (ERISC0 still running, these L1
+                        // addresses don't overlap with syseng FW).
                         cluster_->write_core(&ds_config, sizeof(ds_config), ds_cxy, config_addr);
                         cluster_->write_core(binary_data.data(), binary_data.size(), ds_cxy, LITE_FABRIC_TEXT_START);
 
@@ -1432,7 +1453,13 @@ void MetalContext::initialize(
                         // before the config is fully written to L1.
                         cluster_->l1_barrier(info.intermediate_chip);
 
-                        // Deassert ERISC1 on the downstream core (ERISC0 stays in reset)
+                        // Now kill ERISC0 and deassert ERISC1 in quick succession.
+                        // These two writes travel through the same forwarding chain and
+                        // are processed back-to-back on the target chip, minimizing the
+                        // time without ETH keepalive (microseconds vs the ~1.3s it took
+                        // when ERISC0 was killed before the config/binary writes).
+                        constexpr uint32_t kBothEriscsInReset = 0x47800;
+                        cluster_->write_core(&kBothEriscsInReset, sizeof(kBothEriscsInReset), ds_cxy, kSoftResetAddr);
                         constexpr uint32_t kErisc1OutErisc0InReset = 0x46800;
                         cluster_->write_core(
                             &kErisc1OutErisc0InReset, sizeof(kErisc1OutErisc0InReset), ds_cxy, kSoftResetAddr);
@@ -1444,8 +1471,10 @@ void MetalContext::initialize(
                             info.downstream_core_noc0.x,
                             info.downstream_core_noc0.y);
 
-                        // Wait for downstream lite fabric to reach READY
-                        constexpr int k_MaxPolls = 20;
+                        // Wait for downstream lite fabric to reach READY.
+                        // Deeper hops need more time: each hop adds relay latency
+                        // for the config/binary writes and init handshake.
+                        int k_MaxPolls = 20 + 10 * next_hop_level;
                         constexpr int k_PollMs = 100;
                         uint32_t state_addr = config_addr + offsetof(lite_fabric::FabricLiteConfig, current_state);
                         bool ready = false;
@@ -1459,14 +1488,43 @@ void MetalContext::initialize(
                             }
                         }
                         if (!ready) {
+                            // Read diagnostic fields from the downstream core's config
+                            uint32_t diag_state = 0, diag_handshake = 0, diag_loop = 0;
+                            uint32_t diag_routing = 0;
+                            cluster_->read_core(
+                                &diag_state,
+                                sizeof(diag_state),
+                                ds_cxy,
+                                config_addr + offsetof(lite_fabric::FabricLiteConfig, current_state));
+                            cluster_->read_core(
+                                &diag_handshake,
+                                sizeof(diag_handshake),
+                                ds_cxy,
+                                config_addr + offsetof(lite_fabric::FabricLiteConfig, primary_local_handshake));
+                            cluster_->read_core(
+                                &diag_loop,
+                                sizeof(diag_loop),
+                                ds_cxy,
+                                config_addr + offsetof(lite_fabric::FabricLiteConfig, neighbour_handshake));
+                            cluster_->read_core(
+                                &diag_routing,
+                                sizeof(diag_routing),
+                                ds_cxy,
+                                config_addr + offsetof(lite_fabric::FabricLiteConfig, routing_enabled));
                             log_warning(
                                 tt::LogMetal,
                                 "Phase 2b: downstream tunnel on chip {} core ({},{}) failed to reach "
-                                "READY, skipping chip {}",
+                                "READY after {} polls, skipping chip {}. "
+                                "Diagnostics: current_state={}, breadcrumb=0x{:x}, loop_counter={}, routing_enabled={}",
                                 info.intermediate_chip,
                                 info.downstream_core_noc0.x,
                                 info.downstream_core_noc0.y,
-                                info.chip_id);
+                                k_MaxPolls,
+                                info.chip_id,
+                                diag_state,
+                                diag_handshake,
+                                diag_loop,
+                                diag_routing);
                             // Clean up: put ERISC1 back in reset on the failed core
                             cluster_->assert_risc_reset_at_core(ds_cxy, tt::umd::RiscType::ERISC1);
                             continue;
@@ -1907,7 +1965,24 @@ void MetalContext::initialize(
                 // threads.  ETH cores are skipped because ERISC0 is not running on
                 // remote ETH cores (all in POR reset), and the lite fabric ETH core
                 // has ERISC1 actively servicing the link.
-                build_and_init_devices(remote_devices_ordered, /*sequential=*/true, /*skip_eth=*/true);
+                // Process each remote device individually with lite fabric
+                // re-sync between devices.  Multiple N-hop devices share the
+                // same MMIO ETH core (e.g., 2-hop and 4-hop devices both route
+                // through channel 7).  When processed sequentially, each
+                // device's reads advance the device-side ch1 h2d/d2h counters,
+                // leaving the next device's recv_ch1 stale and pointing to the
+                // wrong ch1 receiver buffer slot (0xdeadbeef sentinel timeout).
+                // set_remote_transfer_ethernet_cores re-reads d2h, resets
+                // recv_ch1, and clears stale ch1 sentinels.
+                for (ChipId device_id : remote_devices_ordered) {
+                    auto gateway = cluster_->get_cluster_desc()->get_closest_mmio_capable_chip(device_id);
+                    auto ch_it = remote_chip_eth_channels.find({device_id, gateway});
+                    if (ch_it != remote_chip_eth_channels.end()) {
+                        auto* remote_chip = cluster_->get_driver()->get_remote_chip(device_id);
+                        remote_chip->set_remote_transfer_ethernet_cores(ch_it->second);
+                    }
+                    build_and_init_devices(std::vector<ChipId>{device_id}, /*sequential=*/true, /*skip_eth=*/true);
+                }
                 log_info(tt::LogMetal, "Phase 3: build_and_init_devices complete, launching FW for remote devices");
                 // Skip reset_cores for remote BH chips: their Tensix cores are
                 // already in POR reset, and reset_cores would kill the lite
@@ -1920,6 +1995,14 @@ void MetalContext::initialize(
                 // buffers on the MMIO-side ETH core and are not safe for
                 // concurrent access from multiple threads.
                 for (ChipId device_id : remote_devices_ordered) {
+                    // Re-sync lite fabric interface (same sharing issue as
+                    // build_and_init above — FW launch may read from device).
+                    auto gateway = cluster_->get_cluster_desc()->get_closest_mmio_capable_chip(device_id);
+                    auto ch_it = remote_chip_eth_channels.find({device_id, gateway});
+                    if (ch_it != remote_chip_eth_channels.end()) {
+                        auto* remote_chip = cluster_->get_driver()->get_remote_chip(device_id);
+                        remote_chip->set_remote_transfer_ethernet_cores(ch_it->second);
+                    }
                     log_info(tt::LogMetal, "launch_fw device {} (remote): initialize_and_launch_firmware", device_id);
                     initialize_and_launch_firmware(device_id);
                     log_info(tt::LogMetal, "launch_fw device {} (remote): complete", device_id);
@@ -3445,26 +3528,33 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
 
         bool peer_is_mmio = cluster_->mmio_chip_ids().count(peer_chip) > 0;
 
-        // Check if ERISC1 is running on this core as a lite fabric tunnel
-        // receiver or downstream sender.  For 1-hop links the peer is MMIO,
-        // for N-hop tunnel endpoints (Phase 2b) ERISC1 was launched via the
-        // downstream tunnel handshake, and for downstream senders on
-        // intermediate chips ERISC1 relays packets to the next hop.
-        // We must keep ERISC1 alive when deasserting ERISC0.
-        bool erisc1_running = peer_is_mmio;
-        if (!erisc1_running && lite_fabric_hal_) {
-            for (const auto& t : lite_fabric_hal_->get_system_descriptor().tunnels_from_mmio) {
-                if (t.connected_id == device_id && t.connected_core_logical == logical_core) {
-                    erisc1_running = true;
-                    break;
+        // Per-core ERISC1 detection: ERISC1 only runs on cores that are part
+        // of a lite fabric tunnel (Phase 2 receivers, Phase 2b downstream
+        // senders, and Phase 2b tunnel endpoints).  Non-tunnel cores on remote
+        // chips have ERISC1 in POR reset — deasserting with 0x46000 would
+        // cause ERISC1 to boot from POR RESET_PC (syseng subordinate FW or
+        // garbage), conflicting with ERISC0's fabric router.
+        bool erisc1_running = false;
+        if (lite_fabric_hal_) {
+            // 1. MMIO-peering cores: Phase 2 deployed ERISC1 via ETH_INIT_NEIGHBOUR
+            if (peer_is_mmio) {
+                erisc1_running = true;
+            }
+            // 2. Downstream sender cores: Phase 2b launched ERISC1 explicitly
+            if (downstream_sender_cores_.count({device_id, static_cast<uint32_t>(logical_core.y)})) {
+                erisc1_running = true;
+            }
+            // 3. Tunnel endpoint cores: Phase 2b ETH_INIT_NEIGHBOUR deployed ERISC1
+            if (!erisc1_running) {
+                const auto& tunnels = lite_fabric_hal_->get_system_descriptor().tunnels_from_mmio;
+                for (const auto& t : tunnels) {
+                    if (t.connected_id == device_id &&
+                        static_cast<uint32_t>(t.connected_core_logical.y) == static_cast<uint32_t>(logical_core.y)) {
+                        erisc1_running = true;
+                        break;
+                    }
                 }
             }
-        }
-        // Also check if this core was launched as a downstream sender during
-        // Phase 2b BFS.  These cores have ERISC1 running but are not tracked
-        // as tunnel endpoints (the tunnel endpoint is on the next-hop chip).
-        if (!erisc1_running) {
-            erisc1_running = downstream_sender_cores_.count({device_id, logical_core.y}) > 0;
         }
 
         log_info(
@@ -3478,10 +3568,10 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
             peer_is_mmio,
             erisc1_running);
 
-        // Lite fabric uses TXQ2; fabric router uses TXQ0/TXQ1.  No TXQ
-        // contention — ERISC0 can be deasserted on all cores including those
-        // where ERISC1 runs lite fabric.  The erisc1_running flag is still
-        // needed to select the correct soft reset value (0x46000 vs 0x47000).
+        // WARNING: Lite fabric currently uses TXQ0 (DEFAULT_ETH_TXQ=0); fabric
+        // router also uses TXQ0/TXQ1.  TXQ0 contention risk when both ERISCs
+        // are running on MMIO cores.  The erisc1_running flag is still needed
+        // to select the correct soft reset value (0x46000 vs 0x47000).
 
         // Track MMIO-peering cores where the fabric router is launched.
         // Used by update_lite_fabric_bindings_for_fabric_routers()
@@ -3664,12 +3754,9 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
         //    0xFFBxxxxx tile register space is NOC-addressable, so the lite
         //    fabric receiver can deliver the write to any tile on the chip.
         //
-        //    Use the appropriate soft reset value:
-        //    - ERISC1 running (MMIO-peering or lite fabric tunnel endpoint):
-        //      0x46000 (both deasserted)
-        //    - ERISC1 in POR (no firmware loaded): 0x47000 (ERISC0 only)
-        //    Writing 0x46000 on cores without ERISC1 FW would deassert ERISC1
-        //    from POR with no firmware loaded, causing it to boot garbage.
+        //    With lite fabric active, ERISC1 runs on all cores (erisc1_running=true),
+        //    so we always use 0x46000 (both ERISCs deasserted).
+        //    Without lite fabric, ERISC1 is in POR — use 0x47000 (ERISC0 only).
         cluster_->l1_barrier(device_id);
 
         uint32_t soft_reset_val = erisc1_running ? SOFT_RESET_ERISC0_ERISC1_RUNNING : SOFT_RESET_ERISC0_ONLY;

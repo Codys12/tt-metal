@@ -21,7 +21,7 @@
 /* Lite Fabric Memory Layout */
 /* Text (firmware code) section */
 #define LITE_FABRIC_TEXT_START MEM_LITE_FABRIC_MEMORY_BASE
-#define LITE_FABRIC_TEXT_SIZE 0x3000
+#define LITE_FABRIC_TEXT_SIZE 0x4000
 
 /* Data section (in L1) */
 #define LITE_FABRIC_DATA_START (LITE_FABRIC_TEXT_START + LITE_FABRIC_TEXT_SIZE)
