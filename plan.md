@@ -251,3 +251,4 @@ Then you need to make sure fabric router is working across those ETH tiles for a
 Use for context the commit "working!" for single ttnn.open_device bringup. That successfully loaded lite_fabric across all remote chips and should be used as a baseline/reference for debugging why lite fabric is not working for n-hop. Study it carefully when you need to. Lite fabric should be fully deployed before you go on to fabric router for maximum simplicity. You must be very attentive to the lite fabric setup/bringup across n-hop devices, as even the slightest mistake can lead to a hang. This lite fabric will be a persistant control plane once set up -- ideally all through TXQ2.
 
 YOU REALLY DO WANT TXQ2 AFTER YOU REACH STEADY STATE (AFTER ALL LITE FABRIC IS SET UP BUT BEFORE FABRIC ROUTER IS LAUNCHED)
+Finally: always try to make your fixes in as minimal lines of code changed as possible. Debug logs do not count towards this line minimization.
