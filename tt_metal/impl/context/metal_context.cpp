@@ -518,6 +518,15 @@ void MetalContext::initialize(
         }
     }
 
+    // Clear force_reinit_ unconditionally before starting the full init.
+    // set_fabric_config() sets this flag, but when called before the very
+    // first MetalContext::initialize() (initialized_=false), the if(initialized_)
+    // guard above is skipped and force_reinit_ is never cleared.  Without this,
+    // the second initialize() call from initialize_device_manager() (which is
+    // idempotent and should be a no-op) sees initialized_=true, force_reinit_=true
+    // and tears down everything, forcing Phase 2b to run twice.
+    force_reinit_ = false;
+
     initialized_ = true;
     dispatch_core_config_ = dispatch_core_config;
     num_hw_cqs_ = num_hw_cqs;
@@ -665,7 +674,7 @@ void MetalContext::initialize(
                 futures.emplace_back(detail::async([per_device_init, device_id]() { per_device_init(device_id); }));
             }
             for (auto& fut : futures) {
-                fut.wait();
+                fut.get();
             }
         }
     };
@@ -713,7 +722,7 @@ void MetalContext::initialize(
             }));
         }
         for (auto& fut : futures) {
-            fut.wait();
+            fut.get();
         }
     };
 
@@ -1167,29 +1176,118 @@ void MetalContext::initialize(
                                         downstream_chans_for_frontier.insert(d.downstream_eth_chan);
                                     }
                                 }
+                                auto format_downstream_chans = [&]() {
+                                    std::string s;
+                                    for (auto c : downstream_chans_for_frontier) {
+                                        if (!s.empty()) {
+                                            s += ",";
+                                        }
+                                        s += std::to_string(c);
+                                    }
+                                    return s;
+                                };
+                                auto is_port_up = [&](const FixupCandidate& cand) {
+                                    uint32_t ps_word = 0;
+                                    try {
+                                        cluster_->read_core(&ps_word, sizeof(ps_word), cand.cxy, ETH_PORT_STATUS_ADDR);
+                                    } catch (...) {
+                                        return false;
+                                    }
+                                    return (static_cast<uint8_t>(ps_word & 0xFF) == PORT_UP);
+                                };
+                                // First pass: prefer a non-conflicting candidate whose
+                                // ETH port is UP.  Stale routing_enabled from a previous
+                                // run may exist on dead/non-UP ports; picking such a port
+                                // as the upstream receiver breaks the reverse-forwarding
+                                // path and causes wait_for_read_event timeouts.
                                 for (const auto& cand : candidates) {
-                                    if (!downstream_chans_for_frontier.count(cand.channel)) {
+                                    if (!downstream_chans_for_frontier.count(cand.channel) && is_port_up(cand)) {
                                         correct_channel = cand.channel;
                                         found = true;
                                         log_warning(
                                             tt::LogMetal,
                                             "Phase 2b: tunnel fixup: couldn't disambiguate {} "
                                             "candidates on chip {}, picked channel {} "
-                                            "(avoids downstream channels {})",
+                                            "(port UP, avoids downstream channels {})",
                                             candidates.size(),
                                             frontier_chip,
                                             cand.channel,
-                                            [&]() {
-                                                std::string s;
-                                                for (auto c : downstream_chans_for_frontier) {
-                                                    if (!s.empty()) {
-                                                        s += ",";
-                                                    }
-                                                    s += std::to_string(c);
-                                                }
-                                                return s;
-                                            }());
+                                            format_downstream_chans());
                                         break;
+                                    }
+                                }
+                                // Second pass: extended scan — probe ALL ETH channels on
+                                // frontier_chip for port-UP links that connect back toward
+                                // MMIO (board_id resolves to a known reachable chip).  The
+                                // real upstream receiver may not have routing_enabled if it
+                                // was freshly set up via ETH_INIT_NEIGHBOUR on the previous
+                                // hop (e.g. on reinit after initialize_and_launch_firmware
+                                // changed which ETH link is UP for reaching the frontier).
+                                if (!found) {
+                                    for (size_t ch = 0; ch < eth_cores_noc0.size(); ch++) {
+                                        if (downstream_chans_for_frontier.count(static_cast<uint32_t>(ch))) {
+                                            continue;  // skip downstream channels
+                                        }
+                                        auto core_noc0 = eth_cores_noc0[ch];
+                                        auto core_translated = frontier_soc.translate_coord_to(
+                                            tt_xy_pair(core_noc0.x, core_noc0.y),
+                                            CoordSystem::NOC0,
+                                            CoordSystem::TRANSLATED);
+                                        auto cxy = tt_cxy_pair(
+                                            static_cast<size_t>(frontier_chip), core_translated.x, core_translated.y);
+                                        uint32_t ps_word = 0;
+                                        try {
+                                            cluster_->read_core(&ps_word, sizeof(ps_word), cxy, ETH_PORT_STATUS_ADDR);
+                                        } catch (...) {
+                                            continue;
+                                        }
+                                        if ((ps_word & 0xFF) != PORT_UP) {
+                                            continue;
+                                        }
+                                        uint32_t hi = 0, lo = 0;
+                                        try {
+                                            cluster_->read_core(&hi, sizeof(hi), cxy, ETH_REMOTE_BOARD_ID_HI_ADDR);
+                                            cluster_->read_core(&lo, sizeof(lo), cxy, ETH_REMOTE_BOARD_ID_LO_ADDR);
+                                        } catch (...) {
+                                            continue;
+                                        }
+                                        uint64_t remote_board_id = (static_cast<uint64_t>(hi) << 32) | lo;
+                                        auto it = boardid_to_chip.find(remote_board_id);
+                                        if (it == boardid_to_chip.end() || !reachable_chips.count(it->second)) {
+                                            continue;
+                                        }
+                                        correct_channel = static_cast<uint32_t>(ch);
+                                        found = true;
+                                        log_warning(
+                                            tt::LogMetal,
+                                            "Phase 2b: tunnel fixup: extended scan found "
+                                            "chip {} chan {} (port UP, connects to reachable "
+                                            "chip {}, avoids downstream channels {})",
+                                            frontier_chip,
+                                            ch,
+                                            it->second,
+                                            format_downstream_chans());
+                                        break;
+                                    }
+                                }
+                                // Third pass: last resort from routing_enabled candidates —
+                                // any non-conflicting channel regardless of port state.
+                                if (!found) {
+                                    for (const auto& cand : candidates) {
+                                        if (!downstream_chans_for_frontier.count(cand.channel)) {
+                                            correct_channel = cand.channel;
+                                            found = true;
+                                            log_warning(
+                                                tt::LogMetal,
+                                                "Phase 2b: tunnel fixup: couldn't disambiguate {} "
+                                                "candidates on chip {}, picked channel {} "
+                                                "(avoids downstream channels {})",
+                                                candidates.size(),
+                                                frontier_chip,
+                                                cand.channel,
+                                                format_downstream_chans());
+                                            break;
+                                        }
                                     }
                                 }
                                 if (!found) {
@@ -1969,11 +2067,12 @@ void MetalContext::initialize(
                 // re-sync between devices.  Multiple N-hop devices share the
                 // same MMIO ETH core (e.g., 2-hop and 4-hop devices both route
                 // through channel 7).  When processed sequentially, each
-                // device's reads advance the device-side ch1 h2d/d2h counters,
-                // leaving the next device's recv_ch1 stale and pointing to the
-                // wrong ch1 receiver buffer slot (0xdeadbeef sentinel timeout).
-                // set_remote_transfer_ethernet_cores re-reads d2h, resets
-                // recv_ch1, and clears stale ch1 sentinels.
+                // device's reads advance the shared MMIO-side ch1 ring state,
+                // leaving the next device's cached recv_ch1 stale and pointing
+                // to the wrong receiver slot (0xdeadbeef sentinel timeout).
+                // set_remote_transfer_ethernet_cores re-syncs the active
+                // channel's ch1 position from device state and clears stale
+                // event IDs before the next device uses that path.
                 for (ChipId device_id : remote_devices_ordered) {
                     auto gateway = cluster_->get_cluster_desc()->get_closest_mmio_capable_chip(device_id);
                     auto ch_it = remote_chip_eth_channels.find({device_id, gateway});
@@ -3568,10 +3667,31 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
             peer_is_mmio,
             erisc1_running);
 
-        // WARNING: Lite fabric currently uses TXQ0 (DEFAULT_ETH_TXQ=0); fabric
-        // router also uses TXQ0/TXQ1.  TXQ0 contention risk when both ERISCs
-        // are running on MMIO cores.  The erisc1_running flag is still needed
-        // to select the correct soft reset value (0x46000 vs 0x47000).
+        // Signal ERISC1 to switch from TXQ0 to TXQ2 before we launch ERISC0
+        // (fabric router uses TXQ0/TXQ1).  ERISC1 polls active_txq_request in
+        // its main loop and switches on the next iteration.
+        if (erisc1_running) {
+            uint32_t txq_req_addr = LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteMemoryMap, config) +
+                                    offsetof(lite_fabric::FabricLiteConfig, forwarding) +
+                                    offsetof(lite_fabric::FabricLiteConfig::ForwardingConfig, active_txq_request);
+            uint8_t txq2 = 2;
+            // Signal the remote-side ERISC1
+            cluster_->write_core(&txq2, sizeof(txq2), tt_cxy_pair(device_id, virtual_core), txq_req_addr);
+            // Also signal the MMIO-side ERISC1 (peer) — it runs lite fabric too
+            if (peer_is_mmio) {
+                CoreCoord peer_virtual =
+                    cluster_->get_virtual_coordinate_from_logical_coordinates(peer_chip, peer_logical, CoreType::ETH);
+                cluster_->write_core(&txq2, sizeof(txq2), tt_cxy_pair(peer_chip, peer_virtual), txq_req_addr);
+            }
+            log_info(
+                tt::LogMetal,
+                "Device {} init remote ETH: wrote active_txq_request=2 to core {} and peer {}:{} at {:#x}",
+                device_id,
+                virtual_core.str(),
+                peer_chip,
+                peer_logical.str(),
+                txq_req_addr);
+        }
 
         // Track MMIO-peering cores where the fabric router is launched.
         // Used by update_lite_fabric_bindings_for_fabric_routers()

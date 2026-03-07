@@ -29,6 +29,10 @@ extern WriteTridTracker1 receiver_channel_1_trid_tracker;
 extern OutboundReceiverChannelPointersTupleImpl outbound_to_receiver_channel_pointers_tuple;
 extern ReceiverChannelPointersTupleImpl receiver_channel_pointers_tuple;
 
+// Runtime TXQ: 0 (TXQ0) during init/early steady-state, 2 (TXQ2) after host
+// signals active_txq_request before fabric router launches on ERISC0.
+extern uint32_t active_txq;
+
 // Forwarding state for multi-hop relay
 extern volatile FabricLiteConfig::ForwardingConfig* forwarding_config;
 extern uint8_t forwarding_downstream_wr_idx;
@@ -167,7 +171,7 @@ FORCE_INLINE void send_next_data(
     ReceiverEthChannelBuffer& receiver_buffer_channel) {
     auto& remote_receiver_buffer_index = outbound_to_receiver_channel_pointers.remote_receiver_buffer_index;
     auto& remote_receiver_num_free_slots = outbound_to_receiver_channel_pointers.num_free_slots;
-    constexpr uint32_t sender_txq_id = lite_fabric::sender_txq_id;
+    uint32_t sender_txq_id = lite_fabric::active_txq;
     uint32_t src_addr = sender_buffer_channel.get_cached_next_buffer_slot_addr();
 
     volatile auto* pkt_header = reinterpret_cast<volatile lite_fabric::FabricLiteHeader*>(src_addr);
@@ -202,11 +206,15 @@ FORCE_INLINE void send_next_data(
     // a monotonic counter to a known L1 address instead of
     // remote_update_ptr_val (which sends a COMMAND frame).
     {
-        static volatile uint32_t sent_notify_scratch[4] __attribute__((aligned(16)));
+        auto* sent_notify_scratch = reinterpret_cast<volatile uint32_t*>(
+            LITE_FABRIC_CONFIG_START + offsetof(FabricLiteMemoryMap, sender_flow_control_semaphore));
         sent_notify_scratch[0] = ++pkts_sent_writer[CHANNEL_INDEX];
+        sent_notify_scratch[1] = 0;
+        sent_notify_scratch[2] = 0;
+        sent_notify_scratch[3] = 0;
         internal_::eth_send_packet_bytes_unsafe(
             sender_txq_id,
-            reinterpret_cast<uint32_t>(&sent_notify_scratch[0]),
+            reinterpret_cast<uint32_t>(sent_notify_scratch),
             reinterpret_cast<uint32_t>(&pkts_sent_notify[CHANNEL_INDEX][0]),
             16);
     }
@@ -554,7 +562,7 @@ __attribute__((optimize("jump-tables"))) FORCE_INLINE void service_fabric_reques
                                 auto* diag = reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(
                                     LITE_FABRIC_CONFIG_START);
                                 auto addr = reinterpret_cast<uintptr_t>(&diag->config.primary_local_handshake);
-                                internal_::eth_send_packet<false>(DEFAULT_ETH_TXQ, addr >> 4, addr >> 4, 1);
+                                internal_::eth_send_packet<false>(active_txq, addr >> 4, addr >> 4, 1);
                             }
                         }
                         invalidate_l1_cache();
@@ -707,16 +715,20 @@ FORCE_INLINE void run_receiver_channel_step() {
     }
 
     if (can_send_completion) {
-        if (!eth_txq_wait_or_recover(DEFAULT_ETH_TXQ)) {
+        if (!eth_txq_wait_or_recover(active_txq)) {
             return;
         }
         // Send completion notification via DATA frame to sender's L1 counter.
         {
-            static volatile uint32_t comp_notify_scratch[4] __attribute__((aligned(16)));
+            auto* comp_notify_scratch = reinterpret_cast<volatile uint32_t*>(
+                LITE_FABRIC_CONFIG_START + offsetof(FabricLiteMemoryMap, sender_connection_live_semaphore));
             comp_notify_scratch[0] = ++pkts_completed_writer[CHANNEL_INDEX];
+            comp_notify_scratch[1] = 0;
+            comp_notify_scratch[2] = 0;
+            comp_notify_scratch[3] = 0;
             internal_::eth_send_packet_bytes_unsafe(
-                DEFAULT_ETH_TXQ,
-                reinterpret_cast<uint32_t>(&comp_notify_scratch[0]),
+                active_txq,
+                reinterpret_cast<uint32_t>(comp_notify_scratch),
                 reinterpret_cast<uint32_t>(&pkts_completed_notify[CHANNEL_INDEX][0]),
                 16);
         }

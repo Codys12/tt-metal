@@ -129,7 +129,10 @@ struct FabricLiteConfig {
         // in the NOC_READ handler, and receiver completion gating.  Upstream
         // receivers (including the real MMIO receiver) leave this at 0.
         uint8_t is_reverse_relay = 0;
-        uint8_t _forwarding_pad[14]{};  // Pad ForwardingConfig to maintain 16-byte struct alignment
+        // Host writes target TXQ (2) here before launching fabric router on ERISC0.
+        // ERISC1 polls this and switches active_txq from 0 (TXQ0) to the requested value.
+        volatile uint8_t active_txq_request = 0;
+        uint8_t _forwarding_pad[13]{};  // Pad ForwardingConfig to maintain 16-byte struct alignment
     } __attribute__((packed)) forwarding;
 } __attribute__((packed));
 

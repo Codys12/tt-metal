@@ -32,8 +32,8 @@ static_assert(sizeof(uint32_t) == sizeof(uintptr_t));
 // so TXQ0 is exclusively available to ERISC1.  Using the same TXQ for both
 // data (eth_send_packet) and register writes (eth_write_remote_reg) ensures
 // natural serialization — no cross-TXQ barriers needed.
-// Steady-state channels.hpp/constants.hpp use TXQ2 (DEFAULT_ETH_TXQ) for
-// ERISC0/ERISC1 coexistence once the fabric router starts on ERISC0.
+// Steady-state uses active_txq (switched to TXQ2 by host before fabric
+// router launches on ERISC0) for ERISC0/ERISC1 coexistence.
 static constexpr uint32_t k_DataTxq = 0;
 
 inline void wait_val(uint32_t addr, uint32_t val) {

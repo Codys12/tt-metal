@@ -97,6 +97,11 @@ uint32_t diag_loop_counter __attribute__((used));
 
 uint32_t txq_recovery_count __attribute__((used));
 
+// Runtime TXQ: starts at 0 (TXQ0) for init and early steady-state.
+// Switched to 2 (TXQ2) when host writes active_txq_request before launching
+// fabric router on ERISC0 (which uses TXQ0/TXQ1).
+uint32_t active_txq __attribute__((used)) = 0;
+
 // L1-based notification counters — replaces stream register COMMAND frames.
 // ETH_TXQ_CMD_START_REG is TXQ0-only on BH, so notifications are sent as
 // DATA frames to these L1 counters instead of COMMAND frame register writes.
@@ -123,6 +128,16 @@ __attribute__((noinline)) void service_lite_fabric() {
     // reload so that values written in main() or by previous iterations are visible.
     asm volatile("" ::: "memory");
     auto* mem_map = reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(LITE_FABRIC_CONFIG_START);
+
+    // Check for TXQ switch request from host (one-shot: 0 → requested value).
+    // Host writes active_txq_request=2 before launching fabric router on ERISC0.
+    if (active_txq == 0) {
+        uint8_t req = mem_map->config.forwarding.active_txq_request;
+        if (req != 0) {
+            active_txq = req;
+        }
+    }
+
     // Static flag: once the host requests STOP and we process it, don't
     // self-heal STOPPED back to ENABLED.  Reset to false on next FW
     // incarnation via BSS zeroing (data_init).
@@ -149,9 +164,9 @@ __attribute__((noinline)) void service_lite_fabric() {
             {
                 constexpr uint32_t routing_enabled_address =
                     LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteConfig, routing_enabled);
-                // Use DEFAULT_ETH_TXQ for steady-state sends.
+                // Use active_txq for steady-state sends (TXQ0 initially, TXQ2 after host signal).
                 internal_::eth_send_packet<false>(
-                    lite_fabric::DEFAULT_ETH_TXQ, routing_enabled_address >> 4, routing_enabled_address >> 4, 1);
+                    lite_fabric::active_txq, routing_enabled_address >> 4, routing_enabled_address >> 4, 1);
             }
             return;
     }
@@ -288,7 +303,7 @@ __attribute__((noinline)) void service_lite_fabric() {
     if ((diag_loop_counter & 0xFFFF) == 0) {
         auto* cfg = &mem_map->config;
         auto addr = reinterpret_cast<uintptr_t>(&cfg->primary_local_handshake);
-        internal_::eth_send_packet<false>(lite_fabric::DEFAULT_ETH_TXQ, addr >> 4, addr >> 4, 1);
+        internal_::eth_send_packet<false>(lite_fabric::active_txq, addr >> 4, addr >> 4, 1);
     }
 }
 
@@ -403,11 +418,12 @@ int main() {
     asm volatile("li t1, 0x8\n\tcsrs 0x7c0, t1" ::: "t1", "memory");
 #endif
 
-    // Kill ERISC0 to prevent TXQ0 contention during init-fsm and steady-state.
+    // Kill ERISC0 to prevent TXQ0 contention during init-fsm.
     // ERISC0 syseng FW shares TXQ0 with ERISC1.  With ERISC0 dead, TXQ0 is
-    // exclusively ERISC1's for both init (k_DataTxq=0) and steady-state
-    // (DEFAULT_ETH_TXQ=0).  ERISC0 will be relaunched for fabric router
-    // (Phase 3/4); NOC cmd buffer contention is prevented by ERISC1 using
+    // exclusively ERISC1's for init (k_DataTxq=0) and early steady-state
+    // (active_txq=0 → TXQ0).  Before fabric router launches on ERISC0
+    // (TXQ0/TXQ1), the host signals active_txq_request=2 and ERISC1 switches
+    // to TXQ2.  NOC cmd buffer contention is prevented by ERISC1 using
     // cmd buffers 2/3 (vs ERISC0's 0/1).
     {
         constexpr uint32_t kSoftResetAddr = 0xFFB121B0;
@@ -535,8 +551,8 @@ int main() {
         }
     }
 
-    // Enable TXQ2 packet resend mode.  Harmless when DEFAULT_ETH_TXQ=0;
-    // keeps TXQ2 ready in case future coexistence work moves back to TXQ2.
+    // Enable TXQ2 packet resend mode.  TXQ2 is used after the host signals
+    // active_txq_request=2 (before fabric router launches on ERISC0).
     *reinterpret_cast<volatile uint32_t*>(ETH_TXQ0_REGS_START + 2 * ETH_TXQ_REGS_SIZE + ETH_TXQ_CTRL) =
         ETH_TXQ_CTRL_KEEPALIVE;
 
@@ -571,7 +587,7 @@ int main() {
         auto src_addr = (uintptr_t)&cfg->primary_local_handshake;
         auto dst_addr = (uintptr_t)&cfg->neighbour_handshake;
         cfg->primary_local_handshake = 0xA0;  // "Remote alive, TXQ2 OK"
-        internal_::eth_send_packet<false>(lite_fabric::DEFAULT_ETH_TXQ, src_addr >> 4, dst_addr >> 4, 1);
+        internal_::eth_send_packet<false>(lite_fabric::active_txq, src_addr >> 4, dst_addr >> 4, 1);
     }
 
     lite_fabric::object_init(structs);

@@ -1646,6 +1646,41 @@ void Cluster::release_ethernet_cores_for_fabric_routers() {
 
 void Cluster::release_fabric_routers_for_inactive_links(const std::set<ChipId>& active_chips) {
     bool changed = false;
+    const auto& local_conns = this->get_ethernet_connections();
+    const auto& remote_conns = this->get_ethernet_connections_to_remote_devices();
+
+    // Build uid→chip reverse map for Case B (remote device reverse lookup).
+    std::unordered_map<uint64_t, ChipId> uid_to_chip;
+    for (const auto& [cid, uid] : this->cluster_desc_->get_chip_unique_ids()) {
+        uid_to_chip[uid] = cid;
+    }
+
+    // Check whether get_connected_ethernet_core can resolve a given (chip, eth_chan).
+    // Inter-remote-chip links (e.g., chip 6→chip 7) may not be tracked in either
+    // get_ethernet_connections() or get_ethernet_connections_to_remote_devices().
+    auto is_peer_resolvable = [&](ChipId cid, EthernetChannel chan) -> bool {
+        // Case 1: local (intra-cluster) connection
+        if (local_conns.contains(cid) && local_conns.at(cid).contains(chan)) {
+            return true;
+        }
+        // Case 2: this chip is MMIO with a remote connection on this channel
+        if (remote_conns.contains(cid) && remote_conns.at(cid).contains(chan)) {
+            return true;
+        }
+        // Case 3: this chip is a remote device — reverse scan MMIO remote_conns
+        if (this->cluster_desc_->get_chip_unique_ids().contains(cid)) {
+            uint64_t chip_uid = this->cluster_desc_->get_chip_unique_ids().at(cid);
+            for (const auto& [mmio_chip, channels] : remote_conns) {
+                for (const auto& [mmio_chan, remote_info] : channels) {
+                    if (std::get<0>(remote_info) == chip_uid && std::get<1>(remote_info) == chan) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
     for (auto& [chip_id, eth_cores] : this->device_eth_routing_info_) {
         if (!active_chips.contains(chip_id)) {
             // Release all fabric router reservations on inactive chips.
@@ -1660,6 +1695,14 @@ void Cluster::release_fabric_routers_for_inactive_links(const std::set<ChipId>& 
         // For active chips, release reservations for links to inactive peers.
         for (auto& [eth_core, mode] : eth_cores) {
             if (mode != EthRouterMode::FABRIC_ROUTER) {
+                continue;
+            }
+            const auto& soc_desc = get_soc_desc(chip_id);
+            EthernetChannel eth_chan = soc_desc.logical_eth_core_to_chan_map.at(eth_core);
+            if (!is_peer_resolvable(chip_id, eth_chan)) {
+                // Peer not tracked in any connection map — can't route through this link.
+                mode = EthRouterMode::IDLE;
+                changed = true;
                 continue;
             }
             auto connected = this->get_connected_ethernet_core(std::make_tuple(chip_id, eth_core));

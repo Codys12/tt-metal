@@ -70,9 +70,10 @@ constexpr uint32_t CHANNEL_BUFFER_SIZE = 2048 + ALIGNMENT_BUFFER_SIZE + sizeof(l
 constexpr size_t RECEIVER_CHANNEL_BASE_ID = NUM_SENDER_CHANNELS;
 constexpr size_t SENDER_CHANNEL_BASE_ID = 0;
 
-// Lite fabric uses TXQ0 (ERISC0 is killed at boot, so no contention).
-// TODO: Move to TXQ2 for coexistence with fabric router (ERISC0) once
-// TXQ2 DATA frame delivery issues are resolved.
+// Init-time TXQ: lite fabric boots on TXQ0 while ERISC0 is in reset (no
+// contention).  Before fabric router launches on ERISC0 (TXQ0/TXQ1), the
+// host writes active_txq_request=2 to FabricLiteConfig and ERISC1 switches
+// to TXQ2 at runtime (see active_txq in channels.hpp).
 // ETH_TXQ_CMD_START_REG (remote register writes) is TXQ0-only, so
 // WRITE_REG is handled by the receiver doing a local RISC-V store
 // instead of the sender using eth_write_remote_reg.
