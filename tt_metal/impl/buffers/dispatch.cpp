@@ -9,6 +9,7 @@
 #include <array>
 #include <optional>
 #include <stack>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -603,15 +604,26 @@ void issue_buffer_dispatch_command_sequence(
     const uint32_t cmd_sequence_sizeB = calculator.write_offset_bytes();
     SystemMemoryManager& sysmem_manager = dispatch_params.device->sysmem_manager();
     void* cmd_region = sysmem_manager.issue_queue_reserve(cmd_sequence_sizeB, dispatch_params.cq_id);
+    const uint32_t issue_q_write_ptr_before = sysmem_manager.get_issue_queue_write_ptr(dispatch_params.cq_id);
 
     HugepageDeviceCommand command_sequence(cmd_region, cmd_sequence_sizeB);
 
+    std::string wait_summary = "<none>";
     if (dispatch_params.issue_wait) {
+        wait_summary.clear();
         for (const auto& sub_device_id : sub_device_ids) {
             auto offset_index = *sub_device_id;
             command_sequence.add_dispatch_wait(
                 CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM,
                 0,
+                MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(offset_index),
+                dispatch_params.expected_num_workers_completed[offset_index]);
+            if (!wait_summary.empty()) {
+                wait_summary += " ";
+            }
+            wait_summary += fmt::format(
+                "sd{}:stream={} count={}",
+                offset_index,
                 MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(offset_index),
                 dispatch_params.expected_num_workers_completed[offset_index]);
         }
@@ -620,6 +632,39 @@ void issue_buffer_dispatch_command_sequence(
         populate_sharded_buffer_write_dispatch_cmds(src, command_sequence, buffer, dispatch_params);
     } else {
         populate_interleaved_buffer_write_dispatch_cmds(src, command_sequence, buffer, dispatch_params);
+    }
+
+    if (dispatch_params.issue_wait || data_size_bytes >= 0x10000) {
+        std::string txn_detail;
+        if constexpr (std::is_same_v<T, ShardedBufferWriteDispatchParams>) {
+            txn_detail = fmt::format(
+                " core=({}, {}) core_pages_remaining={} full_pages_written={}",
+                dispatch_params.core.x,
+                dispatch_params.core.y,
+                dispatch_params.core_num_pages_remaining_to_write,
+                dispatch_params.total_pages_written);
+        } else {
+            txn_detail = fmt::format(
+                " dst_page_index={} full_pages_written={}",
+                dispatch_params.dst_page_index,
+                dispatch_params.num_full_pages_written());
+        }
+        log_info(
+            tt::LogMetal,
+            "DEBUG CQ-WRITE-ISSUE: device {} cq {} kind={} issue_wr=0x{:x} cmd_size=0x{:x} data_bytes=0x{:x} "
+            "dst_addr=0x{:x} pages={} page_size=0x{:x} issue_wait={} waits=[{}]{}",
+            dispatch_params.device->id(),
+            dispatch_params.cq_id,
+            std::is_same_v<T, ShardedBufferWriteDispatchParams> ? "sharded" : "interleaved",
+            issue_q_write_ptr_before,
+            cmd_sequence_sizeB,
+            data_size_bytes,
+            dispatch_params.address,
+            dispatch_params.pages_per_txn,
+            dispatch_params.page_size_to_write,
+            dispatch_params.issue_wait,
+            wait_summary,
+            txn_detail);
     }
 
     sysmem_manager.issue_queue_push_back(cmd_sequence_sizeB, dispatch_params.cq_id);
@@ -830,6 +875,7 @@ void issue_read_buffer_dispatch_command_sequence(
     const uint32_t cmd_sequence_sizeB = calculator.write_offset_bytes();
 
     void* cmd_region = sysmem_manager.issue_queue_reserve(cmd_sequence_sizeB, dispatch_params.cq_id);
+    const uint32_t issue_q_write_ptr_before = sysmem_manager.get_issue_queue_write_ptr(dispatch_params.cq_id);
     HugepageDeviceCommand command_sequence(cmd_region, cmd_sequence_sizeB);
 
     uint32_t last_index = num_worker_counters - 1;
@@ -869,6 +915,24 @@ void issue_read_buffer_dispatch_command_sequence(
             dispatch_params.padded_page_size,
             dispatch_params.pages_per_txn);
     }
+
+    log_info(
+        tt::LogMetal,
+        "DEBUG CQ-READ-ISSUE: device {} cq {} kind={} issue_wr=0x{:x} cmd_size=0x{:x} addr=0x{:x} src_page={} "
+        "pages={} page_size=0x{:x} padded_page_size=0x{:x} host_bytes=0x{:x} is_dram={} sub_devices={}",
+        dispatch_params.device->id(),
+        dispatch_params.cq_id,
+        std::is_same_v<T, ShardedBufferReadDispatchParams> ? "sharded" : "interleaved",
+        issue_q_write_ptr_before,
+        cmd_sequence_sizeB,
+        dispatch_params.address,
+        dispatch_params.src_page_index,
+        dispatch_params.pages_per_txn,
+        buffer.page_size(),
+        dispatch_params.padded_page_size,
+        dispatch_params.pages_per_txn * dispatch_params.padded_page_size,
+        buffer.is_dram(),
+        sub_device_ids.size());
 
     sysmem_manager.issue_queue_push_back(cmd_sequence_sizeB, dispatch_params.cq_id);
     sysmem_manager.fetch_queue_reserve_back(dispatch_params.cq_id);

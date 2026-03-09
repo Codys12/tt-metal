@@ -239,6 +239,7 @@ public:
         bool minimal = false) override;
     void init_command_queue_host() override;
     void init_command_queue_device() override;
+    void initialize_command_queue_runtime_state() override;
     bool compile_fabric() override;
     void configure_fabric() override;
     void init_fabric() override;

@@ -64,20 +64,17 @@ DispatchSettingsContainer& get_store() {
 
 uint32_t get_min_cq_size_bytes(const tt::Cluster& cluster, uint32_t num_hw_cqs) {
     uint32_t min_cq_size = std::numeric_limits<uint32_t>::max();
-    const bool is_galaxy = cluster.is_galaxy_cluster();
     for (ChipId device_id : cluster.all_chip_ids()) {
-        const ChipId mmio_device_id = cluster.get_associated_mmio_device(device_id);
-        const uint16_t channel = cluster.get_assigned_channel_for_device(device_id);
-        uint32_t host_channel_size = cluster.get_host_channel_size(mmio_device_id, channel);
-        if (host_channel_size == 0) {
+        if (MetalContext::instance().is_chip_unreachable(device_id)) {
             continue;
         }
-        uint32_t cq_size = host_channel_size / num_hw_cqs;
-        if (is_galaxy) {
-            const uint32_t devices_per_channel =
-                std::max(1u, host_channel_size / DispatchSettings::MAX_DEV_CHANNEL_SIZE);
-            cq_size /= devices_per_channel;
+        const uint16_t channel = cluster.get_assigned_channel_for_device(device_id);
+        uint32_t logical_channel_size = get_per_device_host_channel_size(device_id, channel);
+        if (logical_channel_size == 0) {
+            continue;
         }
+        uint32_t cq_size = logical_channel_size / num_hw_cqs;
+        cq_size -= cq_size % MetalContext::instance().hal().get_alignment(HalMemType::HOST);
         min_cq_size = std::min(min_cq_size, cq_size);
     }
     if (min_cq_size == std::numeric_limits<uint32_t>::max()) {

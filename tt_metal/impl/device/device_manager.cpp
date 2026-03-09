@@ -12,6 +12,7 @@
 #include <tt_stl/assert.hpp>
 #include <tt-logger/tt-logger.hpp>
 #include <tt_metal.hpp>
+#include <umd/device/warm_reset.hpp>
 #include "common/executor.hpp"
 #include "context/metal_context.hpp"
 
@@ -406,11 +407,397 @@ void DeviceManager::initialize_fabric_and_dispatch_fw() {
     }
     this->initialize_active_devices();
 
+    log_info(tt::LogMetal, "DEBUG: initialize_fabric_and_dispatch_fw: active devices done, checking INIT_FABRIC flag");
     if (has_flag(
             tt::tt_metal::MetalContext::instance().get_fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
+        log_info(
+            tt::LogMetal,
+            "DEBUG: initialize_fabric_and_dispatch_fw: calling wait_for_fabric_router_sync (timeout={}ms)",
+            this->get_fabric_router_sync_timeout_ms());
         this->wait_for_fabric_router_sync(this->get_fabric_router_sync_timeout_ms());
+        log_info(tt::LogMetal, "DEBUG: initialize_fabric_and_dispatch_fw: wait_for_fabric_router_sync returned");
+
+        // Diagnostic: read EDM status from ALL fabric router ETH cores on MMIO device(s)
+        try {
+            const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+            const auto& cp = tt::tt_metal::MetalContext::instance().get_control_plane();
+            const auto& fc = cp.get_fabric_context();
+            const auto& bc = fc.get_builder_context();
+            auto [sync_addr, _expected] = bc.get_fabric_router_sync_address_and_status();
+            for (const auto& dev : this->get_all_active_devices()) {
+                if (!cluster.mmio_chip_ids().count(dev->id())) {
+                    continue;
+                }
+                auto num_routers = bc.get_num_fabric_initialized_routers(dev->id());
+                if (num_routers == 0) {
+                    continue;
+                }
+                // Read EDM status from all ETH channels that might have fabric routers
+                const auto& soc_desc = cluster.get_soc_desc(dev->id());
+                for (uint32_t chan = 0; chan < 14; chan++) {
+                    try {
+                        auto lc = soc_desc.get_eth_core_for_channel(chan, CoordSystem::LOGICAL);
+                        std::vector<std::uint32_t> status(1, 0);
+                        tt_metal::detail::ReadFromDeviceL1(dev, lc, sync_addr, 4, status, CoreType::ETH);
+                        // Only log if it looks like a valid EDM status value
+                        if ((status[0] & 0xF0F0F0F0) == 0xa0b0c0d0 || status[0] == 0) {
+                            log_info(
+                                tt::LogMetal,
+                                "DEBUG: MMIO device {} ETH chan={} logical={} EDM_status=0x{:08x}",
+                                dev->id(),
+                                chan,
+                                lc.str(),
+                                status[0]);
+                        }
+                    } catch (...) {
+                    }
+                }
+            }
+        } catch (...) {
+            log_info(tt::LogMetal, "DEBUG: Failed to read post-sync EDM status diagnostics");
+        }
+    } else {
+        log_info(tt::LogMetal, "DEBUG: initialize_fabric_and_dispatch_fw: INIT_FABRIC flag not set, skipping sync");
     }
-    log_trace(tt::LogMetal, "Fabric and Dispatch Firmware initialized");
+
+    if (using_fast_dispatch_) {
+        tt_fabric::FabricConfig fabric_config = tt::tt_metal::MetalContext::instance().get_fabric_config();
+        const bool check_chip_mapped = tt_fabric::is_tt_fabric_config(fabric_config);
+        const auto* control_plane_ptr =
+            check_chip_mapped ? &tt::tt_metal::MetalContext::instance().get_control_plane() : nullptr;
+        auto is_dispatch_device = [&](ChipId id) {
+            if (!dispatch_device_ids_.contains(id)) {
+                return false;
+            }
+            if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(id)) {
+                return false;
+            }
+            return !check_chip_mapped || control_plane_ptr->is_chip_mapped(id);
+        };
+
+        log_info(tt::LogMetal, "DEBUG: initialize_fabric_and_dispatch_fw: initializing CQ runtime state");
+        for (auto* dev : this->get_all_active_devices()) {
+            if (!is_dispatch_device(dev->id())) {
+                continue;
+            }
+            dev->initialize_command_queue_runtime_state();
+        }
+        log_info(tt::LogMetal, "DEBUG: initialize_fabric_and_dispatch_fw: CQ runtime state initialized");
+
+        // Diagnostic: Enumerate fabric MUX cores on MMIO device
+        try {
+            const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+            auto& dcm = tt::tt_metal::MetalContext::instance().get_dispatch_core_manager();
+            for (const auto& dev : this->get_all_active_devices()) {
+                if (!cluster.mmio_chip_ids().count(dev->id())) {
+                    continue;
+                }
+                uint16_t channel = cluster.get_assigned_channel_for_device(dev->id());
+                for (int tunnel = 0; tunnel < 4; tunnel++) {
+                    if (dcm.is_fabric_mux_core_allocated(dev->id(), channel, 0, tunnel)) {
+                        const auto& mux_core = dcm.fabric_mux_core(dev->id(), channel, 0, tunnel);
+                        log_info(
+                            tt::LogMetal,
+                            "DEBUG POST-INIT: MMIO dev {} fabric_mux tunnel={} core={}",
+                            dev->id(),
+                            tunnel,
+                            mux_core.str());
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            log_info(tt::LogMetal, "DEBUG POST-INIT: Failed to enumerate fabric mux cores: {}", e.what());
+        }
+
+        // Diagnostic: Log control plane routing info for each device from MMIO
+        if (tt_fabric::is_tt_fabric_config(fabric_config)) {
+            try {
+                const auto& cp = tt::tt_metal::MetalContext::instance().get_control_plane();
+                const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+                for (const auto& dev : this->get_all_active_devices()) {
+                    if (!cluster.mmio_chip_ids().count(dev->id())) {
+                        continue;
+                    }
+                    auto src_node = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(dev->id());
+                    for (const auto& target_dev : this->get_all_active_devices()) {
+                        if (target_dev->id() == dev->id()) {
+                            continue;
+                        }
+                        try {
+                            auto dst_node = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(target_dev->id());
+                            auto fwd_dir = cp.get_forwarding_direction(src_node, dst_node);
+                            auto links = tt::tt_fabric::get_forwarding_link_indices(src_node, dst_node);
+                            std::string link_str;
+                            for (auto l : links) {
+                                link_str += std::to_string(l) + " ";
+                            }
+                            log_info(
+                                tt::LogMetal,
+                                "DEBUG ROUTE: MMIO phys{} (M{}D{}) -> phys{} (M{}D{}): dir={} links=[{}]",
+                                dev->id(),
+                                src_node.mesh_id.get(),
+                                src_node.chip_id,
+                                target_dev->id(),
+                                dst_node.mesh_id.get(),
+                                dst_node.chip_id,
+                                fwd_dir.has_value() ? static_cast<int>(*fwd_dir) : -1,
+                                link_str);
+                        } catch (...) {
+                            log_info(
+                                tt::LogMetal,
+                                "DEBUG ROUTE: MMIO phys{} -> phys{}: FAILED",
+                                dev->id(),
+                                target_dev->id());
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                log_info(tt::LogMetal, "DEBUG POST-INIT: Failed to log routing info: {}", e.what());
+            }
+        }
+
+        // Diagnostic: Dump active fabric router channels per device
+        if (tt_fabric::is_tt_fabric_config(fabric_config)) {
+            try {
+                const auto& cp = tt::tt_metal::MetalContext::instance().get_control_plane();
+                const auto& fc = cp.get_fabric_context();
+                const auto& bc = fc.get_builder_context();
+                for (const auto& dev : this->get_all_active_devices()) {
+                    try {
+                        auto fabric_node = cp.get_fabric_node_id_from_physical_chip_id(dev->id());
+                        auto num_routers = bc.get_num_fabric_initialized_routers(dev->id());
+                        auto channels = cp.get_active_fabric_eth_channels(fabric_node);
+                        std::string chan_str;
+                        for (const auto& [chan, dir] : channels) {
+                            chan_str += fmt::format("ch{}(dir={}) ", chan, (int)dir);
+                        }
+                        // Also check each direction for routing planes
+                        std::string dir_str;
+                        for (int d = 0; d < 4; d++) {
+                            auto rd = static_cast<tt::tt_fabric::RoutingDirection>(d);
+                            auto planes = cp.get_active_fabric_eth_routing_planes_in_direction(fabric_node, rd);
+                            if (!planes.empty()) {
+                                dir_str += fmt::format("dir{}={}_planes ", d, planes.size());
+                            }
+                        }
+                        log_info(
+                            tt::LogMetal,
+                            "DEBUG POST-INIT: dev {} (phys{} M{}D{}) routers={} active_chans=[{}] routing=[{}]",
+                            dev->id(),
+                            dev->id(),
+                            fabric_node.mesh_id.get(),
+                            fabric_node.chip_id,
+                            num_routers,
+                            chan_str,
+                            dir_str);
+                    } catch (...) {
+                    }
+                }
+            } catch (const std::exception& e) {
+                log_info(tt::LogMetal, "DEBUG POST-INIT: Failed to enumerate per-device fabric state: {}", e.what());
+            }
+        }
+
+        // Diagnostic: Read fabric router sender channel connection state on MMIO device.
+        // After CQ runtime init, the FABRIC_MUX should have opened connections to the
+        // fabric router.  Reading the sender channel connection semaphores tells us which
+        // channels are connected.
+        if (tt_fabric::is_tt_fabric_config(fabric_config)) {
+            try {
+                const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+                const auto& cp = tt::tt_metal::MetalContext::instance().get_control_plane();
+                const auto& fc = cp.get_fabric_context();
+                const auto& bc = fc.get_builder_context();
+                const auto& router_config = bc.get_fabric_router_config();
+
+                for (const auto& dev : this->get_all_active_devices()) {
+                    if (!cluster.mmio_chip_ids().count(dev->id())) {
+                        continue;
+                    }
+                    auto num_routers = bc.get_num_fabric_initialized_routers(dev->id());
+                    if (num_routers == 0) {
+                        continue;
+                    }
+
+                    const auto& soc_desc = cluster.get_soc_desc(dev->id());
+                    const auto fabric_node_id = cp.get_fabric_node_id_from_physical_chip_id(dev->id());
+                    const auto router_chans_and_dir = cp.get_active_fabric_eth_channels(fabric_node_id);
+
+                    for (const auto& [chan, dir] : router_chans_and_dir) {
+                        auto lc = soc_desc.get_eth_core_for_channel(chan, CoordSystem::LOGICAL);
+                        // Read EDM status
+                        std::vector<std::uint32_t> edm_status(1, 0);
+                        tt_metal::detail::ReadFromDeviceL1(
+                            dev, lc, router_config.edm_status_address, 4, edm_status, CoreType::ETH);
+
+                        // Read sender channel connection semaphores
+                        std::string conn_sems;
+                        for (uint32_t s = 0; s < router_config.num_used_sender_channels; s++) {
+                            auto addr = router_config.sender_channels_connection_semaphore_address[s];
+                            if (addr == 0) {
+                                continue;
+                            }
+                            std::vector<std::uint32_t> sem(1, 0);
+                            tt_metal::detail::ReadFromDeviceL1(dev, lc, addr, 4, sem, CoreType::ETH);
+                            conn_sems += fmt::format(" s{}={}@0x{:x}", s, sem[0], addr);
+                        }
+
+                        // Read sender channel flow control semaphores
+                        std::string fc_sems;
+                        for (uint32_t s = 0; s < router_config.num_used_sender_channels; s++) {
+                            auto addr = router_config.sender_channels_local_flow_control_semaphore_address[s];
+                            if (addr == 0) {
+                                continue;
+                            }
+                            std::vector<std::uint32_t> sem(1, 0);
+                            tt_metal::detail::ReadFromDeviceL1(dev, lc, addr, 4, sem, CoreType::ETH);
+                            fc_sems += fmt::format(" s{}={}@0x{:x}", s, sem[0], addr);
+                        }
+
+                        // Read routing table header (first 16 bytes = mesh_id, device_id, intra_mesh_direction bytes)
+                        const auto& hal = tt::tt_metal::MetalContext::instance().hal();
+                        auto rt_addr = hal.get_dev_addr(
+                            tt::tt_metal::HalProgrammableCoreType::ACTIVE_ETH,
+                            tt::tt_metal::HalL1MemAddrType::ROUTING_TABLE);
+                        std::vector<std::uint32_t> rt_data(8, 0);  // 32 bytes
+                        tt_metal::detail::ReadFromDeviceL1(dev, lc, rt_addr, 32, rt_data, CoreType::ETH);
+                        // First word: mesh_id(16) | device_id(16)
+                        uint16_t rt_mesh_id = rt_data[0] & 0xFFFF;
+                        uint16_t rt_device_id = (rt_data[0] >> 16) & 0xFFFF;
+
+                        log_info(
+                            tt::LogMetal,
+                            "DEBUG POST-INIT: MMIO dev {} chan={} dir={} logical={} EDM=0x{:08x} "
+                            "conn_sems:[{}] fc_sems:[{}] num_sender_ch={} "
+                            "RT: mesh={} dev={} raw=[0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x} "
+                            "0x{:08x}]",
+                            dev->id(),
+                            chan,
+                            (int)dir,
+                            lc.str(),
+                            edm_status[0],
+                            conn_sems,
+                            fc_sems,
+                            router_config.num_used_sender_channels,
+                            rt_mesh_id,
+                            rt_device_id,
+                            rt_data[0],
+                            rt_data[1],
+                            rt_data[2],
+                            rt_data[3],
+                            rt_data[4],
+                            rt_data[5],
+                            rt_data[6],
+                            rt_data[7]);
+                    }
+                }
+            } catch (const std::exception& e) {
+                log_info(tt::LogMetal, "DEBUG POST-INIT: Failed to read fabric connection diagnostics: {}", e.what());
+            }
+        }
+    }
+
+    const auto fabric_config = tt::tt_metal::MetalContext::instance().get_fabric_config();
+
+    // Diagnostic: Read MUX kernel status on MMIO device.
+    // The MUX status is at the address in the MUX config, on the MUX Tensix core.
+    if (using_fast_dispatch_ && tt_fabric::is_tt_fabric_config(fabric_config)) {
+        try {
+            const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+            auto& dcm = tt::tt_metal::MetalContext::instance().get_dispatch_core_manager();
+            for (const auto& dev : this->get_all_active_devices()) {
+                if (!cluster.mmio_chip_ids().count(dev->id())) {
+                    continue;
+                }
+                uint16_t channel = cluster.get_assigned_channel_for_device(dev->id());
+                for (int tunnel = 0; tunnel < 8; tunnel++) {
+                    if (!dcm.is_fabric_mux_core_allocated(dev->id(), channel, 0, tunnel)) {
+                        continue;
+                    }
+                    const auto& mux_core = dcm.fabric_mux_core(dev->id(), channel, 0, tunnel);
+                    // Read first 32 bytes from MUX L1 at the buffer base to see status
+                    CoreCoord logical(mux_core.x, mux_core.y);
+                    // Try reading MUX status. The status address is at the beginning of the MUX buffer region.
+                    auto l1_base = tt::tt_metal::MetalContext::instance().hal().get_dev_addr(
+                        tt::tt_metal::HalProgrammableCoreType::TENSIX,
+                        tt::tt_metal::HalL1MemAddrType::DEFAULT_UNRESERVED);
+                    std::vector<std::uint32_t> mux_data(4, 0);
+                    try {
+                        tt_metal::detail::ReadFromDeviceL1(dev, logical, l1_base, 16, mux_data, CoreType::WORKER);
+                        log_info(
+                            tt::LogMetal,
+                            "DEBUG POST-INIT: MMIO dev {} MUX tunnel={} core={} status_region=[0x{:08x} 0x{:08x} "
+                            "0x{:08x} 0x{:08x}]",
+                            dev->id(),
+                            tunnel,
+                            mux_core.str(),
+                            mux_data[0],
+                            mux_data[1],
+                            mux_data[2],
+                            mux_data[3]);
+                    } catch (...) {
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            log_info(tt::LogMetal, "DEBUG POST-INIT: MUX status read failed: {}", e.what());
+        }
+    }
+
+    // Diagnostic: Delayed re-read of connection semaphores to check if MUX connects later
+    if (using_fast_dispatch_ && tt_fabric::is_tt_fabric_config(fabric_config)) {
+        try {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+            const auto& cp = tt::tt_metal::MetalContext::instance().get_control_plane();
+            const auto& fc = cp.get_fabric_context();
+            const auto& bc = fc.get_builder_context();
+            const auto& router_config = bc.get_fabric_router_config();
+
+            for (const auto& dev : this->get_all_active_devices()) {
+                if (!cluster.mmio_chip_ids().count(dev->id())) {
+                    continue;
+                }
+                auto num_routers = bc.get_num_fabric_initialized_routers(dev->id());
+                if (num_routers == 0) {
+                    continue;
+                }
+                const auto& soc_desc = cluster.get_soc_desc(dev->id());
+                const auto fabric_node_id = cp.get_fabric_node_id_from_physical_chip_id(dev->id());
+                const auto router_chans_and_dir = cp.get_active_fabric_eth_channels(fabric_node_id);
+
+                for (const auto& [chan, dir] : router_chans_and_dir) {
+                    auto lc = soc_desc.get_eth_core_for_channel(chan, CoordSystem::LOGICAL);
+                    // Read sender channel connection semaphores
+                    std::string conn_sems;
+                    for (uint32_t s = 0; s < router_config.num_used_sender_channels; s++) {
+                        auto addr = router_config.sender_channels_connection_semaphore_address[s];
+                        if (addr == 0) {
+                            continue;
+                        }
+                        std::vector<std::uint32_t> sem(1, 0);
+                        tt_metal::detail::ReadFromDeviceL1(dev, lc, addr, 4, sem, CoreType::ETH);
+                        conn_sems += fmt::format(" s{}={}", s, sem[0]);
+                    }
+
+                    std::string rx_info;
+
+                    log_info(
+                        tt::LogMetal,
+                        "DEBUG DELAYED-200ms: MMIO dev {} chan={} dir={} conn:[{}] {}",
+                        dev->id(),
+                        chan,
+                        (int)dir,
+                        conn_sems,
+                        rx_info);
+                }
+            }
+        } catch (const std::exception& e) {
+            log_info(tt::LogMetal, "DEBUG DELAYED: connection re-read failed: {}", e.what());
+        }
+    }
+
+    log_info(tt::LogMetal, "DEBUG: initialize_fabric_and_dispatch_fw: returning");
 }
 
 void DeviceManager::initialize_host(IDevice* dev) const {
@@ -462,21 +849,15 @@ void DeviceManager::init_fabric(const std::vector<tt_metal::IDevice*>& active_de
         }
     }
 
-    // Configure remote devices FIRST (deepest-hop first), then MMIO devices.
+    // Stage remote devices FIRST (deepest-hop first), then MMIO devices.
     //
-    // Remote device configure_fabric() uses the lite fabric relay (ERISC1) to
-    // write kernel binaries and deassert ERISC0 on remote ETH cores.  Each
-    // configure_fabric generates heavy traffic through the forwarding chain
-    // (kernel binaries, runtime args, barriers).  Processing deeper devices
-    // first ensures their longer forwarding chains are used while pristine.
+    // Remote configure_fabric() in the lite-fabric path only stages firmware,
+    // router binaries, and launch mailboxes.  ERISC0 launch is deferred until
+    // after remote CQ programs are written, so all heavy relay traffic happens
+    // while ERISC1 is the only firmware using the ETH tile.
     //
-    // ERISC0 (fabric router) and ERISC1 (lite fabric relay) run on separate
-    // processors with non-overlapping L1 memory and separate TXQs (fabric
-    // router uses TXQ0/TXQ1, lite fabric uses TXQ2), so they can coexist
-    // on all ETH cores without interference.
-    //
-    // MMIO devices are configured last to minimize TXQ contention on the
-    // MMIO-side ETH links while remote devices are still being configured.
+    // MMIO devices are staged last to keep the gateway links free while remote
+    // binaries are still being pushed through the relay.
     const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
     const auto& mmio_ids = cluster.mmio_chip_ids();
 
@@ -512,11 +893,24 @@ void DeviceManager::init_fabric(const std::vector<tt_metal::IDevice*>& active_de
         int hops_b = tt::tt_metal::MetalContext::instance().get_lite_fabric_hop_count(b->id());
         return hops_a != hops_b ? hops_a > hops_b : a->id() > b->id();
     });
+    auto resync_remote_lite_fabric = [](tt_metal::IDevice* dev) {
+        MetalContext::instance()
+            .get_cluster()
+            .get_driver()
+            ->get_remote_chip(dev->id())
+            ->get_remote_communication()
+            ->resync_remote_transfer_ethernet_cores();
+    };
     for (auto* dev : remote_deep) {
+        // Phase 3 reads on other remote devices can advance the shared MMIO-side
+        // ch1 ring. Re-sync the current binding before this device starts doing
+        // remote ETH readbacks during configure_fabric().
+        resync_remote_lite_fabric(dev);
         dev->configure_fabric();
     }
     // 1-hop devices second.
     for (auto* dev : remote_onehop) {
+        resync_remote_lite_fabric(dev);
         dev->configure_fabric();
     }
     // MMIO devices last.
@@ -529,6 +923,54 @@ void DeviceManager::init_fabric(const std::vector<tt_metal::IDevice*>& active_de
 
 void DeviceManager::initialize_active_devices() {
     const auto& active_devices = this->get_all_active_devices();
+    auto finalize_lite_fabric_bootstrap = [&]() {
+        auto& context = tt::tt_metal::MetalContext::instance();
+        if (!context.is_lite_fabric_bootstrap_active()) {
+            return;
+        }
+
+        std::vector<IDevice*> remote_devices;
+        std::vector<IDevice*> mmio_devices;
+        remote_devices.reserve(active_devices.size());
+        mmio_devices.reserve(active_devices.size());
+        for (auto* dev : active_devices) {
+            if (!context.get_control_plane().is_chip_mapped(dev->id())) {
+                continue;
+            }
+            if (context.get_cluster().mmio_chip_ids().count(dev->id())) {
+                mmio_devices.push_back(dev);
+            } else {
+                remote_devices.push_back(dev);
+            }
+        }
+
+        std::sort(remote_devices.begin(), remote_devices.end(), [](IDevice* a, IDevice* b) {
+            int hops_a = tt::tt_metal::MetalContext::instance().get_lite_fabric_hop_count(a->id());
+            int hops_b = tt::tt_metal::MetalContext::instance().get_lite_fabric_hop_count(b->id());
+            return hops_a != hops_b ? hops_a > hops_b : a->id() > b->id();
+        });
+
+        for (auto* dev : remote_devices) {
+            context.launch_remote_eth_cores_for_fabric(dev->id());
+        }
+        // Single wait for all remote ERISC0s to boot (they boot in parallel).
+        // 500ms is conservative for: trampoline → main() → base FW init → go-signal → kernel entry.
+        log_info(tt::LogMetal, "All remote ERISC0 fabric routers deasserted, waiting 500ms for boot");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        log_info(tt::LogMetal, "DEBUG: finalize: calling terminate_lite_fabric_bootstrap");
+        context.terminate_lite_fabric_bootstrap();
+        log_info(
+            tt::LogMetal,
+            "DEBUG: finalize: terminate returned, calling configure_fabric on {} MMIO devices",
+            mmio_devices.size());
+        for (auto* dev : mmio_devices) {
+            log_info(tt::LogMetal, "DEBUG: finalize: configure_fabric for MMIO device {}", dev->id());
+            dev->configure_fabric();
+            log_info(tt::LogMetal, "DEBUG: finalize: configure_fabric for MMIO device {} done", dev->id());
+        }
+        context.update_lite_fabric_bindings_for_fabric_routers();
+        log_info(tt::LogMetal, "Fabric Initialized with config {}", context.get_fabric_config());
+    };
 
     // Activate fabric (must be before FD)
     tt_fabric::FabricConfig fabric_config = tt::tt_metal::MetalContext::instance().get_fabric_config();
@@ -544,12 +986,10 @@ void DeviceManager::initialize_active_devices() {
             // then MMIO devices.
             init_fabric(active_devices);
 
-            // Now that fabric routers are running on MMIO-side ETH cores, update UMD
-            // bindings to exclude channels reserved for fabric routing.  This must happen
-            // AFTER init_fabric because remote device configure_fabric() needs UMD bindings
-            // to write L1 data and perform l1_barrier through the lite fabric relay.
-            tt::tt_metal::MetalContext::instance().update_lite_fabric_bindings_for_fabric_routers();
-            log_info(tt::LogMetal, "Fabric Initialized with config {}", fabric_config);
+            if (!tt::tt_metal::MetalContext::instance().is_lite_fabric_bootstrap_active()) {
+                tt::tt_metal::MetalContext::instance().update_lite_fabric_bindings_for_fabric_routers();
+                log_info(tt::LogMetal, "Fabric Initialized with config {}", fabric_config);
+            }
         } else if (has_flag(
                        tt::tt_metal::MetalContext::instance().get_fabric_manager(),
                        tt_fabric::FabricManagerMode::TERMINATE_FABRIC)) {
@@ -567,6 +1007,7 @@ void DeviceManager::initialize_active_devices() {
     // Activate FD kernels
     // Remaining steps are for setting up FD
     if (!using_fast_dispatch_) {
+        finalize_lite_fabric_bootstrap();
         return;
     }
 
@@ -583,6 +1024,16 @@ void DeviceManager::initialize_active_devices() {
             return false;
         }
         return !check_chip_mapped || control_plane_ptr->is_chip_mapped(id);
+    };
+    auto resync_remote_lite_fabric = [&](ChipId id) {
+        auto& context = tt::tt_metal::MetalContext::instance();
+        if (context.get_cluster().mmio_chip_ids().count(id)) {
+            return;
+        }
+        auto* remote_chip = context.get_cluster().get_driver()->get_remote_chip(id);
+        if (remote_chip) {
+            remote_chip->get_remote_communication()->resync_remote_transfer_ethernet_cores();
+        }
     };
 
     // Generate static args
@@ -706,6 +1157,7 @@ void DeviceManager::initialize_active_devices() {
                 if (!rdev || !rdev->is_initialized()) {
                     continue;
                 }
+                resync_remote_lite_fabric(rid);
                 log_info(tt::LogMetal, "DEBUG: FD init: post-MMIO-CQ barrier for remote device {}", rid);
                 tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(rid);
                 log_info(tt::LogMetal, "DEBUG: FD init: post-MMIO-CQ barrier for remote device {} passed", rid);
@@ -727,6 +1179,7 @@ void DeviceManager::initialize_active_devices() {
                     }
                     log_info(
                         tt::LogMetal, "DEBUG: FD init: CQ device init for tunnel device {}", mmio_controlled_device_id);
+                    resync_remote_lite_fabric(mmio_controlled_device_id);
                     tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(mmio_controlled_device_id);
                     device->init_command_queue_device();
                     log_info(tt::LogMetal, "Command Queue initialized on Device {}", device->id());
@@ -740,6 +1193,7 @@ void DeviceManager::initialize_active_devices() {
                     if (device && device->is_initialized()) {
                         log_info(
                             tt::LogMetal, "DEBUG: FD init: CQ device init for N-hop device {}", controlled_device_id);
+                        resync_remote_lite_fabric(controlled_device_id);
                         tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(controlled_device_id);
                         device->init_command_queue_device();
                         log_info(tt::LogMetal, "Command Queue initialized on N-hop Device {}", device->id());
@@ -748,6 +1202,7 @@ void DeviceManager::initialize_active_devices() {
             }
         }
     }
+    finalize_lite_fabric_bootstrap();
     log_info(tt::LogMetal, "DEBUG: FD init: complete");
     dispatch_firmware_active_ = true;
 }
@@ -939,20 +1394,25 @@ void DeviceManager::wait_for_fabric_router_sync(uint32_t timeout_ms) const {
     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
     const auto& fabric_context = control_plane.get_fabric_context();
     const auto& builder_context = fabric_context.get_builder_context();
+    // (deferred_lite_remote_devices removed — remote poll after lite fabric termination can never work)
 
     auto wait_for_handshake = [&](IDevice* dev) {
         if (!dev) {
             TT_THROW("Fabric router sync on null device. All devices must be opened for Fabric.");
         }
-        if (builder_context.get_num_fabric_initialized_routers(dev->id()) == 0) {
+        auto did = dev->id();
+        bool is_mmio = dev->is_mmio_capable();
+        bool lite_term = tt::tt_metal::MetalContext::instance().was_lite_fabric_bootstrap_terminated();
+        log_info(
+            tt::LogMetal, "DEBUG: wait_for_handshake: device {} mmio={} lite_terminated={}", did, is_mmio, lite_term);
+        auto num_routers = builder_context.get_num_fabric_initialized_routers(did);
+        if (num_routers == 0) {
+            log_info(tt::LogMetal, "DEBUG: wait_for_handshake: device {} early return (0 routers)", did);
             return;
         }
-        // compile_fabric sets num_fabric_initialized_routers for all devices, but for
-        // deep-hop remote devices, initialize_remote_eth_cores_for_fabric skips all cores
-        // (peer not MMIO) so the fabric router is never actually started on ERISC0.
-        // Reading from such a device would attempt a lite fabric read with a stale
-        // read_event_counter, causing a timeout.
-        if (!tt::tt_metal::MetalContext::instance().has_fabric_routers_launched(dev->id())) {
+        bool launched = tt::tt_metal::MetalContext::instance().has_fabric_routers_launched(did);
+        if (!launched) {
+            log_info(tt::LogMetal, "DEBUG: wait_for_handshake: device {} early return (not launched)", did);
             return;
         }
 
@@ -960,6 +1420,30 @@ void DeviceManager::wait_for_fabric_router_sync(uint32_t timeout_ms) const {
         const auto master_router_logical_core =
             tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(dev->id()).get_eth_core_for_channel(
                 master_router_chan, CoordSystem::LOGICAL);
+
+        log_info(
+            tt::LogMetal,
+            "DEBUG: wait_for_handshake: device {} routers={} chan={}",
+            did,
+            num_routers,
+            master_router_chan);
+        if (lite_term && !is_mmio) {
+            // Remote devices can't be polled after lite fabric termination — ReadFromDeviceL1
+            // goes through UMD read_non_mmio which speaks lite fabric protocol, but nobody is
+            // running lite fabric anymore.  Skip the deferred poll entirely; trust MMIO sync.
+            log_info(
+                tt::LogMetal,
+                "DEBUG: wait_for_handshake: device {} skipping remote READY poll (lite fabric terminated, trusting "
+                "MMIO sync)",
+                did);
+            return;
+        }
+        log_info(
+            tt::LogMetal,
+            "DEBUG: wait_for_handshake: device {} ENTERING POLLING LOOP (lite_term={} is_mmio={})",
+            did,
+            lite_term,
+            is_mmio);
 
         const auto [router_sync_address, expected_status] = builder_context.get_fabric_router_sync_address_and_status();
         std::vector<std::uint32_t> master_router_status{0};
@@ -1242,6 +1726,9 @@ void DeviceManager::wait_for_fabric_router_sync(uint32_t timeout_ms) const {
 
         wait_for_handshake(dev);
     }
+
+    // Note: deferred_lite_remote_devices is no longer populated — remote devices
+    // are skipped entirely when lite fabric is terminated (can't read via UMD).
 }
 
 void DeviceManager::init_firmware_on_active_devices() {
@@ -1416,6 +1903,8 @@ bool DeviceManager::close_device(ChipId device_id) {
 
 bool DeviceManager::close_devices(const std::vector<IDevice*>& devices, bool /*skip_synchronize*/) {
     ZoneScoped;
+    const bool lite_fabric_bootstrap_terminated =
+        tt::tt_metal::MetalContext::instance().was_lite_fabric_bootstrap_terminated();
 
     // Ordered, because we need to shutdown tunnels from the farthest to the closest.
     std::vector<ChipId> devices_to_close;
@@ -1463,36 +1952,49 @@ bool DeviceManager::close_devices(const std::vector<IDevice*>& devices, bool /*s
         mmio_devices_to_close.insert(mmio_device_id);
     }
 
-    // TODO(MO): Remove when legacy non-mesh device is removed
-    for (const ChipId device_id : devices_to_close) {
-        IDevice* device = get_active_device(device_id);
-        detail::ReadDeviceProfilerResults(device, ProfilerReadState::LAST_FD_READ);
+    const bool dispatch_firmware_was_active = this->using_fast_dispatch_ && this->dispatch_firmware_active_;
+    if (dispatch_firmware_was_active) {
+        // TODO(MO): Remove when legacy non-mesh device is removed
+        for (const ChipId device_id : devices_to_close) {
+            IDevice* device = get_active_device(device_id);
+            if (lite_fabric_bootstrap_terminated && !device->is_mmio_capable()) {
+                continue;
+            }
+            detail::ReadDeviceProfilerResults(device, ProfilerReadState::LAST_FD_READ);
+        }
     }
 
     dispatch_firmware_active_ = false;
-    teardown_fd(std::unordered_set<ChipId>(devices_to_close.begin(), devices_to_close.end()));
-    // Terminate sent to each device. Wait for dispatch to finish. MMIO only to prevent clogging SD path.
-    // Dispatch kernels internally have a sync at the end to ensure all credits are returned
-    for (const auto& dev_id : devices_to_close) {
-        auto* dev = get_active_device(dev_id);
-        if (!dev->is_mmio_capable() || !using_fast_dispatch_) {
-            continue;
+    if (dispatch_firmware_was_active) {
+        // Once lite fabric is terminated, remote accesses are rebound to fabric routers.
+        // Teardown still needs to stop dispatch cleanly before the final warm reset.
+        teardown_fd(std::unordered_set<ChipId>(devices_to_close.begin(), devices_to_close.end()));
+        // Terminate sent to each device. Wait for dispatch to finish. MMIO only to prevent clogging SD path.
+        // Dispatch kernels internally have a sync at the end to ensure all credits are returned
+        for (const auto& dev_id : devices_to_close) {
+            auto* dev = get_active_device(dev_id);
+            if (!dev->is_mmio_capable()) {
+                continue;
+            }
+
+            auto dispatch_cores = tt::tt_metal::get_virtual_dispatch_cores(dev_id);
+            tt::llrt::internal_::wait_until_cores_done(dev_id, dev_msgs::RUN_MSG_GO, dispatch_cores, 0);
         }
 
-        auto dispatch_cores = tt::tt_metal::get_virtual_dispatch_cores(dev_id);
-        tt::llrt::internal_::wait_until_cores_done(dev_id, dev_msgs::RUN_MSG_GO, dispatch_cores, 0);
-    }
-
-    // Process registered termination signals from topology
-    for (const auto& dev_id : devices_to_close) {
-        auto* dev = this->get_active_device(dev_id);
-        const auto& info = tt::tt_metal::get_registered_termination_cores(dev_id);
-        for (const auto& core_to_terminate : info) {
-            std::vector<uint32_t> val{core_to_terminate.val};
-            tt_metal::detail::WriteToDeviceL1(
-                dev, core_to_terminate.logical_core, core_to_terminate.address, val, core_to_terminate.core_type);
+        // Process registered termination signals from topology
+        for (const auto& dev_id : devices_to_close) {
+            auto* dev = this->get_active_device(dev_id);
+            // After lite-fabric teardown, remote L1 writes are routed through fabric
+            // routers. Keep profiler readbacks disabled for remotes, but still send
+            // write-only shutdown signals to remote relay muxes.
+            const auto& info = tt::tt_metal::get_registered_termination_cores(dev_id);
+            for (const auto& core_to_terminate : info) {
+                std::vector<uint32_t> val{core_to_terminate.val};
+                tt_metal::detail::WriteToDeviceL1(
+                    dev, core_to_terminate.logical_core, core_to_terminate.address, val, core_to_terminate.core_type);
+            }
+            tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(dev_id);
         }
-        tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(dev_id);
     }
 
     // Terminate fabric routers if not using fabric manager
@@ -1556,9 +2058,14 @@ bool DeviceManager::close_devices(const std::vector<IDevice*>& devices, bool /*s
         }
     }
 
-    for (const ChipId device_id : devices_to_close) {
-        IDevice* device = this->get_active_device(device_id);
-        detail::ReadDeviceProfilerResults(device, ProfilerReadState::ONLY_DISPATCH_CORES);
+    if (dispatch_firmware_was_active) {
+        for (const ChipId device_id : devices_to_close) {
+            IDevice* device = this->get_active_device(device_id);
+            if (lite_fabric_bootstrap_terminated && !device->is_mmio_capable()) {
+                continue;
+            }
+            detail::ReadDeviceProfilerResults(device, ProfilerReadState::ONLY_DISPATCH_CORES);
+        }
     }
 
     detail::ProfilerSync(ProfilerSyncState::CLOSE_DEVICE);
@@ -1570,6 +2077,19 @@ bool DeviceManager::close_devices(const std::vector<IDevice*>& devices, bool /*s
     }
 
     tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::DISABLED);
+
+    if (lite_fabric_bootstrap_terminated) {
+        std::sort(devices_to_close.begin(), devices_to_close.end());
+        devices_to_close.erase(std::unique(devices_to_close.begin(), devices_to_close.end()), devices_to_close.end());
+        if (!devices_to_close.empty()) {
+            std::vector<int> pci_device_ids;
+            pci_device_ids.reserve(devices_to_close.size());
+            for (const auto& dev_id : devices_to_close) {
+                pci_device_ids.push_back(static_cast<int>(dev_id));
+            }
+            tt::umd::WarmReset::warm_reset(pci_device_ids);
+        }
+    }
 
     if (getDeviceProfilerState()) {
         // Device profiling data is dumped here instead of MetalContext::teardown() because MetalContext::teardown() is

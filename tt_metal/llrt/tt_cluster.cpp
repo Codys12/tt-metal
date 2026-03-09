@@ -394,19 +394,22 @@ void Cluster::assign_mem_channels_to_devices(
     // g_MAX_HOST_MEM_CHANNELS (4) is defined in tt::umd::Cluster and denotes the max number of host memory channels per
     // MMIO device Metal currently assigns 1 channel per device. See https://github.com/tenstorrent/tt-metal/issues/4087
     // One WH gateway should have 8 remote deivces in its control group.
+    std::vector<ChipId> sorted_device_ids(controlled_device_ids.begin(), controlled_device_ids.end());
+    std::sort(sorted_device_ids.begin(), sorted_device_ids.end());
+
     log_info(
         tt::LogDevice,
         "assign_mem_channels_to_devices: mmio_device_id={}, controlled_device_ids.size()={}",
         mmio_device_id,
         controlled_device_ids.size());
-    for (const ChipId& device_id : controlled_device_ids) {
+    for (const ChipId& device_id : sorted_device_ids) {
         log_info(tt::LogDevice, "  controlled device: {}", device_id);
     }
     TT_ASSERT(controlled_device_ids.size() <= 9, "Unable to assign each device to its own host memory channel!");
     uint16_t channel = 0;
     this->device_to_host_mem_channel_[mmio_device_id] = channel++;
     log_info(tt::LogDevice, "  assigned mmio device {} -> channel {}", mmio_device_id, 0);
-    for (const ChipId& device_id : controlled_device_ids) {
+    for (const ChipId& device_id : sorted_device_ids) {
         if (device_id == mmio_device_id) {
             continue;
         }
@@ -1723,23 +1726,23 @@ std::set<tt_fabric::chan_id_t> Cluster::get_fabric_ethernet_channels(ChipId chip
     std::set<tt_fabric::chan_id_t> fabric_ethernet_channels;
     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
     const auto& active_eth_cores = control_plane.get_active_ethernet_cores(chip_id, false);
-    log_info(
-        tt::LogDevice,
-        "DEBUG: get_fabric_ethernet_channels: chip {} has {} active eth cores",
-        chip_id,
-        active_eth_cores.size());
+    // log_info(
+    //     tt::LogDevice,
+    //     "DEBUG: get_fabric_ethernet_channels: chip {} has {} active eth cores",
+    //     chip_id,
+    //     active_eth_cores.size());
     for (const auto& eth_core : active_eth_cores) {
         if (!this->is_ethernet_link_up(chip_id, eth_core)) {
             continue;
         }
         if (!this->device_eth_routing_info_.contains(chip_id) ||
             !this->device_eth_routing_info_.at(chip_id).contains(eth_core)) {
-            log_info(
-                tt::LogDevice,
-                "DEBUG: get_fabric_ethernet_channels: chip {} core ({},{}) NOT in routing info",
-                chip_id,
-                eth_core.x,
-                eth_core.y);
+            // log_info(
+            //     tt::LogDevice,
+            //     "DEBUG: get_fabric_ethernet_channels: chip {} core ({},{}) NOT in routing info",
+            //     chip_id,
+            //     eth_core.x,
+            //     eth_core.y);
             continue;
         }
         if (this->device_eth_routing_info_.at(chip_id).at(eth_core) == EthRouterMode::FABRIC_ROUTER) {

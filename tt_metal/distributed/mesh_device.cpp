@@ -335,8 +335,11 @@ std::shared_ptr<MeshDevice> MeshDevice::create(
     mesh_device->distributed_context_->barrier();
 
     // The Device Profiler must be initialized before Fabric is loaded on the Cluster
+    log_info(tt::LogMetal, "DEBUG: MeshDevice::create: calling init_profiler");
     tt_metal::MetalContext::instance().device_manager()->init_profiler();
+    log_info(tt::LogMetal, "DEBUG: MeshDevice::create: calling initialize_fabric_and_dispatch_fw");
     tt_metal::MetalContext::instance().device_manager()->initialize_fabric_and_dispatch_fw();
+    log_info(tt::LogMetal, "DEBUG: MeshDevice::create: returning mesh_device");
     return mesh_device;
 }
 
@@ -1115,6 +1118,11 @@ void MeshDevice::init_command_queue_host() {
 void MeshDevice::init_command_queue_device() {
     TT_THROW("init_command_queue_device() is not supported on MeshDevice - use individual devices instead");
     reference_device()->init_command_queue_device();
+}
+void MeshDevice::initialize_command_queue_runtime_state() {
+    TT_THROW(
+        "initialize_command_queue_runtime_state() is not supported on MeshDevice - use individual devices instead");
+    reference_device()->initialize_command_queue_runtime_state();
 }
 bool MeshDevice::compile_fabric() {
     TT_THROW("compile_fabric() is not supported on MeshDevice - use individual devices instead");

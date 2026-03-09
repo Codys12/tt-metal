@@ -1,145 +1,129 @@
-# Full ERISC0 + ERISC1 Coexistence on All Connected ETH Tiles
+# Fabric Router Dispatch for P150 (1x8 Blackhole)
 
-## Goal
+## Current Objective
 
-Every connected ETH core on every chip (MMIO and remote) simultaneously runs:
-- **ERISC0**: Metal's fabric router (for op-level CCL communication)
-- **ERISC1**: Lite fabric relay (for UMD-level L1 reads/writes to remote devices)
+Get fabric router dispatch working end-to-end for all 8 devices in a 1x8 Blackhole mesh.
+Lite fabric bootstrap is DONE and WORKING. The current problem is in the dispatch-through-fabric-router
+layer: Device 0 (phys6, 3-hop NORTH from MMIO) stalls during op execution.
 
-They coexist on the same ETH tile because they use separate L1 regions, separate NOC
-TRIDs, and separate TXQs (fabric router: TXQ0/TXQ1, lite fabric: TXQ2).
+## Physical Topology
 
-## Completed Work
+```
+D0(phys6) ── D1(phys4) ── D2(phys2) ── D3(phys0/MMIO) ── D4(phys1) ── D5(phys3) ── D6(phys5) ── D7(phys7)
+  3-hop N      2-hop N      1-hop N       (PCIe host)       1-hop S      2-hop S      3-hop S      4-hop S
+```
 
-### Dual-channel architecture (Groups 1-5)
-- **Ch0**: outbound commands (host→remote writes + read commands)
-- **Ch1**: inbound read responses (remote→host)
-- 4 buffer slots per channel for pipelining
-- Per-TRID NOC barriers: ch0 uses TRIDs 8-11, ch1 uses TRIDs 12-15
-- Stream register assignments: ch0 IDs 23-25, ch1 IDs 26-28
-- UMD: `HostToLiteFabricInterface` has `recv_ch1` state, `flush_recv_ch1_h2d()`,
-  `read_one_page()` uses ch1 receiver buffers
-- Memory layout: 56KB (base 0x62000), FW and UMD memory maps in sync
+- Board: p150b, 1 PCIe device (phys0 = MMIO), rest are remote via ETH
+- Config: FABRIC_1D_RING, MeshShape([1, 8]), 1 routing plane per direction
+- UMD tunnels: flat `[mmio, remote]` pairs created by Phase 3c (chip-ID order)
 
-### Lite fabric / fabric router resource separation
-- Lite fabric: TXQ2, TRIDs 8-15, stream regs 23-28, L1 region 0x62000-0x70000
-- Fabric router: TXQ0/TXQ1, TRIDs 0-7, stream regs 0-22+29-31, L1 below 0x62000
+## How Dispatch Through Fabric Works
 
-### N-hop BFS discovery (Phase 2b)
-- BFS discovers multi-hop chips, launches downstream tunnels, configures forwarding
-- Forwarding stays on ch0 only; direct 1-hop reads use ch1
-- `downstream_sender_cores_` tracks which cores have ERISC1 running as downstream senders
+### Forward Path (Host → Remote Device)
+```
+Host CQ → PREFETCH_H (MMIO Tensix) → FABRIC_MUX (MMIO Tensix) → Router sender ch0 (MMIO ETH/ERISC0)
+  → ETH link → Router receiver (intermediate) → forwarding → Router sender ch1 (intermediate)
+  → ... (repeat for each hop) ...
+  → Router receiver (destination) → NOC write to PREFETCH_D L1 (remote Tensix)
+  → DISPATCH_D → workers
+```
 
-### Phase A: ERISC0 kill + TXQ0 init (DONE)
-**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
+### Return Path (Remote Device → Host)
+```
+DISPATCH_D (remote Tensix) → RETURN_FABRIC_MUX (remote Tensix) → Router sender ch0 (remote ETH/ERISC0)
+  → ETH link → Router receiver (intermediate) → forwarding → Router sender ch1 (intermediate)
+  → ... (repeat for each hop) ...
+  → Router receiver (MMIO) → NOC write to DISPATCH_H L1 (MMIO Tensix)
+  → DISPATCH_H → host CQ completion
+```
 
-- ERISC0 killed at boot via local RISC-V store (0x46800). Required because init-fsm
-  uses TXQ0, ERISC0 syseng FW also uses TXQ0 → contention causes hardware hang.
-- TXQ0 KEEPALIVE enabled after kill. After init, ERISC1 switches to TXQ2 steady-state.
-- Periodic keepalive on TXQ2 every ~65K iterations (safety net for Phase 2→4 window).
-- Keepalive in sentinel spin loop (channels.hpp NOC_READ) prevents ETH timeout during slow reads.
+### Key Concepts
 
-### Phase B: L1-based notification counters (DONE)
-**Files: `channels.hpp`, `lite_fabric.cpp`**
+- **Routing path (LowLatencyRoutingFields)**: 2-bit fields packed into uint64. Each receiver reads lowest 2 bits, right-shifts by 2. Values: WRITE_ONLY=0b01 (deliver locally), FORWARD_ONLY=0b10 (forward to next hop), WRITE_AND_FORWARD=0b11.
+- **For 3-hop route**: `0b01_10_10` = FORWARD, FORWARD, WRITE_ONLY. Each intermediate hop forwards, last hop delivers.
+- **`num_hops`**: Computed by `get_num_hops(mmio_id, remote_id)` in relay_mux.cpp. Baked into dispatch kernel binaries as compile-time `NUM_HOPS` macro. Used by CQRelayClient to construct the routing path bitmask via `fabric_set_unicast_route()`.
+- **Forwarding connections**: On each intermediate chip, NORTH↔SOUTH router pairs. SOUTH receiver → NORTH sender ch1 (northbound forwarding). NORTH receiver → SOUTH sender ch1 (southbound forwarding).
+- **Sender ch0**: Connected to local FABRIC_MUX (worker traffic). **Sender ch1**: Connected to paired router's receiver (forwarded traffic).
+- **Routing planes**: Number of ETH links used per direction. Currently 1 (minimum across all chips). Endpoint chips with 1 link in their direction drag the count.
 
-- COMMAND frames (stream register updates) are TXQ0-only on BH; lite fabric uses TXQ2.
-- Replaced with L1 DATA frame counters: `pkts_sent_notify[2][4]`, `pkts_completed_notify[2][4]`.
-- Read via `noc_self_read_word()` to bypass D-cache (BSS variables have stale cache lines).
+### Dispatch Topology (topology.cpp)
 
-### Phase C: NOC cmd buffer separation (DONE)
-**Files: `channels.hpp`, `constants.hpp`, `lite_fabric.cpp`**
+`generate_blackhole_multichip_fabric_1cq_nodes()` creates per-direction relay groups:
+- Groups remote devices by `(forwarding_direction, link_index)` key
+- NORTH group: D0, D1, D2 share one FABRIC_MUX on MMIO
+- SOUTH group: D4, D5, D6, D7 share one FABRIC_MUX on MMIO
+- Each remote device gets: PREFETCH_D, DISPATCH_D, DISPATCH_S, RETURN_FABRIC_MUX
+- MMIO gets: per-device PREFETCH_H + DISPATCH_H pairs, plus FABRIC_MUX per direction
 
-- ERISC1: cmd buf 2 (write), cmd buf 3 (read). ERISC0: cmd buf 0/1.
-- `local_chip_data_cmd_buf = DYNAMIC_NOC_NCRISC_WR_CMD_BUF`, `LF_RD_CMD_BUF = 3`.
-- Initialized in main() mirroring noc_init's setup.
+### MUX → Router Connection
 
-### Phase D: TXQ2 MAC configuration (DONE)
-**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
+In `fabric.cpp:append_fabric_connection_rt_args()`:
+- MUX determines forwarding direction from src/dst fabric node IDs
+- Selects ETH channel via `candidate_eth_chans[link_idx]`
+- Connects to router's sender ch0 (via SenderWorkerAdapterSpec with NOC coords)
+- Two-phase handshake: write location info, then write open_connection_value=1
 
-- TXPKT_CFG_SEL_SW (0x80) and TXPKT_CFG_SEL_HW (0x84) set to entry 0 (broadcast MAC DA).
-- Without this, TXQ2 uses undefined config → remote MAC drops frames silently.
+## Current Bug: D0 (3-hop NORTH) CQ Stall
 
-### Phase E: Init-fsm TXQ0 serialization (DONE)
-**File: `tt_metal/lite_fabric/hw/inc/init-fsm-basic.hpp`**
+### Symptom
+- D0's CQ completion write pointer stuck at 0x2555a8 (made some initial progress, then stopped)
+- Other devices (D1-D7) appear to make progress
+- Happens during `flash_mla_prefill` op execution on all 8 devices
 
-- `k_DataTxq = 0`: data + handshake on same TXQ as COMMAND frames (deassert).
-- Natural serialization, no cross-TXQ race. TXQ busy barrier after binary send.
+### Root Cause Hypothesis: Wrong `num_hops` from UMD Tunnel Fallback
 
-### Phase F: Per-core erisc1_running detection (DONE)
-**File: `tt_metal/impl/context/metal_context.cpp`**
+**`get_num_hops(mmio, downstream)`** has 3 resolution tiers:
+1. `get_lite_fabric_hop_count(downstream)` — BFS-discovered, correct (returns 3 for phys6)
+2. **NEW**: Control plane `get_fabric_route()` — computes actual route length (returns 3)
+3. UMD tunnel scan — flat `[mmio, remote]` tunnels, returns `hop=1` for ALL devices (WRONG!)
 
-- erisc1_running=true only for: MMIO-peering, downstream senders, tunnel endpoints.
-- Non-tunnel cores keep ERISC1 in POR (0x47000). Prevents syseng subordinate FW conflicts.
+If tier 1 returns 0 (e.g., lite_fabric_hal_ not available), the old code fell through to tier 3,
+giving `hop=1` for phys6. DISPATCH_D would construct routing path `0b01` (WRITE_ONLY at first hop).
+Completion packets would be "delivered" at D1 instead of forwarded to MMIO → D0's CQ never advances.
 
-### Phase G: Early MetalContext::initialize (DONE)
-**File: `tt_metal/distributed/mesh_device.cpp`**
+**Fix applied**: Added tier 2 (control plane route length) as fallback before the broken UMD scan.
 
-- MeshDevice::create calls initialize() before control plane access.
-- Ensures BFS discovery completes before SystemMesh construction.
+### Other Possible Causes (if hop count is confirmed correct)
+- Forwarding chain congestion under load (all 8 devices using shared links simultaneously)
+- Flow control credit leak in forwarding path
+- EDM router firmware issue at intermediate hops under sustained traffic
+- Router connection handshake failure on D0's RETURN_FABRIC_MUX → SOUTH router
 
-### device.cpp configure_fabric (DONE — no changes needed)
-- SOFT_RESET_BOTH_RUNNING = 0x46000. TXQ partitioning eliminates contention.
+### Diagnostics Added
+- `relay_mux.cpp`: Logs which `get_num_hops` tier was used (lite_fabric / control_plane / UMD)
+- `dispatch.cpp`: Logs exact `num_hops` for DISPATCH_H (forward) and DISPATCH_D (return)
+- `prefetch.cpp`: Logs exact `num_hops` for PREFETCH_H (forward)
+- `system_memory_manager.cpp`: At CQ stall (≥10s), dumps all devices' CQ pointers, router connection/flow-control semaphores, EDM status, hop counts
+- `device_manager.cpp`: Post-init dumps EDM status, MUX cores, routing info per device, connection semaphores
+- `control_plane.cpp`: Pre/post routing plane channel counts per device per direction
 
----
+## Routing Plane Count (Physical Links)
 
-## Remaining Work
+Currently limited to 1 per direction. The `initialize_dynamic_routing_plane_counts()` function
+takes the global minimum across all chips for each direction. Endpoint chips (D0, D7) with only
+1 ETH link in their direction drag the count to 1.
 
-### Build + Test (NEXT)
-
-1. Clear FW cache: `rm -rf ~/.cache/tt-metal-cache/`
-2. Build: `cmake --build build -- -j$(nproc) tt_metal`
-3. Run test script (see Test Plan below)
-4. Debug any failures
-
-### Phase H: D-Cache Optimization (Nice-to-Have, DEFERRED)
-
-**File: `tt_metal/lite_fabric/hw/src/lite_fabric.cpp`**
-
-The `noc_self_read_word()` calls are slow (NOC DMA self-read to bypass D-cache).
-Note: `invalidate_l1_cache()` on BH is just `asm("fence")` — it does NOT invalidate
-D-cache lines. CSR 0x7c0 bit 3 prevents NEW allocations but existing stale lines
-from `data_init()` (which runs before CSR set on second boot) persist.
-
-Deferred until coexistence is working.
-
-### Phase I: Multi-Path Tunnels (Nice-to-Have, DEFERRED)
-
-Allow multiple tunnels to the same remote device through different ETH links for
-redundancy and load balancing. Requires:
-- `set_remote_transfer_ethernet_cores` to accept multiple cores
-- Round-robin or least-loaded selection in `get_remote_transfer_ethernet_core()`
-- Per-core h2d/d2h tracking (already in place with separate HostToLiteFabricInterface)
-
-Deferred until coexistence is working.
-
----
-
-## 6-Phase Initialization Order
-
-1. **Phase 1**: MMIO FW — launch Metal FW on MMIO device ETH cores (ERISC0)
-2. **Phase 2**: Lite fabric — launch ERISC1 on all connected MMIO ETH cores, init-fsm handshake with neighbors
-3. **Phase 2a**: Upgrade remote SoC — read boot_results, populate SoC descriptor
-4. **Phase 2b**: BFS + downstream tunnels — discover N-hop chips, launch downstream senders/receivers
-5. **Phase 3**: Remote FW — launch ERISC0 (Metal active erisc) on all remote device ETH cores via `initialize_remote_eth_cores_for_fabric()`
-6. **Phase 4**: Fabric router — `configure_fabric()` on all devices (deep-hop first, 1-hop second, MMIO last)
-
-After Phase 4, every connected ETH core has ERISC0 (fabric router) + ERISC1 (lite fabric relay) running simultaneously.
+The diagnostic logs will show exactly which chip/direction is the bottleneck. If endpoint chips
+genuinely only have 1 link, we'd need topology changes (e.g., different MeshShape interpretation)
+to use more links on the segments that support it.
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `tt_metal/lite_fabric/hw/src/lite_fabric.cpp` | FW main loop — ERISC1 only touches TXQ2 |
-| `tt_metal/lite_fabric/hw/inc/channels.hpp` | Sender/receiver logic, TXQ2 recovery |
-| `tt_metal/lite_fabric/hw/inc/constants.hpp` | TXQ assignments (DEFAULT_ETH_TXQ=2), TRID offsets, stream reg IDs |
-| `tt_metal/lite_fabric/hw/inc/host_interface.hpp` | FabricLiteConfig, FabricLiteMemoryMap |
-| `tt_metal/lite_fabric/hw/inc/init-fsm-basic.hpp` | Init handshake (uses TXQ0 via ConnectedRiscInterface — Phase 2 only) |
-| `tt_metal/lite_fabric/hw/inc/blackhole/risc_interface.hpp` | ConnectedRiscInterface (TXQ0 for remote reg writes — Phase 2 only) |
-| `tt_metal/impl/device/device.cpp` | `configure_fabric()` — ERISC0 deassert with 0x46000 on all cores |
-| `tt_metal/impl/device/device_manager.cpp` | `init_fabric()` ordering — deep-hop first, 1-hop second, MMIO last |
-| `tt_metal/impl/context/metal_context.cpp` | `initialize_remote_eth_cores_for_fabric()` (erisc1_running=true when lite fabric active), `update_lite_fabric_bindings_for_fabric_routers()` |
-| `tt_metal/third_party/umd/.../lite_fabric.hpp` | UMD-side host interface and memory map |
-| `tt_metal/third_party/umd/.../remote_communication_lite_fabric.cpp` | UMD read/write/rebind |
+| `tt_metal/impl/dispatch/topology.cpp` | Dispatch node graph, relay group formation |
+| `tt_metal/impl/dispatch/kernel_config/relay_mux.cpp` | FABRIC_MUX config, `get_num_hops()` |
+| `tt_metal/impl/dispatch/kernel_config/dispatch.cpp` | DISPATCH_H/D config, num_hops usage |
+| `tt_metal/impl/dispatch/kernel_config/prefetch.cpp` | PREFETCH_H/D config, num_hops usage |
+| `tt_metal/impl/dispatch/system_memory_manager.cpp` | CQ wait + stall diagnostics |
+| `tt_metal/impl/device/device_manager.cpp` | Fabric/dispatch init, post-init diagnostics |
+| `tt_metal/fabric/fabric.cpp` | `append_fabric_connection_rt_args()` MUX→Router |
+| `tt_metal/fabric/control_plane.cpp` | Routing tables, routing planes, `get_fabric_route()` |
+| `tt_metal/fabric/compute_mesh_router_builder.cpp` | Forwarding connection pairs |
+| `tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp` | EDM router FW |
+| `tt_metal/fabric/hw/inc/edm_fabric/fabric_edm_packet_transmission.hpp` | Forwarding logic |
+| `tt_metal/impl/context/metal_context.cpp` | BFS discovery, lite fabric hop counts |
+| `tt_metal/impl/dispatch/kernel_config/fd_kernel.cpp` | `GetUpstreamDeviceId/GetDownstreamDeviceId` |
 
 ## Test Plan
 You will be fed the output of this script to debug and complete implementation:
@@ -213,42 +197,8 @@ if __name__ == "__main__":
 Make sure devices 0-7 are fully working for ops and that teardown works successfully
 DO NOT BUILD THE CHANGES OR RUN THEM WHEN YOU ARE DONE. I will do this from an extrnel loop.
 Start this session by checking your memory for progress and bugs from previous runs.
-
-
-## Risks and Known Caveats
-
-1. **Boot window (Phase 2 → Phase 4)**: Between lite fabric start and fabric router
-   start, ERISC0 is in POR/reset state. No natural keepalive from ERISC0. BH MAC
-   timeout is ~10s; boot window is ~2-5s. BFS traffic provides some ETH activity.
-   If link timeouts are observed during boot, add a conditional keepalive in ERISC1
-   that checks whether ERISC0 is running (e.g., read TXQ0 CTRL or a shared flag).
-
-2. **Init handshake TXQ0**: `ConnectedRiscInterface` uses TXQ0 during Phase 2 init
-   (before fabric router starts in Phase 4). No conflict in normal flow. Would
-   conflict if lite fabric re-initializes after fabric router is running — this
-   doesn't happen in normal operation. Low-priority future fix: migrate
-   ConnectedRiscInterface to TXQ2.
-
-3. **L1 overlap**: Fabric router's L1 must not extend into 0x62000-0x70000 (lite
-   fabric region). Currently safe: `MEM_ERISC_MAX_SIZE` is ~0x61260. Monitor if
-   fabric router grows.
-
-4. **NOC contention**: Both ERISCs share NOC0. Lite fabric uses per-TRID barriers
-   (TRIDs 8-15) and sentinel-based reads to avoid counter interference with
-   fabric router (TRIDs 0-7). No overlap verified.
-
-5. **ERISC0 killed at boot**: ERISC1 kills ERISC0 at boot (local store to 0x46800)
-   to prevent TXQ0 contention during init-fsm. ERISC0 remains in reset until
-   Phase 3 (remote FW) or Phase 4 (configure_fabric on MMIO) relaunches it.
-   During Phase 2→4 window, no fabric router traffic exists — the periodic
-   keepalive on TXQ2 prevents ETH link timeout.
+Always look at the previous log before this to make sure there are no regressions.
 
 
 IMPORTANT:
-You need to make sure lite_fabric deployment is working first across at least 8 total devices (there are at least 7 remote for you to used cabled up)
-Then you need to make sure fabric router is working across those ETH tiles for all ERISC0s in tandem with the lite fabric logic.
-
-Use for context the commit "working!" for single ttnn.open_device bringup. That successfully loaded lite_fabric across all remote chips and should be used as a baseline/reference for debugging why lite fabric is not working for n-hop. Study it carefully when you need to. Lite fabric should be fully deployed before you go on to fabric router for maximum simplicity. You must be very attentive to the lite fabric setup/bringup across n-hop devices, as even the slightest mistake can lead to a hang. This lite fabric will be a persistant control plane once set up -- ideally all through TXQ2.
-
-YOU REALLY DO WANT TXQ2 AFTER YOU REACH STEADY STATE (AFTER ALL LITE FABRIC IS SET UP BUT BEFORE FABRIC ROUTER IS LAUNCHED)
-Finally: always try to make your fixes in as minimal lines of code changed as possible. Debug logs do not count towards this line minimization.
+Always try to make your fixes in as minimal lines of code changed as possible. Debug logs do not count towards this line minimization.

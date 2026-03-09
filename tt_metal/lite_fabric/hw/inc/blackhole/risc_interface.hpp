@@ -94,6 +94,14 @@ struct ConnectedRiscInterface {
         txq_wait_or_recover_init(k_Txq);
     }
 
+    // Put only the connected ERISC1 into reset while leaving ERISC0 running.
+    // Used during lite-fabric shutdown after the remote fabric router has been launched.
+    inline static void assert_connected_erisc1_reset_only() {
+        constexpr uint32_t k_ResetErisc1Only = 0x47000;
+        internal_::eth_write_remote_reg(k_Txq, k_SoftResetAddr, k_ResetErisc1Only);
+        txq_wait_or_recover_init(k_Txq);
+    }
+
     // Take ERISC1 out of reset while keeping ERISC0 in reset.
     // ERISC0 will be deasserted later by Metal's initialize_and_launch_firmware.
     inline static void deassert_connected_dm1_reset() {

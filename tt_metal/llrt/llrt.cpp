@@ -229,7 +229,9 @@ bool test_load_write_read_risc_binary(
 
 void write_binary_to_address(const ll_api::memory& mem, tt::ChipId chip_id, const CoreCoord& core, uint32_t address) {
     log_debug(tt::LogLLRuntime, "vec size = {}, size_in_bytes = {}", mem.size(), mem.size() * sizeof(uint32_t));
-    bool is_remote = !tt::tt_metal::MetalContext::instance().get_cluster().mmio_chip_ids().count(chip_id);
+    const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
+    bool is_remote = !cluster.mmio_chip_ids().count(chip_id);
+    const bool lite_fabric_bootstrap_active = tt::tt_metal::MetalContext::instance().is_lite_fabric_bootstrap_active();
     uint32_t total_written = 0;
     uint32_t first_word_written = 0;
     mem.process_spans([&](std::vector<uint32_t>::const_iterator mem_ptr, uint64_t /*addr*/, uint32_t len_words) {
@@ -240,6 +242,19 @@ void write_binary_to_address(const ll_api::memory& mem, tt::ChipId chip_id, cons
         }
         total_written += len_words;
     });
+    // Remote bootstrap writes still go through lite fabric. The write succeeds, but
+    // immediate readback can stall the shared relay on later devices.
+    if (is_remote && lite_fabric_bootstrap_active) {
+        log_info(
+            tt::LogMetal,
+            "write_binary_to_address VERIFY: skipping remote {} readback on chip {} core {} addr=0x{:x} "
+            "while lite-fabric bootstrap is active",
+            cluster.is_ethernet_core(core, chip_id) ? "ETH" : "non-ETH",
+            chip_id,
+            core.str(),
+            address);
+        return;
+    }
     if (is_remote) {
         // Readback verify for remote devices
         uint32_t readback[4] = {0};

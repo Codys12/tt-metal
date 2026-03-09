@@ -175,6 +175,7 @@ public:
         bool minimal = false) = 0;
     virtual void init_command_queue_host() = 0;
     virtual void init_command_queue_device() = 0;
+    virtual void initialize_command_queue_runtime_state() = 0;
 
     // return false if compile fails (mainly come from Nebula on TG)
     virtual bool compile_fabric() = 0;

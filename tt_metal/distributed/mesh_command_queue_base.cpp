@@ -4,6 +4,7 @@
 
 #include "mesh_command_queue_base.hpp"
 
+#include <tt-logger/tt-logger.hpp>
 #include <mesh_device.hpp>
 #include <mesh_event.hpp>
 #include <optional>
@@ -231,15 +232,22 @@ void MeshCommandQueueBase::enqueue_write_shards_nolock(
             *buffer, shard_data_transfer.shard_coord, shard_data_transfer.host_data, shard_data_transfer.region);
     };
 
+    log_info(tt::LogMetal, "DEBUG: enqueue_write_shards_nolock: dispatching {} shards", shard_data_transfers.size());
     for (std::size_t shard_idx = 0; shard_idx < shard_data_transfers.size(); shard_idx++) {
         auto shard_coord = shard_data_transfers[shard_idx].shard_coord;
         if (mesh_device_->is_local(shard_coord)) {
-            dispatch_thread_pool_->enqueue(
-                [&dispatch_lambda, shard_idx]() { dispatch_lambda(shard_idx); },
-                mesh_device_->get_device(shard_coord)->id());
+            auto dev_id = mesh_device_->get_device(shard_coord)->id();
+            log_info(
+                tt::LogMetal,
+                "DEBUG: enqueue_write_shards_nolock: dispatching shard {} to device {}",
+                shard_idx,
+                dev_id);
+            dispatch_thread_pool_->enqueue([&dispatch_lambda, shard_idx]() { dispatch_lambda(shard_idx); }, dev_id);
         }
     }
+    log_info(tt::LogMetal, "DEBUG: enqueue_write_shards_nolock: waiting for thread pool");
     dispatch_thread_pool_->wait();
+    log_info(tt::LogMetal, "DEBUG: enqueue_write_shards_nolock: thread pool done");
 
     if (blocking) {
         this->finish_nolock();

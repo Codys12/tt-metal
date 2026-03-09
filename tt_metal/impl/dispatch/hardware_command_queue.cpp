@@ -94,17 +94,9 @@ HWCommandQueue::HWCommandQueue(
         prefetcher_dram_aligned_block_size_, prefetcher_dram_aligned_num_blocks_, prefetcher_cache_manager_size_)) {
     ZoneScopedN("CommandQueue_constructor");
 
-    ChipId mmio_device_id =
-        tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device_->id());
     uint16_t channel =
         tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device_->id());
-    this->size_B_ =
-        tt::tt_metal::MetalContext::instance().get_cluster().get_host_channel_size(mmio_device_id, channel) /
-        device_->num_hw_cqs();
-    if (tt::tt_metal::MetalContext::instance().get_cluster().is_galaxy_cluster()) {
-        // Galaxy puts 4 devices per host channel until umd can provide one channel per device.
-        this->size_B_ = this->size_B_ / 4;
-    }
+    this->size_B_ = manager_.get_cq_size();
 
     CoreCoord enqueue_program_dispatch_core;
     CoreType core_type = MetalContext::instance().get_dispatch_core_manager().get_dispatch_core_type();

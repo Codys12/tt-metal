@@ -231,23 +231,33 @@ void Device::configure_command_queue_programs() {
                 // Reset the host manager's pointer for this command queue
                 this->sysmem_manager_->reset(cq_id);
 
-                pointers[host_issue_q_rd_ptr / sizeof(uint32_t)] =
-                    (cq_start + get_absolute_cq_offset(serviced_device_id, channel, cq_id, cq_size)) >> 4;
-                pointers[host_issue_q_wr_ptr / sizeof(uint32_t)] =
-                    (cq_start + get_absolute_cq_offset(serviced_device_id, channel, cq_id, cq_size)) >> 4;
-                pointers[host_completion_q_wr_ptr / sizeof(uint32_t)] =
-                    (cq_start + this->sysmem_manager_->get_issue_queue_size(cq_id) +
-                     get_absolute_cq_offset(serviced_device_id, channel, cq_id, cq_size)) >>
-                    4;
-                pointers[host_completion_q_rd_ptr / sizeof(uint32_t)] =
-                    (cq_start + this->sysmem_manager_->get_issue_queue_size(cq_id) +
-                     get_absolute_cq_offset(serviced_device_id, channel, cq_id, cq_size)) >>
-                    4;
+                const uint32_t host_cq_offset = get_absolute_cq_offset(serviced_device_id, channel, cq_id, cq_size);
+                const uint32_t issue_q_start_16B = (cq_start + host_cq_offset) >> 4;
+                const uint32_t completion_q_start_16B =
+                    (cq_start + this->sysmem_manager_->get_issue_queue_size(cq_id) + host_cq_offset) >> 4;
+                pointers[host_issue_q_rd_ptr / sizeof(uint32_t)] = issue_q_start_16B;
+                pointers[host_issue_q_wr_ptr / sizeof(uint32_t)] = issue_q_start_16B;
+                pointers[host_completion_q_wr_ptr / sizeof(uint32_t)] = completion_q_start_16B;
+                pointers[host_completion_q_rd_ptr / sizeof(uint32_t)] = completion_q_start_16B;
+
+                log_info(
+                    tt::LogMetal,
+                    "DEBUG CQ-SETUP: mmio={} serviced_device={} cq={} channel={} umd={} share_offset=0x{:x} "
+                    "host_cq_offset=0x{:x} issue_start=0x{:x} completion_start=0x{:x}",
+                    device_id,
+                    serviced_device_id,
+                    cq_id,
+                    channel,
+                    get_umd_channel(channel),
+                    get_per_device_host_channel_offset(serviced_device_id, channel),
+                    host_cq_offset,
+                    issue_q_start_16B << 4,
+                    completion_q_start_16B << 4);
 
                 tt::tt_metal::MetalContext::instance().get_cluster().write_sysmem(
                     pointers.data(),
                     pointers.size() * sizeof(uint32_t),
-                    get_absolute_cq_offset(serviced_device_id, channel, cq_id, cq_size),
+                    host_cq_offset,
                     mmio_device_id,
                     get_umd_channel(channel));
             }
@@ -358,6 +368,9 @@ void Device::init_command_queue_device() {
                 this->get_dev_addr(virtual_core, HalL1MemAddrType::LAUNCH));
         }
     }
+}
+
+void Device::initialize_command_queue_runtime_state() {
     // Set num_worker_sems and go_signal_noc_data on dispatch for the default sub device config
     for (auto& hw_cq : this->command_queues_) {
         hw_cq->set_go_signal_noc_data_and_dispatch_sems(
@@ -376,11 +389,14 @@ void Device::configure_fabric() {
         return;
     }
 
-    // Remote devices behind lite fabric have their ETH cores in POR state
-    // (skipped during init_fw).  Initialize base ERISC firmware on ETH cores
-    // used by the fabric program so they can process kernel launch messages.
     const auto& cluster = MetalContext::instance().get_cluster();
-    if (!cluster.mmio_chip_ids().count(this->id())) {
+    const bool needs_eth_fw_bootstrap =
+        !cluster.mmio_chip_ids().count(this->id()) || MetalContext::instance().was_lite_fabric_bootstrap_terminated();
+    // Remote devices behind lite fabric have their ETH cores in POR state.
+    // After lite-fabric teardown, MMIO tunnel cores also need the same
+    // reset-PC bootstrap because ERISC0 stayed in reset for the relay's
+    // lifetime and never received base ERISC firmware.
+    if (needs_eth_fw_bootstrap) {
         const auto& hal = MetalContext::instance().hal();
         std::vector<std::vector<CoreCoord>> logical_cores = fabric_program_->impl().logical_cores();
         std::vector<CoreCoord> eth_cores;
@@ -391,7 +407,7 @@ void Device::configure_fabric() {
                 }
             }
         }
-        MetalContext::instance().initialize_remote_eth_cores_for_fabric(this->id(), eth_cores);
+        MetalContext::instance().initialize_remote_eth_cores_for_fabric(this->id(), eth_cores, /*launch_erisc0=*/false);
     }
 
     tt::tt_fabric::configure_fabric_cores(this);
@@ -463,15 +479,15 @@ void Device::configure_fabric() {
     // hard reset via assert_risc_reset_at_core(ALL_TENSIX) and only deasserted
     // ERISC1.  ERISC0 must be restarted to process the fabric router go message.
     //
-    // WARNING: Lite fabric currently uses TXQ0 (DEFAULT_ETH_TXQ=0).  Fabric
-    // router also uses TXQ0/TXQ1.  Deasserting ERISC0 creates TXQ0 contention
-    // on MMIO cores where ERISC1 runs lite fabric.  This is a known issue that
-    // will be resolved when TXQ2 coexistence is debugged.
+    // During bootstrap, MMIO tunnel cores still run lite fabric ERISC1 and must
+    // not launch ERISC0 yet. After the relay is terminated, this same code path
+    // is re-entered to deassert MMIO ERISC0 locally.
     if (cluster.mmio_chip_ids().count(this->id())) {
         constexpr uint32_t SOFT_RESET_REG_ADDR = 0xFFB121B0;
-        // 0x46000: bits 13/14/18 set (standard for ETH tiles), ERISC0+ERISC1 out of reset.
-        // Previous value 0x00000 incorrectly cleared bits 13/14/18.
+        // 0x46000: bits 13/14/18 set, ERISC0+ERISC1 out of reset.
         constexpr uint32_t SOFT_RESET_BOTH_RUNNING = 0x46000;
+        // 0x47000: bits 12/13/14/18 set, ERISC0 out of reset and ERISC1 held in reset.
+        constexpr uint32_t SOFT_RESET_ERISC0_ONLY = 0x47000;
         constexpr uint32_t AERISC_RESET_PC_ADDR = 0xFFB14000;
         constexpr uint32_t API_TABLE_ADDR = 0x7CF00;
         constexpr uint32_t API_TABLE_ENTRIES = 4;
@@ -484,6 +500,7 @@ void Device::configure_fabric() {
         auto jit_build_config = hal_ref.get_jit_build_config(core_type_idx, 0, 0);
         uint32_t fw_base = jit_build_config.fw_launch_addr_value;
         DeviceAddr mailbox_addr = hal_ref.get_dev_addr(eth_type, HalL1MemAddrType::MAILBOX);
+        const bool lite_fabric_terminated = MetalContext::instance().was_lite_fabric_bootstrap_terminated();
 
         bool any_deasserted = false;
         for (uint32_t pct_idx = 0; pct_idx < logical_cores_used_in_program.size(); pct_idx++) {
@@ -497,7 +514,8 @@ void Device::configure_fabric() {
                 // Lite fabric (ERISC1) uses TXQ0; fabric router (ERISC0) also
                 // uses TXQ0/TXQ1.  Deasserting ERISC0 creates TXQ0 contention
                 // that causes permanent TXQ hang after ~115 operations.
-                if (MetalContext::instance().is_lite_fabric_mmio_core(this->id(), vc)) {
+                if (MetalContext::instance().is_lite_fabric_bootstrap_active() &&
+                    MetalContext::instance().is_lite_fabric_mmio_core(this->id(), vc)) {
                     log_info(
                         tt::LogMetal,
                         "Device {} configure_fabric: skipping ERISC0 deassert on core {} — "
@@ -533,7 +551,7 @@ void Device::configure_fabric() {
 
                 // Deassert ERISC0
                 cluster.l1_barrier(this->id());
-                uint32_t soft_reset_val = SOFT_RESET_BOTH_RUNNING;
+                uint32_t soft_reset_val = lite_fabric_terminated ? SOFT_RESET_ERISC0_ONLY : SOFT_RESET_BOTH_RUNNING;
                 cluster.write_core(&soft_reset_val, sizeof(uint32_t), tt_cxy_pair(this->id(), vc), SOFT_RESET_REG_ADDR);
 
                 log_info(tt::LogMetal, "Device {} configure_fabric: deasserted ERISC0 on core {}", this->id_, vc.str());
@@ -547,7 +565,12 @@ void Device::configure_fabric() {
         }
     }
 
-    log_info(tt::LogMetal, "Fabric initialized on Device {}", this->id_);
+    const bool fabric_launch_deferred =
+        (cluster.mmio_chip_ids().count(this->id()) && MetalContext::instance().is_lite_fabric_bootstrap_active()) ||
+        (!cluster.mmio_chip_ids().count(this->id()) &&
+         !MetalContext::instance().has_fabric_routers_launched(this->id_));
+    log_info(
+        tt::LogMetal, "{} on Device {}", fabric_launch_deferred ? "Fabric staged" : "Fabric initialized", this->id_);
 }
 
 // backward compatibility

@@ -6,6 +6,7 @@
 
 #include "device/device_manager.hpp"
 #include <host_api.hpp>
+#include <algorithm>
 #include <enchantum/enchantum.hpp>
 #include <experimental/fabric/mesh_graph.hpp>
 #include <tt_metal.hpp>
@@ -28,6 +29,7 @@
 #include "program/program_impl.hpp"
 #include "program.hpp"
 #include <tt_stl/span.hpp>
+#include <experimental/fabric/control_plane.hpp>
 #include <experimental/fabric/fabric.hpp>
 #include "system_memory_manager.hpp"
 #include <umd/device/types/core_coordinates.hpp>
@@ -35,6 +37,8 @@
 #include "dispatch_mem_map.hpp"
 #include <llrt/tt_cluster.hpp>
 #include "dispatch_core_manager.hpp"
+#include "fabric/fabric_host_utils.hpp"
+#include <tt-logger/tt-logger.hpp>
 
 namespace tt::tt_metal {
 
@@ -392,6 +396,182 @@ static const std::vector<DispatchKernelNode> galaxy_nine_chip_arch_2cq_fabric = 
 };
 // clang-format on
 
+std::vector<DispatchKernelNode> generate_blackhole_multichip_fabric_1cq_nodes(
+    ChipId mmio_device_id, const std::vector<ChipId>& remote_devices) {
+    TT_FATAL(!remote_devices.empty(), "Blackhole multichip fabric topology requires at least one remote device");
+
+    const auto& cluster = MetalContext::instance().get_cluster();
+    const auto tunnels = cluster.get_tunnels_from_mmio_device(mmio_device_id);
+
+    std::unordered_map<ChipId, int> remote_to_tunnel_index;
+    for (int tunnel_index = 0; tunnel_index < static_cast<int>(tunnels.size()); ++tunnel_index) {
+        for (ChipId tunnel_device_id : tunnels[tunnel_index]) {
+            if (tunnel_device_id != mmio_device_id) {
+                remote_to_tunnel_index.emplace(tunnel_device_id, tunnel_index);
+            }
+        }
+    }
+
+    struct RelayGroup {
+        int representative_tunnel_index = -1;
+        std::vector<ChipId> remote_devices;
+    };
+
+    // Group remote devices by (forwarding_direction, link_index) so that devices
+    // reachable in different directions from the MMIO device get separate FABRIC_MUXes.
+    // Without direction-awareness, northward and southward devices sharing the same
+    // link index would be grouped together, and the single MUX would connect to only
+    // one direction's fabric router — making the other direction unreachable.
+    std::map<uint64_t, RelayGroup> remotes_by_direction_and_link;
+    const auto mmio_fabric_node_id = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(mmio_device_id);
+    const auto& control_plane = MetalContext::instance().get_control_plane();
+    for (ChipId remote_device_id : remote_devices) {
+        TT_FATAL(
+            remote_to_tunnel_index.contains(remote_device_id),
+            "Missing tunnel index for remote device {} serviced by MMIO device {}",
+            remote_device_id,
+            mmio_device_id);
+
+        const auto remote_fabric_node_id = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(remote_device_id);
+        const auto forwarding_direction =
+            control_plane.get_forwarding_direction(mmio_fabric_node_id, remote_fabric_node_id);
+        TT_FATAL(
+            forwarding_direction.has_value(),
+            "No forwarding direction from MMIO device {} to remote device {}",
+            mmio_device_id,
+            remote_device_id);
+        const auto forwarding_links =
+            tt::tt_fabric::get_forwarding_link_indices(mmio_fabric_node_id, remote_fabric_node_id);
+        TT_FATAL(
+            !forwarding_links.empty(),
+            "No forwarding links available from MMIO device {} to remote device {}",
+            mmio_device_id,
+            remote_device_id);
+
+        // Encode (direction, link_index) into a single key so each direction gets its own relay group
+        uint64_t group_key = (static_cast<uint64_t>(forwarding_direction.value()) << 32) | forwarding_links.back();
+        auto& relay_group = remotes_by_direction_and_link[group_key];
+        if (relay_group.remote_devices.empty()) {
+            relay_group.representative_tunnel_index = remote_to_tunnel_index.at(remote_device_id);
+        }
+        relay_group.remote_devices.push_back(remote_device_id);
+    }
+
+    std::vector<DispatchKernelNode> nodes;
+    auto add_node = [&](ChipId device_id,
+                        ChipId servicing_device_id,
+                        DispatchWorkerType kernel_type,
+                        std::vector<int> upstream_ids,
+                        std::vector<int> downstream_ids,
+                        noc_selection_t noc_selection,
+                        int tunnel_index = -1) {
+        int node_id = nodes.size();
+        nodes.push_back(
+            {node_id,
+             device_id,
+             servicing_device_id,
+             0,
+             kernel_type,
+             std::move(upstream_ids),
+             std::move(downstream_ids),
+             noc_selection,
+             tunnel_index});
+        return node_id;
+    };
+
+    // Keep the MMIO device usable for local execution while servicing remote devices via fabric.
+    int local_prefetch =
+        add_node(mmio_device_id, mmio_device_id, PREFETCH_HD, {x, x, x, x}, {x, x, x, x}, k_prefetcher_noc);
+    int local_dispatch = add_node(
+        mmio_device_id, mmio_device_id, DISPATCH_HD, {local_prefetch, x, x, x}, {x, x, x, x}, k_dispatcher_noc);
+    int local_dispatch_s = add_node(
+        mmio_device_id,
+        mmio_device_id,
+        DISPATCH_S,
+        {local_prefetch, x, x, x},
+        {local_dispatch, x, x, x},
+        k_dispatcher_s_noc);
+    nodes[local_prefetch].downstream_ids = {local_dispatch, local_dispatch_s, x, x};
+    nodes[local_dispatch].downstream_ids = {local_dispatch_s, x, x, x};
+
+    for (const auto& [unused_key, relay_group] : remotes_by_direction_and_link) {
+        (void)unused_key;
+
+        struct MmioRemoteNodes {
+            ChipId remote_device_id;
+            int prefetch_h_node_id;
+            int dispatch_h_node_id;
+        };
+
+        std::vector<MmioRemoteNodes> mmio_remote_nodes;
+        std::vector<int> mux_full_size_inputs;
+        std::vector<int> mux_header_only_inputs;
+        mmio_remote_nodes.reserve(relay_group.remote_devices.size());
+        mux_full_size_inputs.reserve(relay_group.remote_devices.size());
+        mux_header_only_inputs.reserve(relay_group.remote_devices.size());
+
+        for (ChipId remote_device_id : relay_group.remote_devices) {
+            int prefetch_h =
+                add_node(mmio_device_id, remote_device_id, PREFETCH_H, {x, x, x, x}, {x, x, x, x}, k_prefetcher_noc);
+            int dispatch_h = add_node(
+                mmio_device_id, remote_device_id, DISPATCH_H, {x, x, x, x}, {prefetch_h, x, x, x}, k_dispatcher_noc);
+            mmio_remote_nodes.push_back({remote_device_id, prefetch_h, dispatch_h});
+            mux_full_size_inputs.push_back(prefetch_h);
+            mux_header_only_inputs.push_back(dispatch_h);
+        }
+
+        int fabric_mux = add_node(
+            mmio_device_id,
+            x,
+            FABRIC_MUX,
+            mux_full_size_inputs,
+            mux_header_only_inputs,
+            k_fabric_mux_noc,
+            relay_group.representative_tunnel_index);
+
+        for (const auto& mmio_remote_node : mmio_remote_nodes) {
+            int prefetch_d = add_node(
+                mmio_remote_node.remote_device_id,
+                x,
+                PREFETCH_D,
+                {mmio_remote_node.prefetch_h_node_id, x, x, x},
+                {x, x, x, x},
+                k_prefetcher_noc);
+            int dispatch_d = add_node(
+                mmio_remote_node.remote_device_id,
+                x,
+                DISPATCH_D,
+                {prefetch_d, x, x, x},
+                {x, x, x, x},
+                k_dispatcher_noc);
+            int dispatch_s = add_node(
+                mmio_remote_node.remote_device_id,
+                x,
+                DISPATCH_S,
+                {prefetch_d, x, x, x},
+                {dispatch_d, x, x, x},
+                k_dispatcher_s_noc);
+            int return_fabric_mux = add_node(
+                mmio_remote_node.remote_device_id,
+                x,
+                RETURN_FABRIC_MUX,
+                {dispatch_d},
+                {prefetch_d},
+                k_fabric_mux_noc,
+                relay_group.representative_tunnel_index);
+
+            nodes[mmio_remote_node.prefetch_h_node_id].downstream_ids = {prefetch_d, fabric_mux, x, x};
+            nodes[mmio_remote_node.dispatch_h_node_id].upstream_ids = {dispatch_d, x, x, x};
+            nodes[mmio_remote_node.dispatch_h_node_id].downstream_ids = {
+                mmio_remote_node.prefetch_h_node_id, fabric_mux, x, x};
+            nodes[prefetch_d].downstream_ids = {dispatch_d, dispatch_s, return_fabric_mux, x};
+            nodes[dispatch_d].downstream_ids = {mmio_remote_node.dispatch_h_node_id, dispatch_s, return_fabric_mux, x};
+        }
+    }
+
+    return nodes;
+}
+
 std::vector<FDKernel*> node_id_to_kernel;
 detail::ProgramCompileGroup command_queue_compile_group;
 std::unordered_map<ChipId, std::unordered_set<CoreCoord>> dispatch_cores;
@@ -513,9 +693,43 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<ChipId>& device_id
                 index_offset += nodes_for_one_mmio.size();
             }
         } else {
+            if (MetalContext::instance().get_cluster().arch() == tt::ARCH::BLACKHOLE && num_hw_cqs == 1 &&
+                tt_fabric::is_tt_fabric_config(MetalContext::instance().get_fabric_config())) {
+                std::map<ChipId, std::vector<ChipId>> mmio_to_remotes;
+                for (auto remote_id : remote_devices) {
+                    ChipId mmio_id = MetalContext::instance().get_cluster().get_associated_mmio_device(remote_id);
+                    mmio_to_remotes[mmio_id].push_back(remote_id);
+                }
+
+                uint32_t index_offset = 0;
+                for (auto mmio_device_id : mmio_devices) {
+                    auto it = mmio_to_remotes.find(mmio_device_id);
+                    if (it == mmio_to_remotes.end()) {
+                        std::vector<DispatchKernelNode> nodes_for_single = populate_single_device();
+                        for (auto node : nodes_for_single) {
+                            node.device_id = mmio_device_id;
+                            node.servicing_device_id = mmio_device_id;
+                            increment_node_ids(node, index_offset);
+                            nodes.push_back(node);
+                        }
+                        index_offset += nodes_for_single.size();
+                        continue;
+                    }
+
+                    std::sort(it->second.begin(), it->second.end());
+                    auto nodes_for_mmio = generate_blackhole_multichip_fabric_1cq_nodes(mmio_device_id, it->second);
+                    for (auto node : nodes_for_mmio) {
+                        increment_node_ids(node, index_offset);
+                        nodes.push_back(node);
+                    }
+                    index_offset += nodes_for_mmio.size();
+                }
+                return nodes;
+            }
+
             // Build a mapping from each MMIO device to its paired remote device (if any).
-            // Not every MMIO device necessarily has a remote — e.g. in a Blackhole 8-chip ring
-            // with lite fabric, only one MMIO device may gateway a single remote device.
+            // Non-Blackhole multichip systems in this path only model a single paired remote
+            // per MMIO device via the two-chip fabric template.
             std::map<ChipId, ChipId> mmio_to_remote;
             for (auto remote_id : remote_devices) {
                 ChipId mmio_id = MetalContext::instance().get_cluster().get_associated_mmio_device(remote_id);
@@ -850,6 +1064,25 @@ void configure_dispatch_cores(IDevice* device) {
                     cq_start + issue_queue_size + get_absolute_cq_offset(serviced_device_id, channel, cq_id, cq_size);
                 uint32_t completion_queue_start_addr_16B = completion_queue_start_addr >> 4;
                 std::vector<uint32_t> completion_queue_wr_ptr = {completion_queue_start_addr_16B};
+                const auto completion_q_writer_virtual =
+                    MetalContext::instance().get_cluster().get_virtual_coordinate_from_logical_coordinates(
+                        completion_q_writer_location, dispatch_core_type);
+                log_info(
+                    tt::LogMetal,
+                    "DEBUG CQ-CORE-SETUP: mmio={} serviced_device={} cq={} channel={} umd={} writer_logical={} "
+                    "writer_virtual={} issue_size=0x{:x} completion_start=0x{:x} l1_wr_ptr_addr=0x{:x} "
+                    "l1_rd_ptr_addr=0x{:x}",
+                    device->id(),
+                    serviced_device_id,
+                    cq_id,
+                    channel,
+                    get_umd_channel(channel),
+                    completion_q_writer_location.str(),
+                    completion_q_writer_virtual.str(),
+                    issue_queue_size,
+                    completion_queue_start_addr,
+                    completion_q_wr_ptr,
+                    completion_q_rd_ptr);
                 detail::WriteToDeviceL1(
                     mmio_device,
                     completion_q_writer_location,

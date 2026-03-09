@@ -5,6 +5,7 @@
 #include "fd_kernel.hpp"
 
 #include <host_api.hpp>
+#include <exception>
 #include <utility>
 #include <variant>
 
@@ -14,17 +15,71 @@
 #include "dispatch/kernel_config/relay_mux.hpp"
 #include "dispatch_core_common.hpp"
 #include "dispatch_s.hpp"
+#include <experimental/fabric/control_plane.hpp>
 #include "hal_types.hpp"
 #include "kernel_types.hpp"
 #include "prefetch.hpp"
 #include "impl/context/metal_context.hpp"
 #include <umd/device/types/core_coordinates.hpp>
 #include <impl/debug/dprint_server.hpp>
+#include <optional>
 
 using namespace tt::tt_metal;
 
+namespace {
+
+std::optional<ChipId> get_immediate_fabric_hop(ChipId src_device_id, ChipId dst_device_id) {
+    auto& metal_context = tt::tt_metal::MetalContext::instance();
+    if (!tt::tt_fabric::is_tt_fabric_config(metal_context.get_fabric_config())) {
+        return std::nullopt;
+    }
+
+    try {
+        const auto& control_plane = metal_context.get_control_plane();
+        if (!control_plane.is_chip_mapped(src_device_id) || !control_plane.is_chip_mapped(dst_device_id)) {
+            return std::nullopt;
+        }
+
+        const auto src_fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(src_device_id);
+        const auto dst_fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(dst_device_id);
+        const auto forwarding_channels =
+            control_plane.get_forwarding_eth_chans_to_chip(src_fabric_node_id, dst_fabric_node_id);
+        for (const auto& src_chan_id : forwarding_channels) {
+            const auto route = control_plane.get_fabric_route(src_fabric_node_id, dst_fabric_node_id, src_chan_id);
+            for (const auto& [next_fabric_node_id, _] : route) {
+                if (next_fabric_node_id == src_fabric_node_id) {
+                    continue;
+                }
+                return control_plane.get_physical_chip_id_from_fabric_node_id(next_fabric_node_id);
+            }
+        }
+    } catch (const std::exception& e) {
+        log_info(
+            tt::LogMetal,
+            "DEBUG: fabric next-hop lookup src={} dst={} failed, falling back to UMD tunnel walk: {}",
+            src_device_id,
+            dst_device_id,
+            e.what());
+    }
+
+    return std::nullopt;
+}
+
+}  // namespace
+
 ChipId FDKernel::GetUpstreamDeviceId(ChipId device_id) {
     ChipId mmio_device_id = tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device_id);
+    if (device_id != mmio_device_id) {
+        if (auto next_hop = get_immediate_fabric_hop(device_id, mmio_device_id); next_hop.has_value()) {
+            log_info(
+                tt::LogMetal,
+                "DEBUG: GetUpstreamDeviceId({}) resolved immediate fabric hop {} toward MMIO {}",
+                device_id,
+                *next_hop,
+                mmio_device_id);
+            return *next_hop;
+        }
+    }
     for (auto tunnel :
          tt::tt_metal::MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id)) {
         for (int idx = 0; idx < tunnel.size(); idx++) {
@@ -49,6 +104,25 @@ ChipId FDKernel::GetDownstreamDeviceId(ChipId device_id, int tunnel) {
         // Remove all tunnels except the relevant one which will be at the front
         std::swap(tunnels[0], tunnels[tunnel]);
         tunnels.erase(tunnels.begin() + 1, tunnels.end());
+    }
+
+    for (const auto& selected_tunnel : tunnels) {
+        if (selected_tunnel.empty()) {
+            continue;
+        }
+        const auto route_target_device_id = selected_tunnel.back();
+        if (route_target_device_id != device_id) {
+            if (auto next_hop = get_immediate_fabric_hop(device_id, route_target_device_id); next_hop.has_value()) {
+                log_info(
+                    tt::LogMetal,
+                    "DEBUG: GetDownstreamDeviceId({}, tunnel={}) resolved immediate fabric hop {} toward target {}",
+                    device_id,
+                    tunnel,
+                    *next_hop,
+                    route_target_device_id);
+                return *next_hop;
+            }
+        }
     }
 
     for (auto tunnel : tunnels) {

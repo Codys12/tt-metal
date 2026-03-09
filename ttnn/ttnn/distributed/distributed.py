@@ -662,11 +662,19 @@ def open_mesh_device(
         ttnn._ttnn.multi_device.MeshDevice: The opened mesh device.
 
     """
+    if dispatch_core_config is None:
+        arch_name = ttnn._ttnn.device.get_arch_name()
+        dispatch_core_config = (
+            ttnn.DispatchCoreConfig(ttnn.DispatchCoreType.WORKER)
+            if "blackhole" in arch_name
+            else ttnn.DispatchCoreConfig()
+        )
+
     return ttnn._ttnn.multi_device.open_mesh_device(
         l1_small_size=l1_small_size,
         trace_region_size=trace_region_size,
         num_command_queues=num_command_queues,
-        dispatch_core_config=dispatch_core_config or ttnn.DispatchCoreConfig(),
+        dispatch_core_config=dispatch_core_config,
         mesh_shape=mesh_shape,
         offset=offset,
         physical_device_ids=physical_device_ids,

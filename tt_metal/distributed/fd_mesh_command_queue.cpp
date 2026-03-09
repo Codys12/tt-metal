@@ -4,6 +4,7 @@
 
 #include "fd_mesh_command_queue.hpp"
 
+#include <tt-logger/tt-logger.hpp>
 #include <tracy/Tracy.hpp>
 
 #include <mesh_device.hpp>
@@ -332,6 +333,10 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
     // current device state. Write the finalized program command sequence to each
     // physical device tied to the program.
     TracyTTMetalEnqueueMeshWorkloadTrace(mesh_device_, mesh_workload, this->trace_id());
+    log_info(
+        tt::LogMetal,
+        "DEBUG: enqueue_mesh_workload: dispatching {} program(s) to mesh",
+        mesh_workload.get_programs().size());
     for (auto& [device_range, program] : mesh_workload.get_programs()) {
         auto& program_cmd_seq = mesh_workload.impl().get_dispatch_cmds_for_program(program, command_hash);
         TT_ASSERT(
@@ -408,8 +413,11 @@ void FDMeshCommandQueue::enqueue_mesh_workload(MeshWorkload& mesh_workload, bool
     mesh_workload.impl().set_program_binary_status(mesh_device_id, ProgramBinaryStatus::Committed);
     mesh_workload.set_last_used_command_queue_for_testing(this);
 
+    log_info(tt::LogMetal, "DEBUG: enqueue_mesh_workload: commands written, blocking={}", blocking);
     if (blocking) {
+        log_info(tt::LogMetal, "DEBUG: enqueue_mesh_workload: calling finish_nolock");
         this->finish_nolock({{sub_device_id}});
+        log_info(tt::LogMetal, "DEBUG: enqueue_mesh_workload: finish_nolock returned");
     }
 }
 
@@ -491,11 +499,18 @@ void FDMeshCommandQueue::enqueue_read_shard_from_core(
 
 void FDMeshCommandQueue::finish_nolock(tt::stl::Span<const SubDeviceId> sub_device_ids) {
     ZoneScopedN("FDMeshCommandQueue::finish_nolock");
+    log_info(
+        tt::LogMetal, "DEBUG: finish_nolock: recording event, outstanding_reads={}", num_outstanding_reads_.load());
     auto event = this->enqueue_record_event_to_host_nolock(sub_device_ids);
+    log_info(
+        tt::LogMetal,
+        "DEBUG: finish_nolock: event recorded, waiting on cv (outstanding_reads={})",
+        num_outstanding_reads_.load());
 
     std::unique_lock<std::mutex> lock(reads_processed_cv_mutex_);
     reads_processed_cv_.wait(
         lock, [this] { return num_outstanding_reads_.load() == 0 || thread_exception_state_.load(); });
+    log_info(tt::LogMetal, "DEBUG: finish_nolock: cv signaled, outstanding_reads={}", num_outstanding_reads_.load());
     auto& sub_device_cq_owner = cq_shared_state_->sub_device_cq_owner;
     for (const auto& sub_device_id : buffer_dispatch::select_sub_device_ids(mesh_device_, sub_device_ids)) {
         sub_device_cq_owner[*sub_device_id].finished(this->id_);
@@ -545,8 +560,17 @@ void FDMeshCommandQueue::write_shard_to_device(
     auto shard_view = device_buffer->view(region.value_or(BufferRegion(0, device_buffer->size())));
 
     sub_device_ids = buffer_dispatch::select_sub_device_ids(mesh_device_, sub_device_ids);
+    auto* dev = buffer.get_device_buffer(device_coord)->device();
+    log_info(
+        tt::LogMetal,
+        "DEBUG: write_shard_to_device: device {} coord=({},{}) buffer_size={}",
+        dev->id(),
+        device_coord[0],
+        device_coord[1],
+        shard_view->size());
     buffer_dispatch::write_to_device_buffer(
         src, *shard_view, id_, expected_num_workers_completed_, this->dispatch_core_type(), sub_device_ids);
+    log_info(tt::LogMetal, "DEBUG: write_shard_to_device: device {} done", dev->id());
 }
 
 void FDMeshCommandQueue::read_shard_from_device(
@@ -742,20 +766,31 @@ void FDMeshCommandQueue::read_completion_queue() {
             }
 
             uint32_t num_reads = num_outstanding_reads_.load();
+            log_info(tt::LogMetal, "DEBUG: read_completion_queue: processing {} reads", num_reads);
             for (uint32_t i = 0; i < num_reads; i++) {
                 auto mesh_read_descriptor = *(completion_queue_reads_.pop());
                 std::visit(
-                    [&](auto&& mesh_read_descriptor) {
+                    [&, i](auto&& mesh_read_descriptor) {
                         using T = std::decay_t<decltype(mesh_read_descriptor)>;
                         if constexpr (std::is_same_v<T, MeshBufferReadDescriptor>) {
+                            log_info(
+                                tt::LogMetal, "DEBUG: read_completion_queue: read {}/{} is BufferRead", i, num_reads);
                             this->copy_buffer_data_to_user_space(mesh_read_descriptor);
                         } else if constexpr (std::is_same_v<T, MeshReadEventDescriptor>) {
+                            log_info(
+                                tt::LogMetal,
+                                "DEBUG: read_completion_queue: read {}/{} is Event (id={})",
+                                i,
+                                num_reads,
+                                mesh_read_descriptor.single_device_descriptor.event_id);
                             this->read_completion_queue_event(mesh_read_descriptor);
                         } else {
+                            log_info(tt::LogMetal, "DEBUG: read_completion_queue: read {}/{} is L1Data", i, num_reads);
                             this->read_l1_data_from_completion_queue(mesh_read_descriptor);
                         }
                     },
                     mesh_read_descriptor);
+                log_info(tt::LogMetal, "DEBUG: read_completion_queue: read {}/{} done", i, num_reads);
             }
             std::unique_lock<std::mutex> lock(reads_processed_cv_mutex_);
             num_outstanding_reads_.fetch_sub(num_reads);
@@ -797,7 +832,20 @@ void FDMeshCommandQueue::copy_buffer_data_to_user_space(MeshBufferReadDescriptor
         uint16_t channel =
             tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device->id());
 
+        log_info(
+            tt::LogMetal,
+            "DEBUG: copy_buffer_data: device {} (mmio={} ch={}) starting {} reads",
+            device->id(),
+            mmio_device_id,
+            channel,
+            num_reads);
         for (int i = 0; i < num_reads; i++) {
+            log_info(
+                tt::LogMetal,
+                "DEBUG: copy_buffer_data: device {} read {}/{} waiting on completion queue",
+                device->id(),
+                i,
+                num_reads);
             buffer_dispatch::copy_completion_queue_data_into_user_space(
                 std::get<ReadBufferDescriptor>(*(read_descriptor_queue.pop())),
                 mmio_device_id,
@@ -805,7 +853,9 @@ void FDMeshCommandQueue::copy_buffer_data_to_user_space(MeshBufferReadDescriptor
                 id_,
                 device->sysmem_manager(),
                 exit_condition_);
+            log_info(tt::LogMetal, "DEBUG: copy_buffer_data: device {} read {}/{} done", device->id(), i, num_reads);
         }
+        log_info(tt::LogMetal, "DEBUG: copy_buffer_data: device {} all reads complete", device->id());
     };
 
     {
@@ -836,7 +886,16 @@ void FDMeshCommandQueue::read_completion_queue_event(MeshReadEventDescriptor& re
             tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device->id());
         uint16_t channel =
             tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device->id());
+        log_info(
+            tt::LogMetal,
+            "DEBUG: read_completion_queue_event: waiting for device {} (mmio={} ch={}) coord=({},{})",
+            device->id(),
+            mmio_device_id,
+            channel,
+            coord[0],
+            coord[1]);
         device->sysmem_manager().completion_queue_wait_front(id_, exit_condition_);
+        log_info(tt::LogMetal, "DEBUG: read_completion_queue_event: device {} completed", device->id());
 
         event_dispatch::read_events_from_completion_queue(
             read_event_descriptor.single_device_descriptor,

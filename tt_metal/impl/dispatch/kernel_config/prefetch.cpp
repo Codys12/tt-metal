@@ -32,6 +32,7 @@
 #include "tt_metal/fabric/fabric_context.hpp"
 #include <impl/dispatch/dispatch_query_manager.hpp>
 #include <impl/dispatch/dispatch_mem_map.hpp>
+#include <tt-logger/tt-logger.hpp>
 
 using namespace tt::tt_metal;
 
@@ -141,7 +142,7 @@ void PrefetchKernel::GenerateStaticConfigs() {
             tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(servicing_device_id_);
         uint32_t cq_start = my_dispatch_constants.get_host_command_queue_addr(CommandQueueHostAddrType::UNRESERVED);
         uint32_t cq_size = device_->sysmem_manager().get_cq_size();
-        uint32_t command_queue_start_addr = get_absolute_cq_offset(device_->id(), channel, cq_id_, cq_size);
+        uint32_t command_queue_start_addr = get_absolute_cq_offset(servicing_device_id_, channel, cq_id_, cq_size);
         uint32_t issue_queue_start_addr = command_queue_start_addr + cq_start;
         uint32_t issue_queue_size = device_->sysmem_manager().get_issue_queue_size(cq_id_);
 
@@ -242,6 +243,36 @@ void PrefetchKernel::GenerateStaticConfigs() {
         ringbuffer_size,
         l1_size);
 
+    if (device_->id() != servicing_device_id_ || !device_->is_mmio_capable()) {
+        const ChipId host_cq_device_id = (static_config_.is_h_variant.value() && !static_config_.is_d_variant.value())
+                                             ? servicing_device_id_
+                                             : device_->id();
+        const char* variant = (static_config_.is_h_variant.value() && static_config_.is_d_variant.value())
+                                  ? "HD"
+                                  : (static_config_.is_h_variant.value() ? "H" : "D");
+        log_info(
+            tt::LogMetal,
+            "DEBUG FD-CONFIG: Prefetch variant={} device={} servicing={} cq={} channel={} umd={} "
+            "host_cq_offset=0x{:x} share_offset=0x{:x} logical={} virtual={} pcie_base=0x{:x} pcie_size=0x{:x} "
+            "prefetch_q_base=0x{:x} prefetch_q_size=0x{:x} prefetch_q_rd=0x{:x} prefetch_q_pcie_rd=0x{:x}",
+            variant,
+            device_->id(),
+            servicing_device_id_,
+            cq_id_,
+            channel,
+            get_umd_channel(channel),
+            get_absolute_cq_offset(host_cq_device_id, channel, cq_id_, device_->sysmem_manager().get_cq_size()),
+            get_per_device_host_channel_offset(host_cq_device_id, channel),
+            logical_core_.str(),
+            GetVirtualCore().str(),
+            static_config_.pcie_base.value_or(0),
+            static_config_.pcie_size.value_or(0),
+            static_config_.prefetch_q_base.value_or(0),
+            static_config_.prefetch_q_size.value_or(0),
+            static_config_.prefetch_q_rd_ptr_addr.value_or(0),
+            static_config_.prefetch_q_pcie_rd_ptr_addr.value_or(0));
+    }
+
     if (!is_hd()) {
         create_edm_connection_sems(edm_connection_attributes_);
         const auto& fabric_context = tt::tt_metal::MetalContext::instance().get_control_plane().get_fabric_context();
@@ -327,6 +358,12 @@ void PrefetchKernel::GenerateDependentConfigs() {
                 dependent_config_.downstream_cb_log_page_size = DispatchSettings::PREFETCH_D_BUFFER_LOG_PAGE_SIZE;
                 dependent_config_.downstream_cb_pages = prefetch_d->GetStaticConfig().cmddat_q_pages;
                 dependent_config_.num_hops = tt::tt_metal::get_num_hops(device_id_, prefetch_d->GetDeviceId());
+                log_info(
+                    tt::LogMetal,
+                    "DEBUG: PREFETCH_H phys{} -> PREFETCH_D phys{}: num_hops={} (forward path)",
+                    device_id_,
+                    prefetch_d->GetDeviceId(),
+                    dependent_config_.num_hops);
                 assemble_2d_fabric_packet_header_args(
                     this->dependent_config_, GetDeviceId(), prefetch_d->GetDeviceId());
             } else if (auto* fabric_mux = dynamic_cast<tt::tt_metal::RelayMux*>(ds_kernel)) {
@@ -545,8 +582,9 @@ void PrefetchKernel::ConfigureCore() {
     // Only H-type prefetchers need L1 configuration
     if (static_config_.is_h_variant.value()) {
         // Initialize the FetchQ
+        const ChipId cq_owner_device_id = static_config_.is_d_variant.value() ? device_->id() : servicing_device_id_;
         uint16_t channel =
-            tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(device_->id());
+            tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(cq_owner_device_id);
         const auto& my_dispatch_constants = MetalContext::instance().dispatch_mem_map(GetCoreType());
         uint32_t cq_start = my_dispatch_constants.get_host_command_queue_addr(CommandQueueHostAddrType::UNRESERVED);
         uint32_t cq_size = device_->sysmem_manager().get_cq_size();
@@ -560,7 +598,7 @@ void PrefetchKernel::ConfigureCore() {
         uint32_t prefetch_q_pcie_rd_ptr =
             my_dispatch_constants.get_device_command_queue_addr(CommandQueueDeviceAddrType::PREFETCH_Q_PCIE_RD);
         std::vector<uint32_t> prefetch_q_pcie_rd_ptr_addr_data = {
-            get_absolute_cq_offset(device_->id(), channel, cq_id_, cq_size) + cq_start};
+            get_absolute_cq_offset(cq_owner_device_id, channel, cq_id_, cq_size) + cq_start};
         detail::WriteToDeviceL1(device_, logical_core_, prefetch_q_rd_ptr, prefetch_q_rd_ptr_addr_data, GetCoreType());
         detail::WriteToDeviceL1(
             device_, logical_core_, prefetch_q_pcie_rd_ptr, prefetch_q_pcie_rd_ptr_addr_data, GetCoreType());

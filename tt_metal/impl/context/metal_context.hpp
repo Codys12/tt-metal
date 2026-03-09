@@ -144,6 +144,8 @@ public:
     // Returns true if the given virtual core on an MMIO device has an active lite fabric tunnel.
     // Used to prevent launching fabric router ERISC0 on cores where ERISC1 runs lite fabric relay.
     bool is_lite_fabric_mmio_core(ChipId mmio_id, CoreCoord virtual_core) const;
+    bool is_lite_fabric_bootstrap_active() const;
+    bool was_lite_fabric_bootstrap_terminated() const { return lite_fabric_bootstrap_terminated_; }
 
     // Utilities
     bool is_coord_in_range(CoreCoord coord, CoreType core_type);
@@ -151,11 +153,14 @@ public:
     // Hang detection
     void on_dispatch_timeout_detected();
 
-    // Initialize ETH cores on remote devices for fabric routing.
-    // Remote devices behind lite fabric have their ETH cores in POR state
-    // (skipped during init_fw). This loads base ERISC firmware and deasserts
-    // the cores so they can process fabric router kernel launch messages.
-    void initialize_remote_eth_cores_for_fabric(ChipId device_id, const std::vector<CoreCoord>& logical_eth_cores);
+    // Initialize ETH cores for fabric routing when ERISC0 was held in reset for
+    // lite-fabric bootstrap. Remote devices need this during initial staging,
+    // and MMIO tunnel cores need it again after lite-fabric teardown before the
+    // local fabric routers are deasserted.
+    void initialize_remote_eth_cores_for_fabric(
+        ChipId device_id, const std::vector<CoreCoord>& logical_eth_cores, bool launch_erisc0 = true);
+    void launch_remote_eth_cores_for_fabric(ChipId device_id);
+    void terminate_lite_fabric_bootstrap();
 
     // Returns true if fabric routers were actually launched (ERISC0 deasserted) on a remote device.
     // For MMIO devices, always returns true.  For remote devices, returns true only if
@@ -279,12 +284,18 @@ private:
     // whose remote peers lack fabric routers (MMIO-side router ETH handshake traffic
     // would corrupt the lite fabric relay on such peers).
     std::map<ChipId, std::set<uint32_t>> remote_fabric_eth_channels_;
+    std::set<ChipId> launched_remote_fabric_router_devices_;
 
     // ETH cores where ERISC1 was launched as a downstream sender during Phase 2b
     // BFS discovery.  Keyed by (chip_id, logical_eth_channel).  Used by
     // initialize_remote_eth_cores_for_fabric to avoid killing ERISC1 when
     // deasserting ERISC0 for the fabric router.
     std::set<std::pair<ChipId, uint32_t>> downstream_sender_cores_;
+
+    // Remote ETH cores that have fabric router firmware and launch mailboxes
+    // staged but whose ERISC0 is still held in reset.
+    std::map<ChipId, std::vector<CoreCoord>> staged_remote_fabric_eth_cores_;
+    bool lite_fabric_bootstrap_terminated_ = false;
 };
 
 }  // namespace tt::tt_metal

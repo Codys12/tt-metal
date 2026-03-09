@@ -11,6 +11,7 @@
 #include <umd/device/types/xy_pair.hpp>           // for tt_cxy_pair
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <vector>
@@ -18,6 +19,12 @@
 using ChipId = int;
 
 namespace tt::tt_metal {
+
+struct FetchTraceEntry {
+    uint32_t start_addr = 0;
+    uint32_t size_bytes = 0;
+    bool stall_prefetcher = false;
+};
 
 class SystemMemoryManager {
 public:
@@ -109,6 +116,11 @@ private:
     std::vector<umd::Writer> completion_q_writers;
     std::vector<uint32_t> prefetch_q_dev_ptrs;
     std::vector<uint32_t> prefetch_q_dev_fences;
+    std::vector<uint32_t> last_issue_push_start_addrs;
+    std::vector<uint32_t> last_issue_push_sizes;
+    std::vector<std::deque<FetchTraceEntry>> recent_fetch_traces;
+    std::vector<uint64_t> total_fetch_trace_counts;
+    mutable std::vector<std::mutex> recent_fetch_trace_locks;
 
     bool bypass_enable = false;
     std::vector<uint32_t> bypass_buffer;

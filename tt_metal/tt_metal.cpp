@@ -892,6 +892,13 @@ void WriteRuntimeArgsToDevice(IDevice* device, Program& program, bool force_slow
         detail::DispatchStateCheck(false);
     }
 
+    auto& context = MetalContext::instance();
+    if (context.is_lite_fabric_bootstrap_active() && !context.get_cluster().mmio_chip_ids().count(device_id)) {
+        if (auto* remote_chip = context.get_cluster().get_driver()->get_remote_chip(device_id)) {
+            remote_chip->get_remote_communication()->resync_remote_transfer_ethernet_cores();
+        }
+    }
+
     const auto& hal = MetalContext::instance().hal();
     for (uint32_t index = 0; index < hal.get_programmable_core_type_count(); index++) {
         CoreType core_type = hal.get_core_type(index);

@@ -15,6 +15,7 @@
 #include "metal_soc_descriptor.h"
 #include "tt_metal.hpp"
 #include <tt_stl/assert.hpp>
+#include <algorithm>
 
 namespace tt::tt_fabric {
 
@@ -382,6 +383,16 @@ void ComputeMeshRouterBuilder::establish_connections_to_router(
     const bool is_2D_routing = fabric_context.is_2D_routing_enabled();
 
     for (uint32_t vc = 0; vc < num_vcs; ++vc) {
+        const auto targets = connection_mapping_.get_downstream_targets(vc, 0);
+        const auto target_it = std::find_if(targets.begin(), targets.end(), [&](const auto& target) {
+            return target.target_direction.has_value() &&
+                   target.target_direction.value() == downstream_router.get_routing_direction();
+        });
+        const auto mapped_connection_type = target_it == targets.end() ? ConnectionType::INVALID : target_it->type;
+        const int mapped_sender_channel =
+            target_it == targets.end() ? -1 : static_cast<int>(target_it->target_sender_channel);
+        const int mapped_target_vc = target_it == targets.end() ? -1 : static_cast<int>(target_it->target_vc);
+
         // Compute sender channel on downstream router based on directions and VC
         uint32_t downstream_sender_channel =
             get_downstream_sender_channel(is_2D_routing, downstream_router.get_eth_direction(), vc);
@@ -407,9 +418,52 @@ void ComputeMeshRouterBuilder::establish_connections_to_router(
                 .dest_eth_chan = downstream_router.location_.eth_chan,
                 .dest_vc = vc,
                 .dest_sender_channel = internal_channel_id,
-                .connection_type = connection_mapping_.get_downstream_targets(vc, 0).at(0).type};
+                .connection_type = mapped_connection_type};
             connection_registry_->record_connection(record);
         }
+
+        if (target_it == targets.end()) {
+            log_warning(
+                tt::LogMetal,
+                "DEBUG ROUTER-CONNECT-MISS: local M{}D{} ch{}(dir={}) vc{} had no mapped target for downstream "
+                "dir={} among {} configured targets",
+                local_node_.mesh_id.get(),
+                local_node_.chip_id,
+                location_.eth_chan,
+                static_cast<int>(location_.direction),
+                vc,
+                static_cast<int>(downstream_router.get_routing_direction()),
+                targets.size());
+        }
+
+        log_info(
+            tt::LogMetal,
+            "DEBUG ROUTER-CONNECT: local M{}D{} ch{}(dir={},peer=M{}D{},dispatch={}) "
+            "vc{} rx{} -> local M{}D{} ch{}(dir={},peer=M{}D{},dispatch={}) "
+            "sender_ch={} internal_sender_ch={} mapped_sender_ch={} mapped_target_vc={} mapped_type={} "
+            "target_count={}",
+            local_node_.mesh_id.get(),
+            local_node_.chip_id,
+            location_.eth_chan,
+            static_cast<int>(location_.direction),
+            location_.remote_node.mesh_id.get(),
+            location_.remote_node.chip_id,
+            location_.is_dispatch_link,
+            vc,
+            0,
+            downstream_router.local_node_.mesh_id.get(),
+            downstream_router.local_node_.chip_id,
+            downstream_router.location_.eth_chan,
+            static_cast<int>(downstream_router.location_.direction),
+            downstream_router.location_.remote_node.mesh_id.get(),
+            downstream_router.location_.remote_node.chip_id,
+            downstream_router.location_.is_dispatch_link,
+            downstream_sender_channel,
+            internal_channel_id,
+            mapped_sender_channel,
+            mapped_target_vc,
+            static_cast<int>(mapped_connection_type),
+            targets.size());
 
         log_debug(
             tt::LogTest,
@@ -565,13 +619,32 @@ void ComputeMeshRouterBuilder::create_kernel(tt::tt_metal::Program& program, con
 
     // Get SOC descriptor for eth core lookup
     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
+    const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
     const auto device_id = control_plane.get_physical_chip_id_from_fabric_node_id(local_node_);
-    const auto& soc_desc = tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device_id);
+    const auto& soc_desc = cluster.get_soc_desc(device_id);
     const auto eth_chan = location_.eth_chan;
     auto eth_logical_core = soc_desc.get_eth_core_for_channel(eth_chan, CoordSystem::LOGICAL);
+    const bool is_remote_device = !cluster.mmio_chip_ids().count(device_id);
+    const bool lite_fabric_bootstrap_active = tt::tt_metal::MetalContext::instance().is_lite_fabric_bootstrap_active();
+    const bool use_host_ready_signal =
+        !(cluster.arch() == tt::ARCH::BLACKHOLE && is_remote_device && lite_fabric_bootstrap_active);
 
-    // Configure for host signal wait
-    erisc_builder_->set_wait_for_host_signal(true);
+    // After Blackhole lite-fabric teardown, host can no longer signal remote
+    // routers directly, so remote EDMs must advance past LOCAL_HANDSHAKE_COMPLETE
+    // without a host READY write.
+    erisc_builder_->set_wait_for_host_signal(use_host_ready_signal);
+    log_info(
+        tt::LogMetal,
+        "DEBUG ROUTER-HANDSHAKE: dev {} local M{}D{} ch{} dir={} remote={} lite_bootstrap={} "
+        "wait_for_host_signal={}",
+        device_id,
+        local_node_.mesh_id.get(),
+        local_node_.chip_id,
+        eth_chan,
+        static_cast<int>(location_.direction),
+        is_remote_device,
+        lite_fabric_bootstrap_active,
+        use_host_ready_signal);
 
     // Get runtime args (same for all RISC cores)
     const std::vector<uint32_t> rt_args = erisc_builder_->get_runtime_args();
@@ -590,8 +663,6 @@ void ComputeMeshRouterBuilder::create_kernel(tt::tt_metal::Program& program, con
 
         // Determine processor
         auto proc = static_cast<tt::tt_metal::DataMovementProcessor>(risc_id);
-        const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
-        bool is_remote_device = !cluster.mmio_chip_ids().count(device_id);
         bool has_remote_devices = cluster.all_chip_ids().size() > cluster.mmio_chip_ids().size();
         if (cluster.arch() == tt::ARCH::BLACKHOLE &&
             tt::tt_metal::MetalContext::instance().rtoptions().get_enable_2_erisc_mode() &&

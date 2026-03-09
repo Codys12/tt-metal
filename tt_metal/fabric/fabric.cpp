@@ -170,6 +170,18 @@ void append_fabric_connection_rt_args(
         forwarding_links);
 
     const auto fabric_router_channel = candidate_eth_chans[link_idx];
+    log_info(
+        tt::LogMetal,
+        "DEBUG: append_fabric_connection_rt_args: src=M{}D{} dst=M{}D{} fwd_dir={} link_idx={} -> eth_chan={} "
+        "core_type={}",
+        src_fabric_node_id.mesh_id.get(),
+        src_fabric_node_id.chip_id,
+        dst_fabric_node_id.mesh_id.get(),
+        dst_fabric_node_id.chip_id,
+        static_cast<int>(forwarding_direction.value()),
+        link_idx,
+        fabric_router_channel,
+        core_type == CoreType::WORKER ? "WORKER" : "ETH");
     auto worker_teardown_semaphore_id = tt_metal::CreateSemaphore(worker_program, {worker_core}, 0, core_type);
     auto worker_buffer_index_semaphore_id = tt_metal::CreateSemaphore(worker_program, {worker_core}, 0, core_type);
     if (core_type == CoreType::WORKER) {

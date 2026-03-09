@@ -2891,21 +2891,21 @@ void kernel_main() {
 
         *edm_status_ptr = tt::tt_fabric::EDMStatus::REMOTE_HANDSHAKE_COMPLETE;
 
+        if constexpr (is_local_handshake_master) {
+            wait_for_notification<ENABLE_RISC_CPU_DATA_CACHE>((uint32_t)edm_local_sync_ptr, num_local_edms - 1);
+            // This master sends notification to self for multi risc in single eth core case,
+            // This still send to self even though with single risc core case, but no side effects
+            constexpr uint32_t exclude_eth_chan = std::numeric_limits<uint32_t>::max();
+            notify_subordinate_routers(
+                edm_channels_mask, exclude_eth_chan, (uint32_t)edm_local_sync_ptr, num_local_edms);
+        } else {
+            notify_master_router(local_handshake_master_eth_chan, (uint32_t)edm_local_sync_ptr);
+            wait_for_notification<ENABLE_RISC_CPU_DATA_CACHE>((uint32_t)edm_local_sync_ptr, num_local_edms);
+        }
+
+        *edm_status_ptr = tt::tt_fabric::EDMStatus::LOCAL_HANDSHAKE_COMPLETE;
+
         if constexpr (wait_for_host_signal) {
-            if constexpr (is_local_handshake_master) {
-                wait_for_notification<ENABLE_RISC_CPU_DATA_CACHE>((uint32_t)edm_local_sync_ptr, num_local_edms - 1);
-                // This master sends notification to self for multi risc in single eth core case,
-                // This still send to self even though with single risc core case, but no side effects
-                constexpr uint32_t exclude_eth_chan = std::numeric_limits<uint32_t>::max();
-                notify_subordinate_routers(
-                    edm_channels_mask, exclude_eth_chan, (uint32_t)edm_local_sync_ptr, num_local_edms);
-            } else {
-                notify_master_router(local_handshake_master_eth_chan, (uint32_t)edm_local_sync_ptr);
-                wait_for_notification<ENABLE_RISC_CPU_DATA_CACHE>((uint32_t)edm_local_sync_ptr, num_local_edms);
-            }
-
-            *edm_status_ptr = tt::tt_fabric::EDMStatus::LOCAL_HANDSHAKE_COMPLETE;
-
             // 1. All risc cores wait for READY_FOR_TRAFFIC signal
             // 2. All risc cores in master eth core receive signal from host and exits from this wait
             //    Other subordinate risc cores wait for this signal
@@ -2920,6 +2920,20 @@ void kernel_main() {
                     local_handshake_master_eth_chan,
                     (uint32_t)edm_status_ptr,
                     tt::tt_fabric::EDMStatus::READY_FOR_TRAFFIC);
+            }
+        } else {
+            if constexpr (is_local_handshake_master) {
+                // Lite-fabric-bootstrapped remote routers cannot be poked by the
+                // host after teardown, so the local master must self-publish READY.
+                *edm_status_ptr = tt::tt_fabric::EDMStatus::READY_FOR_TRAFFIC;
+                notify_subordinate_routers(
+                    edm_channels_mask,
+                    local_handshake_master_eth_chan,
+                    (uint32_t)edm_status_ptr,
+                    tt::tt_fabric::EDMStatus::READY_FOR_TRAFFIC);
+            } else {
+                wait_for_notification<ENABLE_RISC_CPU_DATA_CACHE>(
+                    (uint32_t)edm_status_ptr, tt::tt_fabric::EDMStatus::READY_FOR_TRAFFIC);
             }
         }
     }

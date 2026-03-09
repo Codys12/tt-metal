@@ -188,6 +188,24 @@ void FabricBuilder::connect_routers() {
         auto& router1 = routers_.at(pair.chan1);
         auto& router2 = routers_.at(pair.chan2);
 
+        log_info(
+            tt::LogMetal,
+            "DEBUG ROUTER-PAIR: dev {} local_pair ch{}(dir={},peer=M{}D{},dispatch={}) <-> "
+            "ch{}(dir={},peer=M{}D{},dispatch={}) link_idx={} num_links={}",
+            device_->id(),
+            router1->get_eth_channel(),
+            static_cast<int>(router1->get_routing_direction()),
+            router1->get_peer_fabric_node_id().mesh_id.get(),
+            router1->get_peer_fabric_node_id().chip_id,
+            router1->is_dispatch_link(),
+            router2->get_eth_channel(),
+            static_cast<int>(router2->get_routing_direction()),
+            router2->get_peer_fabric_node_id().mesh_id.get(),
+            router2->get_peer_fabric_node_id().chip_id,
+            router2->is_dispatch_link(),
+            pair.link_idx,
+            pair.num_links);
+
         router1->configure_connection(*router2, pair.link_idx, pair.num_links, topology, is_galaxy);
 
         routers_by_direction_map[router1.get()].insert({router2->get_location().direction, router2.get()});

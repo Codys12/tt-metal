@@ -30,6 +30,7 @@
 #include "fabric/fabric_context.hpp"
 #include <dispatch/dispatch_query_manager.hpp>
 #include <dispatch/dispatch_mem_map.hpp>
+#include <tt-logger/tt-logger.hpp>
 
 using namespace tt::tt_metal;
 
@@ -135,7 +136,7 @@ void DispatchKernel::GenerateStaticConfigs() {
         channel = MetalContext::instance().get_cluster().get_assigned_channel_for_device(servicing_device_id_);
         uint32_t cq_start = my_dispatch_constants.get_host_command_queue_addr(CommandQueueHostAddrType::UNRESERVED);
         uint32_t cq_size = device_->sysmem_manager().get_cq_size();
-        uint32_t command_queue_start_addr = get_absolute_cq_offset(device_->id(), channel, cq_id_, cq_size);
+        uint32_t command_queue_start_addr = get_absolute_cq_offset(servicing_device_id_, channel, cq_id_, cq_size);
         uint32_t issue_queue_start_addr = command_queue_start_addr + cq_start;
         uint32_t issue_queue_size = device_->sysmem_manager().get_issue_queue_size(cq_id_);
         uint32_t completion_queue_start_addr = issue_queue_start_addr + issue_queue_size;
@@ -214,6 +215,37 @@ void DispatchKernel::GenerateStaticConfigs() {
         TT_FATAL(false, "DispatchKernel must be one of (or both) H and D variants");
     }
 
+    if (device_->id() != servicing_device_id_ || !device_->is_mmio_capable()) {
+        const ChipId host_cq_device_id = (static_config_.is_h_variant.value() && !static_config_.is_d_variant.value())
+                                             ? servicing_device_id_
+                                             : device_->id();
+        const char* variant = (static_config_.is_h_variant.value() && static_config_.is_d_variant.value())
+                                  ? "HD"
+                                  : (static_config_.is_h_variant.value() ? "H" : "D");
+        log_info(
+            tt::LogMetal,
+            "DEBUG FD-CONFIG: Dispatch variant={} device={} servicing={} cq={} channel={} umd={} "
+            "host_cq_offset=0x{:x} share_offset=0x{:x} logical={} virtual={} cmd_base=0x{:x} "
+            "completion_base=0x{:x} completion_size=0x{:x} host_comp_wr_ptr=0x{:x} dev_comp_wr_ptr=0x{:x} "
+            "dev_comp_rd_ptr=0x{:x}",
+            variant,
+            device_->id(),
+            servicing_device_id_,
+            cq_id_,
+            channel,
+            get_umd_channel(channel),
+            get_absolute_cq_offset(host_cq_device_id, channel, cq_id_, device_->sysmem_manager().get_cq_size()),
+            get_per_device_host_channel_offset(host_cq_device_id, channel),
+            logical_core_.str(),
+            GetVirtualCore().str(),
+            static_config_.command_queue_base_addr.value_or(0),
+            static_config_.completion_queue_base_addr.value_or(0),
+            static_config_.completion_queue_size.value_or(0),
+            static_config_.host_completion_q_wr_ptr.value_or(0),
+            static_config_.dev_completion_q_wr_ptr.value_or(0),
+            static_config_.dev_completion_q_rd_ptr.value_or(0));
+    }
+
     if (!is_hd()) {
         create_edm_connection_sems(edm_connection_attributes_);
         const auto& fabric_context = MetalContext::instance().get_control_plane().get_fabric_context();
@@ -286,6 +318,12 @@ void DispatchKernel::GenerateDependentConfigs() {
             dependent_config_.upstream_dispatch_cb_sem_id = dispatch_d->GetStaticConfig().my_downstream_cb_sem_id;
             dependent_config_.upstream_sync_sem = 0;  // Unused
             dependent_config_.num_hops = tt_metal::get_num_hops(device_id_, dispatch_d->GetDeviceId());
+            log_info(
+                tt::LogMetal,
+                "DEBUG: DISPATCH_H phys{} -> DISPATCH_D phys{}: num_hops={}",
+                device_id_,
+                dispatch_d->GetDeviceId(),
+                dependent_config_.num_hops);
             assemble_2d_fabric_packet_header_args(this->dependent_config_, GetDeviceId(), dispatch_d->GetDeviceId());
         } else {
             TT_FATAL(false, "Unimplemented path");
@@ -371,6 +409,12 @@ void DispatchKernel::GenerateDependentConfigs() {
                 dependent_config_.downstream_cb_base = dispatch_h_kernel->GetStaticConfig().dispatch_cb_base;
                 dependent_config_.downstream_cb_sem_id = dispatch_h_kernel->GetStaticConfig().my_dispatch_cb_sem_id;
                 dependent_config_.num_hops = tt_metal::get_num_hops(dispatch_h_kernel->GetDeviceId(), device_id_);
+                log_info(
+                    tt::LogMetal,
+                    "DEBUG: DISPATCH_D phys{} -> DISPATCH_H phys{}: num_hops={} (return path)",
+                    device_id_,
+                    dispatch_h_kernel->GetDeviceId(),
+                    dependent_config_.num_hops);
                 assemble_2d_fabric_packet_header_args(
                     this->dependent_config_, GetDeviceId(), dispatch_h_kernel->GetDeviceId());
                 found_dispatch_h = true;

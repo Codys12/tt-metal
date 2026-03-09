@@ -48,6 +48,15 @@ uint32_t get_relative_cq_offset(uint8_t cq_id, uint32_t cq_size);
 // used in system_memory_manager and device
 uint16_t get_umd_channel(uint16_t channel);
 
+// Returns the host-sysmem slice size available to a single logical device on the
+// selected MMIO channel. This collapses to the full channel size when no sharing
+// is active, and shrinks to a per-device slice when multiple logical devices
+// share the same backing host channel.
+uint32_t get_per_device_host_channel_size(ChipId chip_id, uint16_t channel);
+
+// Returns the share offset of a logical device within its backing host channel.
+uint32_t get_per_device_host_channel_offset(ChipId chip_id, uint16_t channel);
+
 // only used in impl
 
 /// @brief Get absolute offset of the command queue

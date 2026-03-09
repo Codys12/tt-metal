@@ -129,10 +129,13 @@ __attribute__((noinline)) void service_lite_fabric() {
     asm volatile("" ::: "memory");
     auto* mem_map = reinterpret_cast<volatile lite_fabric::FabricLiteMemoryMap*>(LITE_FABRIC_CONFIG_START);
 
-    // Check for TXQ switch request from host (one-shot: 0 → requested value).
-    // Host writes active_txq_request=2 before launching fabric router on ERISC0.
+    // Check for TXQ switch request from host (one-shot: 0 -> requested value).
+    // Must use NOC self-read to bypass the BH ERISC D-cache: host writes this
+    // field via PCIe after boot, and stale zero lines can survive soft reset.
     if (active_txq == 0) {
-        uint8_t req = mem_map->config.forwarding.active_txq_request;
+        uint32_t req_l1 = reinterpret_cast<uint32_t>(&mem_map->config.forwarding.active_txq_request);
+        uint32_t req_word = noc_self_read_word(req_l1 & ~0xFu, (req_l1 & 0xFu) / 4);
+        uint8_t req = static_cast<uint8_t>((req_word >> ((req_l1 & 0x3u) * 8)) & 0xFF);
         if (req != 0) {
             active_txq = req;
         }
@@ -160,7 +163,9 @@ __attribute__((noinline)) void service_lite_fabric() {
             }
             terminate_processed = true;
             mem_map->config.routing_enabled = lite_fabric::RoutingEnabledState::STOPPED;
-            ConnectedRiscInterface::assert_connected_dm1_reset();
+            // Preserve any remote fabric router already running on ERISC0.
+            // Shutdown only the lite-fabric ERISC1 on the connected core.
+            ConnectedRiscInterface::assert_connected_erisc1_reset_only();
             {
                 constexpr uint32_t routing_enabled_address =
                     LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteConfig, routing_enabled);

@@ -99,23 +99,26 @@ void RelayMux::GenerateStaticConfigs() {
     const auto dst_fabric_node_id = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(destination_device_id);
 
     auto link_index = get_dispatch_link_index(src_fabric_node_id, dst_fabric_node_id, device_);
-    log_debug(
+    log_info(
         tt::LogMetal,
-        "RelayMux Device:{}, HeaderCh:{}, FullCh:{}, FullB:{}, Logical:{}, Virtual: {}, D2H: {} Channel Size: {}, Num "
-        "Slots: {}, L1 Size: {}, Src: {}, Dst: {}, Link Index: {}",
+        "RelayMux Device:{}, dest_dev:{}, tunnel:{}, D2H:{}, Logical:{}, Virtual:{}, "
+        "Src:M{}D{}, Dst:M{}D{}, LinkIdx:{}, status_addr:0x{:x}, term_addr:0x{:x}, "
+        "ep_status_addr:0x{:x}, local_ep_status_addr:0x{:x}",
         device_->id(),
-        kernels_requiring_header_only_channel,
-        kernels_requiring_full_size_channel,
-        static_config_.buffer_size_bytes.value(),
+        destination_device_id,
+        tunnel_id_,
+        d2h_,
         logical_core_.str(),
         GetVirtualCore().str(),
-        d2h_,
-        mux_buffer_size,
-        num_slots,
-        l1_size,
-        src_fabric_node_id,
-        dst_fabric_node_id,
-        link_index);
+        src_fabric_node_id.mesh_id.get(),
+        src_fabric_node_id.chip_id,
+        dst_fabric_node_id.mesh_id.get(),
+        dst_fabric_node_id.chip_id,
+        link_index,
+        mux_kernel_config_->get_status_address(),
+        mux_kernel_config_->get_termination_signal_address(),
+        mux_ct_args_.size() > 12 ? mux_ct_args_[12] : 0,   // fabric_endpoint_status_address
+        mux_ct_args_.size() > 11 ? mux_ct_args_[11] : 0);  // local_fabric_router_status_address
 
     mux_rt_args_ = mux_kernel_config_->get_fabric_mux_run_time_args(
         src_fabric_node_id, dst_fabric_node_id, link_index, *program_, {logical_core_});
@@ -179,6 +182,64 @@ int get_num_hops(ChipId mmio_dev_id, ChipId downstream_dev_id) {
             dev_mmio_device_id);
     }
 
+    // Blackhole N-hop discovery flattens UMD tunnels to [mmio, remote] so the
+    // dispatch topology can enumerate every reachable chip. Those synthetic
+    // tunnels lose the real routing distance, so prefer the original lite-fabric
+    // discovery metadata when it exists.
+    const int lite_fabric_hops = tt::tt_metal::MetalContext::instance().get_lite_fabric_hop_count(downstream_dev_id);
+    if (lite_fabric_hops > 0) {
+        TT_FATAL(
+            tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(downstream_dev_id) ==
+                mmio_dev_id,
+            "RelayMux Downstream device {} is not controlled by MMIO device {}",
+            downstream_dev_id,
+            mmio_dev_id);
+        log_info(
+            tt::LogMetal,
+            "DEBUG: get_num_hops(mmio={}, downstream={}) = {} (from lite_fabric)",
+            mmio_dev_id,
+            downstream_dev_id,
+            lite_fabric_hops);
+        return lite_fabric_hops;
+    }
+
+    // Fallback: compute hop count from the control plane's fabric route.
+    // The UMD tunnel scan below returns hop=1 for ALL N-hop devices because
+    // Phase 3c creates flat [mmio, remote] tunnels.  Using the control plane
+    // route length gives the correct distance for multi-hop devices.
+    try {
+        const auto& cp = tt::tt_metal::MetalContext::instance().get_control_plane();
+        const auto src_node = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(mmio_dev_id);
+        const auto dst_node = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(downstream_dev_id);
+        const auto fwd_dir = cp.get_forwarding_direction(src_node, dst_node);
+        if (fwd_dir.has_value()) {
+            const auto& active_chans = cp.get_active_fabric_eth_channels_in_direction(src_node, *fwd_dir);
+            if (!active_chans.empty()) {
+                const auto route = cp.get_fabric_route(src_node, dst_node, active_chans[0]);
+                if (!route.empty()) {
+                    int hops = static_cast<int>(route.size());
+                    log_info(
+                        tt::LogMetal,
+                        "DEBUG: get_num_hops(mmio={}, downstream={}) = {} (from control_plane route, dir={})",
+                        mmio_dev_id,
+                        downstream_dev_id,
+                        hops,
+                        static_cast<int>(*fwd_dir));
+                    return hops;
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        log_info(
+            tt::LogMetal,
+            "DEBUG: get_num_hops(mmio={}, downstream={}): control_plane fallback failed: {}",
+            mmio_dev_id,
+            downstream_dev_id,
+            e.what());
+    }
+
+    // Last resort: UMD tunnel scan.  WARNING: returns hop=1 for ALL N-hop
+    // devices because flat [mmio, remote] tunnels lose distance information.
     auto tunnels_from_mmio =
         tt::tt_metal::MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_dev_id);
 
@@ -191,6 +252,12 @@ int get_num_hops(ChipId mmio_dev_id, ChipId downstream_dev_id) {
             k_MaxTunnelSize);
         for (int hop = 0; hop < tunnel.size(); ++hop) {
             if (tunnel[hop] == downstream_dev_id) {
+                log_info(
+                    tt::LogMetal,
+                    "WARNING: get_num_hops(mmio={}, downstream={}) = {} (from UMD tunnel — likely WRONG for N-hop!)",
+                    mmio_dev_id,
+                    downstream_dev_id,
+                    hop);
                 return hop;
             }
         }

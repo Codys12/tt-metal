@@ -90,6 +90,8 @@ inline std::string get_core_descriptor_file(
                     return core_desc_dir + "blackhole_140_arch_eth_dispatch.yaml";
                 } else if (use_fabric_tensix) {
                     return core_desc_dir + "blackhole_140_arch_fabric_mux.yaml";
+                } else if (tt::tt_metal::MetalContext::instance().get_cluster().number_of_devices() > 1) {
+                    return core_desc_dir + "blackhole_140_arch_multichip.yaml";
                 } else {
                     return core_desc_dir + "blackhole_140_arch.yaml";
                 }

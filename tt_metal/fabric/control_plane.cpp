@@ -1108,7 +1108,35 @@ void ControlPlane::configure_routing_tables_for_fabric_ethernet_channels(
         }
     }
 
+    // Diagnostic: per-device per-direction channel counts before routing plane calculation
+    for (const auto& [fabric_node_id, directions] : this->router_port_directions_to_physical_eth_chan_map_) {
+        std::string dir_str;
+        for (const auto& [dir, chans] : directions) {
+            dir_str += fmt::format("dir{}={} ", static_cast<int>(dir), chans.size());
+        }
+        log_info(
+            tt::LogFabric,
+            "DEBUG: pre-routing-planes M{}D{} channels_per_dir: [{}]",
+            fabric_node_id.mesh_id,
+            fabric_node_id.chip_id,
+            dir_str);
+    }
+
     this->initialize_dynamic_routing_plane_counts(intra_mesh_connectivity, fabric_config, reliability_mode);
+
+    // Diagnostic: final routing plane counts
+    for (const auto& [fabric_node_id, directions] : this->router_port_directions_to_num_routing_planes_map_) {
+        std::string dir_str;
+        for (const auto& [dir, count] : directions) {
+            dir_str += fmt::format("dir{}={} ", static_cast<int>(dir), count);
+        }
+        log_info(
+            tt::LogFabric,
+            "DEBUG: routing_planes M{}D{}: [{}]",
+            fabric_node_id.mesh_id,
+            fabric_node_id.chip_id,
+            dir_str);
+    }
 
     // Order the ethernet channels so that when we use them for deciding connections, indexing into ports per direction
     // is consistent for each each neighbouring chip.
@@ -1914,6 +1942,8 @@ void ControlPlane::write_routing_tables_to_all_chips() const {
     TT_ASSERT(
         this->intra_mesh_routing_tables_.size() == this->inter_mesh_routing_tables_.size(),
         "Intra mesh routing tables size mismatch with inter mesh routing tables");
+    auto& context = tt::tt_metal::MetalContext::instance();
+    const auto& cluster = context.get_cluster();
     auto user_meshes = this->get_user_physical_mesh_ids();
     for (auto mesh_id : user_meshes) {
         const auto& local_mesh_coord_range = this->get_coord_range(mesh_id, MeshScope::LOCAL);
@@ -1922,13 +1952,19 @@ void ControlPlane::write_routing_tables_to_all_chips() const {
             auto fabric_node_id = FabricNodeId(mesh_id, fabric_chip_id);
             // Skip unreachable N-hop chips — no lite fabric path to write routing tables.
             auto physical_chip_id = this->logical_mesh_chip_id_to_physical_chip_id_mapping_.at(fabric_node_id);
-            if (tt::tt_metal::MetalContext::instance().is_chip_unreachable(physical_chip_id)) {
+            if (context.is_chip_unreachable(physical_chip_id)) {
                 log_info(
                     tt::LogFabric,
                     "write_routing_tables_to_all_chips: skipping unreachable chip {} (physical {})",
                     fabric_chip_id,
                     physical_chip_id);
                 continue;
+            }
+            if (context.is_lite_fabric_bootstrap_active() && !cluster.mmio_chip_ids().contains(physical_chip_id)) {
+                // Multiple remotes can share one MMIO lite-fabric sender core; resync before each chip's write burst.
+                if (auto* remote_chip = cluster.get_driver()->get_remote_chip(physical_chip_id)) {
+                    remote_chip->get_remote_communication()->resync_remote_transfer_ethernet_cores();
+                }
             }
             TT_ASSERT(
                 this->inter_mesh_routing_tables_.contains(fabric_node_id),

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -14,6 +15,7 @@
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include <enchantum/enchantum.hpp>
 #include <fmt/base.h>
@@ -640,8 +642,42 @@ void launch_build_step(const std::function<void()>& build_func, std::vector<std:
 }
 
 void sync_build_steps(std::vector<std::shared_future<void>>& events) {
-    for (auto& event : events) {
-        event.get();
+    if (events.empty()) {
+        return;
+    }
+
+    using namespace std::chrono_literals;
+
+    std::vector<bool> completed(events.size(), false);
+    std::size_t num_completed = 0;
+    auto last_heartbeat = std::chrono::steady_clock::now();
+
+    while (num_completed < events.size()) {
+        bool made_progress = false;
+        for (std::size_t i = 0; i < events.size(); ++i) {
+            if (completed[i] || events[i].wait_for(0s) != std::future_status::ready) {
+                continue;
+            }
+            events[i].get();
+            completed[i] = true;
+            ++num_completed;
+            made_progress = true;
+        }
+
+        if (num_completed == events.size()) {
+            break;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_heartbeat >= 30s) {
+            log_info(
+                tt::LogBuildKernels, "Waiting for async build steps: {} / {} complete", num_completed, events.size());
+            last_heartbeat = now;
+        }
+
+        if (!made_progress) {
+            std::this_thread::sleep_for(1s);
+        }
     }
 }
 

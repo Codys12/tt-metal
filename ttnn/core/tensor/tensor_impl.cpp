@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ttnn/tensor/tensor_impl.hpp"
+#include <tt-logger/tt-logger.hpp>
 #include <fmt/format.h>
 #include <optional>
 
@@ -675,9 +676,16 @@ Tensor to_device(
     const auto* tensor_spec = tensor_spec_overriden_memory_config.has_value()
                                   ? &tensor_spec_overriden_memory_config.value()
                                   : &tensor.tensor_spec();
+    log_info(
+        tt::LogMetal,
+        "DEBUG: tensor_impl::to_device: allocating mesh buffer shape={} dtype={}",
+        tensor_spec->logical_shape(),
+        tensor_spec->data_type());
     auto mesh_buffer = allocate_device_buffer(mesh_device, *tensor_spec);
+    log_info(tt::LogMetal, "DEBUG: tensor_impl::to_device: calling to_device_mesh_buffer");
     auto [mesh_storage, topology] = to_device_mesh_buffer(
         tensor.storage(), mesh_buffer, *tensor_spec, *tensor.tensor_attributes, tensor.tensor_topology(), cq_id);
+    log_info(tt::LogMetal, "DEBUG: tensor_impl::to_device: done");
     return Tensor(std::move(mesh_storage), *tensor_spec, topology);
 }
 

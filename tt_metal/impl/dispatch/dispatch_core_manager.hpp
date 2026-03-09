@@ -158,7 +158,7 @@ private:
     /// @brief getting any available dispatch core for a device
     /// @param device_id
     /// @return
-    CoreCoord get_next_available_dispatch_core(ChipId device_id);
+    CoreCoord get_next_available_dispatch_core(ChipId device_id, bool consume_from_back = false);
 
     void log_dispatch_assignment(
         std::string name,

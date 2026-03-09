@@ -28,7 +28,16 @@ const tt_cxy_pair& dispatch_core_manager::prefetcher_core(ChipId device_id, uint
     }
     // Issue queue interface is on the MMIO device
     ChipId mmio_device_id = tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device_id);
-    CoreCoord issue_queue_coord = this->get_next_available_dispatch_core(mmio_device_id);
+    const bool consume_prefetcher_from_back = device_id != mmio_device_id &&
+                                              this->get_dispatch_core_type() == CoreType::WORKER &&
+                                              tt::tt_metal::MetalContext::instance()
+                                                      .get_cluster()
+                                                      .get_devices_controlled_by_mmio_device(mmio_device_id)
+                                                      .size() > 1;
+    // Only remote-servicing PREFETCH_H kernels should consume from the back on the
+    // MMIO gateway. The MMIO device's local PREFETCH_HD must keep front-slot ordering
+    // so its enqueue-program dispatcher matches the remotes' dispatcher_d/dispatcher_s.
+    CoreCoord issue_queue_coord = this->get_next_available_dispatch_core(mmio_device_id, consume_prefetcher_from_back);
     assignment.prefetcher = tt_cxy_pair(mmio_device_id, issue_queue_coord.x, issue_queue_coord.y);
     log_dispatch_assignment("Prefetcher", assignment.prefetcher.value(), device_id, channel, cq_id);
     return assignment.prefetcher.value();
@@ -215,18 +224,24 @@ void dispatch_core_manager::reset_dispatch_core_manager(
     }
 }
 
-CoreCoord dispatch_core_manager::get_next_available_dispatch_core(ChipId device_id) {
+CoreCoord dispatch_core_manager::get_next_available_dispatch_core(ChipId device_id, bool consume_from_back) {
     if (!this->available_dispatch_cores_by_device.contains(device_id)) {
         TT_THROW("Invalid device ID to assign dispatch cores {}", device_id);
     }
-    if (this->available_dispatch_cores_by_device.at(device_id).empty()) {
+    auto& available_dispatch_cores = this->available_dispatch_cores_by_device.at(device_id);
+    if (available_dispatch_cores.empty()) {
         TT_THROW(
             "No more available dispatch cores on device {} to assign. Expand dispatch cores specified in core "
             "descriptor YAML",
             device_id);
     }
-    CoreCoord avail_dispatch_core = this->available_dispatch_cores_by_device.at(device_id).front();
-    this->available_dispatch_cores_by_device.at(device_id).pop_front();
+    CoreCoord avail_dispatch_core =
+        consume_from_back ? available_dispatch_cores.back() : available_dispatch_cores.front();
+    if (consume_from_back) {
+        available_dispatch_cores.pop_back();
+    } else {
+        available_dispatch_cores.pop_front();
+    }
     return avail_dispatch_core;
 }
 

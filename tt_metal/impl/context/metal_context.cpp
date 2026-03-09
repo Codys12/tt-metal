@@ -548,6 +548,9 @@ void MetalContext::initialize(
     dispatch_timeout_detection_processed_ = false;
     unreachable_chip_ids_.clear();
     remote_fabric_eth_channels_.clear();
+    staged_remote_fabric_eth_cores_.clear();
+    launched_remote_fabric_router_devices_.clear();
+    lite_fabric_bootstrap_terminated_ = false;
     downstream_sender_cores_.clear();
 
     // Initialize dispatch state
@@ -2014,6 +2017,7 @@ void MetalContext::initialize(
                 if (clean_channels != orig_channels) {
                     auto* remote_chip = cluster_->get_driver()->get_remote_chip(chip_id);
                     remote_chip->set_remote_transfer_ethernet_cores(clean_channels);
+                    remote_chip_eth_channels[key] = clean_channels;
                     log_info(
                         tt::LogMetal,
                         "Phase 2b: rebound chip {} to non-forwarded channels [{}] "
@@ -2079,6 +2083,7 @@ void MetalContext::initialize(
                     if (ch_it != remote_chip_eth_channels.end()) {
                         auto* remote_chip = cluster_->get_driver()->get_remote_chip(device_id);
                         remote_chip->set_remote_transfer_ethernet_cores(ch_it->second);
+                        remote_chip->get_remote_communication()->resync_remote_transfer_ethernet_cores();
                     }
                     build_and_init_devices(std::vector<ChipId>{device_id}, /*sequential=*/true, /*skip_eth=*/true);
                 }
@@ -2101,6 +2106,7 @@ void MetalContext::initialize(
                     if (ch_it != remote_chip_eth_channels.end()) {
                         auto* remote_chip = cluster_->get_driver()->get_remote_chip(device_id);
                         remote_chip->set_remote_transfer_ethernet_cores(ch_it->second);
+                        remote_chip->get_remote_communication()->resync_remote_transfer_ethernet_cores();
                     }
                     log_info(tt::LogMetal, "launch_fw device {} (remote): initialize_and_launch_firmware", device_id);
                     initialize_and_launch_firmware(device_id);
@@ -2133,6 +2139,17 @@ void MetalContext::initialize(
                 log_info(tt::LogMetal, "Phase 3b: removing unreachable chip {} from cluster descriptor", id);
                 cluster_->get_cluster_desc()->remove_chip(id);
             }
+            if (!unreachable_chip_ids_.empty()) {
+                // Keep host CQ channel assignment aligned with the finalized
+                // reachable topology. Otherwise live devices can retain channel
+                // IDs that were only needed while unreachable chips were still
+                // present in the descriptor.
+                cluster_->reassign_mem_channels();
+                log_info(
+                    tt::LogMetal,
+                    "Phase 3b: reassigned host memory channels after pruning {} unreachable chip(s)",
+                    unreachable_chip_ids_.size());
+            }
 
             // Phase 3c: Rebuild UMD tunnel structure with flat [MMIO, remote]
             // tunnels for all reachable remote devices.  The original
@@ -2161,6 +2178,15 @@ void MetalContext::initialize(
             launch_fw_for_devices(initial_devices);
         }
     }
+    // Dynamic Blackhole discovery updates host-channel assignment and can prune
+    // unreachable chips after the initial dispatch settings were built. Refresh
+    // dispatch sizing now so host CQ allocation matches the finalized topology.
+    tt_metal::DispatchSettings::initialize(*cluster_);
+    dispatch_mem_map_[enchantum::to_underlying(CoreType::WORKER)] =
+        std::make_unique<DispatchMemMap>(CoreType::WORKER, num_hw_cqs);
+    dispatch_mem_map_[enchantum::to_underlying(CoreType::ETH)] =
+        std::make_unique<DispatchMemMap>(CoreType::ETH, num_hw_cqs);
+
     // Watcher needs to init before FW since FW needs watcher mailboxes to be set up, and needs to attach after FW
     // starts since it also writes to watcher mailboxes.
     watcher_server_->attach_devices();
@@ -2278,6 +2304,10 @@ void MetalContext::teardown() {
     // Deinitialize inspector
     inspector_data_.reset();
 
+    staged_remote_fabric_eth_cores_.clear();
+    remote_fabric_eth_channels_.clear();
+    launched_remote_fabric_router_devices_.clear();
+    lite_fabric_bootstrap_terminated_ = false;
     control_plane_.reset();
 }
 
@@ -2625,6 +2655,11 @@ void MetalContext::initialize_fabric_config() {
         return;
     }
 
+    lite_fabric_bootstrap_terminated_ = false;
+    staged_remote_fabric_eth_cores_.clear();
+    remote_fabric_eth_channels_.clear();
+    launched_remote_fabric_router_devices_.clear();
+
     log_info(tt::LogMetal, "DEBUG: initialize_fabric_config: configuring eth cores for fabric routers");
     this->cluster_->configure_ethernet_cores_for_fabric_routers(
         this->fabric_config_, this->num_fabric_active_routing_planes_);
@@ -2651,74 +2686,106 @@ void MetalContext::update_lite_fabric_bindings_for_fabric_routers() {
         return;
     }
 
-    // Identify MMIO channels used for multi-hop forwarding.  These channels
-    // have forwarding enabled on the 1-hop receiver — routing 1-hop reads
-    // through them causes forwarding_downstream_wr_idx desync and corrupts
-    // the entire forwarding chain (devices 2+ hops away become unreachable).
-    // Phase 2b already excluded these channels via rebinding; we must NOT
-    // re-include them here.
-    std::set<uint32_t> forwarding_mmio_channels;
+    const auto& control_plane = this->get_control_plane();
+    std::map<ChipId, std::set<uint32_t>> direct_mmio_channels_per_remote;
+    std::map<ChipId, int> tunnel_hops_per_remote;
     for (const auto& t : tunnels) {
-        if (t.num_hops > 1) {
-            forwarding_mmio_channels.insert(t.mmio_core_logical.y);
-        }
-    }
-
-    // Identify 1-hop chips that have at least one forwarding channel.
-    // For these chips, Phase 2b already bound them to non-forwarded channels
-    // and we must preserve that binding.
-    std::set<ChipId> chips_with_forwarding;
-    for (const auto& t : tunnels) {
-        if (t.num_hops == 1 && forwarding_mmio_channels.count(t.mmio_core_logical.y)) {
-            chips_with_forwarding.insert(t.connected_id);
-        }
-    }
-
-    // Group channels by remote chip, but only include channels whose remote
-    // peers have fabric routers.  Skip chips that have forwarding chains —
-    // their Phase 2b bindings to non-forwarded channels must be preserved.
-    std::map<ChipId, std::set<uint32_t>> channels_per_remote;
-    for (const auto& t : tunnels) {
-        if (t.num_hops != 1) {
-            continue;  // Only 1-hop tunnels are candidates for direct UMD binding
-        }
-        if (chips_with_forwarding.count(t.connected_id)) {
-            log_info(
-                tt::LogMetal,
-                "Preserving Phase 2b binding for remote device {} — "
-                "MMIO channel {} has forwarding, skipping rebind",
-                t.connected_id,
-                t.mmio_core_logical.y);
+        if (cluster_->mmio_chip_ids().count(t.connected_id) || is_chip_unreachable(t.connected_id)) {
             continue;
         }
-        auto it = remote_fabric_eth_channels_.find(t.connected_id);
-        if (it != remote_fabric_eth_channels_.end() && it->second.count(t.connected_core_logical.y)) {
-            channels_per_remote[t.connected_id].insert(t.mmio_core_logical.y);
-        } else {
+        tunnel_hops_per_remote[t.connected_id] = std::max(tunnel_hops_per_remote[t.connected_id], t.num_hops);
+
+        if (t.num_hops != 1) {
+            continue;
+        }
+        auto router_channels_it = remote_fabric_eth_channels_.find(t.connected_id);
+        if (router_channels_it == remote_fabric_eth_channels_.end() ||
+            !router_channels_it->second.count(t.connected_core_logical.y)) {
             log_info(
                 tt::LogMetal,
                 "Excluding MMIO channel {} for remote device {} — remote peer core {} has no fabric router",
                 t.mmio_core_logical.y,
                 t.connected_id,
                 t.connected_core_logical.str());
+            continue;
         }
+        direct_mmio_channels_per_remote[t.connected_id].insert(t.mmio_core_logical.y);
     }
 
-    for (auto& [chip_id, channels] : channels_per_remote) {
-        // Drain all pending lite fabric writes before re-syncing the host-side
-        // h2d/d2h counters.  set_remote_transfer_ethernet_cores reads d2h from
-        // the device and sets host h2d = d2h.  If the relay hasn't finished
-        // processing a write (d2h < h2d on device), the sync picks up stale d2h,
-        // and when the relay eventually advances d2h, it permanently disagrees
-        // with the host's h2d, causing wait_for_all_writes_consumed to hang.
-        cluster_->l1_barrier(chip_id);
+    for (ChipId chip_id : launched_remote_fabric_router_devices_) {
+        if (cluster_->mmio_chip_ids().count(chip_id) || is_chip_unreachable(chip_id) ||
+            !control_plane.is_chip_mapped(chip_id)) {
+            continue;
+        }
 
-        cluster_->get_driver()->get_remote_chip(chip_id)->set_remote_transfer_ethernet_cores(channels);
+        ChipId mmio_chip_id = cluster_->get_associated_mmio_device(chip_id);
+        if (!control_plane.is_chip_mapped(mmio_chip_id)) {
+            continue;
+        }
+
+        const auto mmio_fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(mmio_chip_id);
+        const auto remote_fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(chip_id);
+        auto forwarding_channels =
+            control_plane.get_forwarding_eth_chans_to_chip(mmio_fabric_node_id, remote_fabric_node_id);
+
+        if (auto hops_it = tunnel_hops_per_remote.find(chip_id);
+            hops_it != tunnel_hops_per_remote.end() && hops_it->second == 1) {
+            std::set<uint32_t> filtered_channels;
+            if (auto direct_it = direct_mmio_channels_per_remote.find(chip_id);
+                direct_it != direct_mmio_channels_per_remote.end()) {
+                for (auto chan : forwarding_channels) {
+                    if (direct_it->second.count(chan)) {
+                        filtered_channels.insert(chan);
+                    }
+                }
+            }
+            forwarding_channels.assign(filtered_channels.begin(), filtered_channels.end());
+        }
+
+        if (forwarding_channels.empty()) {
+            log_info(
+                tt::LogMetal,
+                "Skipping router binding update for remote device {} — no MMIO fabric-router channels available",
+                chip_id);
+            continue;
+        }
+
+        auto* remote_chip = cluster_->get_driver()->get_remote_chip(chip_id);
+        if (!remote_chip) {
+            continue;
+        }
+        std::set<uint32_t> channels(forwarding_channels.begin(), forwarding_channels.end());
+
+        int num_hops = 1;
+        auto route =
+            control_plane.get_fabric_route(mmio_fabric_node_id, remote_fabric_node_id, forwarding_channels.front());
+        if (!route.empty()) {
+            auto current_node = mmio_fabric_node_id;
+            num_hops = 0;
+            for (const auto& [next_node, _] : route) {
+                if (next_node != current_node) {
+                    ++num_hops;
+                    current_node = next_node;
+                }
+            }
+        } else if (auto hops_it = tunnel_hops_per_remote.find(chip_id); hops_it != tunnel_hops_per_remote.end()) {
+            num_hops = hops_it->second;
+        }
+
+        remote_chip->set_remote_transfer_ethernet_cores(channels);
+        if (num_hops > 1) {
+            remote_chip->get_remote_communication()->set_num_hops(num_hops);
+        }
+        // Rebinds after lite-fabric teardown can preserve stale ch1/read-event
+        // state on shared MMIO ETH cores. Force a transport resync so the first
+        // post-bootstrap router read doesn't poll a stale 0xdeadbeef slot.
+        remote_chip->get_remote_communication()->resync_remote_transfer_ethernet_cores();
         log_info(
             tt::LogMetal,
-            "Updated UMD binding for remote device {}: lite fabric channels=[{}]",
+            "Updated UMD binding for remote device {}: fabric-router channels=[{}], num_hops={}",
             chip_id,
-            fmt::join(channels, ", "));
+            fmt::join(channels, ", "),
+            num_hops);
     }
 }
 
@@ -3324,9 +3391,24 @@ void MetalContext::initialize_firmware(
                 cluster_->write_core(data.data(), data.size(), tt_cxy_pair(device_id, virtual_core), ncrisc_halt_addr);
             }
 
+            // Active-eth cores that were held in reset for lite-fabric
+            // bootstrapping do not have syseng base FW running on ERISC0, so
+            // the mailbox release path is invalid. initialize_remote_eth_cores_for_fabric()
+            // performs the reset-PC bootstrap and soft-reset deassert after this load step.
+            const bool remote_active_eth_bootstrap =
+                is_active_eth && !assert_reset &&
+                (!cluster_->mmio_chip_ids().count(device_id) || lite_fabric_bootstrap_terminated_);
+
             // Write firmware main to primary erisc (DM0)
             // Using classic ASSERT/DEASSERT PC method for 1 erisc mode because erisc1 has no base firmware
-            if (hal_->get_eth_fw_is_cooperative() || core_type != HalProgrammableCoreType::ACTIVE_ETH ||
+            if (remote_active_eth_bootstrap) {
+                log_info(
+                    tt::LogMetal,
+                    "Device {} init_fw ETH {}: reset-PC bootstrap path, skipping mailbox release/direct PC write",
+                    device_id,
+                    virtual_core.str());
+            } else if (
+                hal_->get_eth_fw_is_cooperative() || core_type != HalProgrammableCoreType::ACTIVE_ETH ||
                 !rtoptions_.get_enable_2_erisc_mode()) {
                 // PC
                 log_info(
@@ -3549,7 +3631,7 @@ int MetalContext::get_lite_fabric_hop_count(ChipId chip_id) const {
 }
 
 bool MetalContext::is_lite_fabric_mmio_core(ChipId mmio_id, CoreCoord virtual_core) const {
-    if (!lite_fabric_hal_) {
+    if (!is_lite_fabric_bootstrap_active()) {
         return false;
     }
     for (const auto& t : lite_fabric_hal_->get_system_descriptor().tunnels_from_mmio) {
@@ -3560,19 +3642,27 @@ bool MetalContext::is_lite_fabric_mmio_core(ChipId mmio_id, CoreCoord virtual_co
     return false;
 }
 
+bool MetalContext::is_lite_fabric_bootstrap_active() const {
+    return lite_fabric_hal_ != nullptr && !lite_fabric_bootstrap_terminated_;
+}
+
 bool MetalContext::has_fabric_routers_launched(ChipId device_id) const {
     const auto& mmio_ids = cluster_->mmio_chip_ids();
     if (mmio_ids.count(device_id)) {
         return true;  // MMIO devices launch fabric routers directly
     }
-    auto it = remote_fabric_eth_channels_.find(device_id);
-    return it != remote_fabric_eth_channels_.end() && !it->second.empty();
+    return launched_remote_fabric_router_devices_.contains(device_id);
 }
 
 void MetalContext::initialize_remote_eth_cores_for_fabric(
-    ChipId device_id, const std::vector<CoreCoord>& logical_eth_cores) {
+    ChipId device_id, const std::vector<CoreCoord>& logical_eth_cores, bool launch_erisc0) {
     if (logical_eth_cores.empty()) {
         return;
+    }
+
+    const bool is_mmio_device = cluster_->mmio_chip_ids().count(device_id) > 0;
+    if (!launch_erisc0 && !is_mmio_device) {
+        staged_remote_fabric_eth_cores_[device_id] = logical_eth_cores;
     }
 
     log_info(
@@ -3596,10 +3686,7 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
     // Bit 11 = ERISC0 reset, bit 12 = ERISC1 reset.
     // These values match the lite fabric FW (risc_interface.hpp).
     constexpr uint32_t SOFT_RESET_REG_ADDR = 0xFFB121B0;
-    constexpr uint32_t AERISC_RESET_PC_ADDR = 0xFFB14000;    // debug reg: ERISC0 boot PC
-    // MMIO-peering cores: ERISC1 already running lite fabric receiver.
-    // 0x46000 = bits 13/14/18 set, bits 11/12 clear (both ERISCs deasserted).
-    constexpr uint32_t SOFT_RESET_ERISC0_ERISC1_RUNNING = 0x46000;
+    constexpr uint32_t AERISC_RESET_PC_ADDR = 0xFFB14000;  // debug reg: ERISC0 boot PC
     // Non-MMIO-peering cores: ERISC1 in POR reset, no firmware loaded.
     // 0x47000 = bits 12/13/14/18 set, bit 11 clear (ERISC0 deasserted, ERISC1 stays in reset).
     constexpr uint32_t SOFT_RESET_ERISC0_ONLY = 0x47000;
@@ -3634,7 +3721,7 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
         // cause ERISC1 to boot from POR RESET_PC (syseng subordinate FW or
         // garbage), conflicting with ERISC0's fabric router.
         bool erisc1_running = false;
-        if (lite_fabric_hal_) {
+        if (is_lite_fabric_bootstrap_active()) {
             // 1. MMIO-peering cores: Phase 2 deployed ERISC1 via ETH_INIT_NEIGHBOUR
             if (peer_is_mmio) {
                 erisc1_running = true;
@@ -3666,39 +3753,6 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
             peer_logical.str(),
             peer_is_mmio,
             erisc1_running);
-
-        // Signal ERISC1 to switch from TXQ0 to TXQ2 before we launch ERISC0
-        // (fabric router uses TXQ0/TXQ1).  ERISC1 polls active_txq_request in
-        // its main loop and switches on the next iteration.
-        if (erisc1_running) {
-            uint32_t txq_req_addr = LITE_FABRIC_CONFIG_START + offsetof(lite_fabric::FabricLiteMemoryMap, config) +
-                                    offsetof(lite_fabric::FabricLiteConfig, forwarding) +
-                                    offsetof(lite_fabric::FabricLiteConfig::ForwardingConfig, active_txq_request);
-            uint8_t txq2 = 2;
-            // Signal the remote-side ERISC1
-            cluster_->write_core(&txq2, sizeof(txq2), tt_cxy_pair(device_id, virtual_core), txq_req_addr);
-            // Also signal the MMIO-side ERISC1 (peer) — it runs lite fabric too
-            if (peer_is_mmio) {
-                CoreCoord peer_virtual =
-                    cluster_->get_virtual_coordinate_from_logical_coordinates(peer_chip, peer_logical, CoreType::ETH);
-                cluster_->write_core(&txq2, sizeof(txq2), tt_cxy_pair(peer_chip, peer_virtual), txq_req_addr);
-            }
-            log_info(
-                tt::LogMetal,
-                "Device {} init remote ETH: wrote active_txq_request=2 to core {} and peer {}:{} at {:#x}",
-                device_id,
-                virtual_core.str(),
-                peer_chip,
-                peer_logical.str(),
-                txq_req_addr);
-        }
-
-        // Track MMIO-peering cores where the fabric router is launched.
-        // Used by update_lite_fabric_bindings_for_fabric_routers()
-        // and has_fabric_routers_launched().
-        if (peer_is_mmio) {
-            remote_fabric_eth_channels_[device_id].insert(logical_core.y);
-        }
 
         // Clear erisc app sync info
         cluster_->write_core(
@@ -3736,9 +3790,8 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
         //      reset, ERISC1 running lite fabric receiver).
         //    - Non-MMIO-peering cores: POR state (both ERISCs in reset, 0x47800).
 
-        // 2. Clear the syseng FW mailbox so that send_msg_to_eth_mailbox
-        //    (called inside initialize_firmware) doesn't timeout on the
-        //    residual POR/CALL marker.
+        // 2. Clear the syseng FW mailbox area to remove any residual POR/CALL
+        //    marker before ERISC0 is booted directly from reset.
         {
             constexpr uint32_t mailbox_index = 0;
             auto mailbox_addr = hal_->get_eth_fw_mailbox_address(mailbox_index);
@@ -3828,23 +3881,16 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
                 &reset_pc_val, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), AERISC_RESET_PC_ADDR);
         }
 
-        // Verify writes by reading back key addresses.
         cluster_->l1_barrier(device_id);
-        {
-            uint32_t readback_tramp[3] = {};
-            cluster_->read_core(readback_tramp, sizeof(readback_tramp), tt_cxy_pair(device_id, virtual_core), 0x0);
-            uint32_t readback_fw = 0;
-            cluster_->read_core(&readback_fw, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), fw_base);
+        // Do not read back remote ETH L1 here. Remote same-tile reads through
+        // the lite-fabric relay are fragile on MMIO-peering cores, and this
+        // path is only staging firmware/mailboxes before the router launch.
+        if (peer_is_mmio) {
             log_info(
                 tt::LogMetal,
-                "Device {} init remote ETH: readback trampoline L1[0x0]={:#010x} [0x4]={:#010x} [0x8]={:#010x}, "
-                "L1[{:#x}]={:#010x} (expect non-zero if FW loaded)",
+                "Device {} init remote ETH: skipping remote ETH self-readback on core {} during staging",
                 device_id,
-                readback_tramp[0],
-                readback_tramp[1],
-                readback_tramp[2],
-                fw_base,
-                readback_fw);
+                virtual_core.str());
         }
 
         // 5. Write skip-dance flag to ncrisc_halt.resume_addr (mailbox_base + 0).
@@ -3869,20 +3915,24 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
             cluster_->write_core(&sentinel, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), mailbox_addr + 8);
         }
 
+        if (!launch_erisc0) {
+            continue;
+        }
+
+        if (peer_is_mmio) {
+            remote_fabric_eth_channels_[device_id].insert(logical_core.y);
+        }
+
         // 6. Deassert ERISC0 via write_core (NOC unicast write to the soft
-        //    reset register on the target ETH tile).  On Blackhole, the
-        //    0xFFBxxxxx tile register space is NOC-addressable, so the lite
-        //    fabric receiver can deliver the write to any tile on the chip.
-        //
-        //    With lite fabric active, ERISC1 runs on all cores (erisc1_running=true),
-        //    so we always use 0x46000 (both ERISCs deasserted).
-        //    Without lite fabric, ERISC1 is in POR — use 0x47000 (ERISC0 only).
+        //    reset register on the target ETH tile). This is the last
+        //    lite-fabric-relayed operation for the core, so keep ERISC1 in
+        //    reset and hand the ETH tile to the fabric router immediately.
         cluster_->l1_barrier(device_id);
 
-        uint32_t soft_reset_val = erisc1_running ? SOFT_RESET_ERISC0_ERISC1_RUNNING : SOFT_RESET_ERISC0_ONLY;
+        uint32_t soft_reset_val = SOFT_RESET_ERISC0_ONLY;
         log_info(
             tt::LogMetal,
-            "Device {} init remote ETH: deasserting ERISC0 ({:#x}) on core {} via write_core (erisc1_running={})",
+            "Device {} init remote ETH: deasserting ERISC0 ({:#x}) on core {} via write_core (ERISC1 was running={})",
             device_id,
             soft_reset_val,
             virtual_core.str(),
@@ -3891,8 +3941,19 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
             &soft_reset_val, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), SOFT_RESET_REG_ADDR);
     }
 
+    if (!launch_erisc0) {
+        cluster_->l1_barrier(device_id);
+        log_info(
+            tt::LogMetal,
+            "Device {} init remote ETH: staged {} core(s) for deferred ERISC0 launch",
+            device_id,
+            logical_eth_cores.size());
+        return;
+    }
+
     // Barrier to ensure deassert has reached the device
     cluster_->l1_barrier(device_id);
+    launched_remote_fabric_router_devices_.insert(device_id);
 
     // Wait for ERISC0 to boot, skip the 2-erisc dance (via the skip flag),
     // pass through wait_subordinate_eriscs(), and reach the go-signal loop.
@@ -3906,41 +3967,112 @@ void MetalContext::initialize_remote_eth_cores_for_fabric(
         if (is_chip_unreachable(peer_chip)) {
             continue;
         }
-        DeviceAddr mailbox_addr = hal_->get_dev_addr(core_type, HalL1MemAddrType::MAILBOX);
-        uint32_t diag[8] = {};
-        cluster_->read_core(diag, sizeof(diag), tt_cxy_pair(device_id, virtual_core), mailbox_addr);
-        // go_messages[0] is at go_addr; read it too
-        uint32_t go_area[4] = {};
-        DeviceAddr go_addr = hal_->get_dev_addr(core_type, HalL1MemAddrType::GO_MSG);
-        if (go_addr == 0) {
-            go_addr = 0x410;  // fallback: known BH ACTIVE_ETH go_messages address
+        if (!cluster_->mmio_chip_ids().count(peer_chip)) {
+            continue;
         }
-        cluster_->read_core(go_area, sizeof(go_area), tt_cxy_pair(device_id, virtual_core), go_addr);
         log_info(
             tt::LogMetal,
-            "Device {} init remote ETH DIAG: core {} mailbox[0..7]="
-            "[{:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}] "
-            "go[0..3]=[{:#010x}, {:#010x}, {:#010x}, {:#010x}] "
-            "(sentinel at +8: {} booted={})",
+            "Device {} init remote ETH DIAG: skipping remote ETH mailbox/go readback on core {} "
+            "while lite fabric relay is active",
             device_id,
-            virtual_core.str(),
-            diag[0],
-            diag[1],
-            diag[2],
-            diag[3],
-            diag[4],
-            diag[5],
-            diag[6],
-            diag[7],
-            go_area[0],
-            go_area[1],
-            go_area[2],
-            go_area[3],
-            diag[2] == 0xDEADBEEF ? "SENTINEL" : "cleared",
-            diag[2] != 0xDEADBEEF ? "YES" : "NO");
+            virtual_core.str());
     }
 
     log_info(tt::LogMetal, "Device {} init remote ETH: {} core(s) initialized", device_id, logical_eth_cores.size());
+}
+
+void MetalContext::launch_remote_eth_cores_for_fabric(ChipId device_id) {
+    auto staged_it = staged_remote_fabric_eth_cores_.find(device_id);
+    if (staged_it == staged_remote_fabric_eth_cores_.end() || staged_it->second.empty()) {
+        return;
+    }
+
+    if (auto* remote_chip = cluster_->get_driver()->get_remote_chip(device_id)) {
+        remote_chip->get_remote_communication()->resync_remote_transfer_ethernet_cores();
+    }
+
+    const auto& logical_eth_cores = staged_it->second;
+    constexpr uint32_t SOFT_RESET_REG_ADDR = 0xFFB121B0;
+    constexpr uint32_t SOFT_RESET_ERISC0_ONLY = 0x47000;
+
+    for (const auto& logical_core : logical_eth_cores) {
+        CoreCoord virtual_core =
+            cluster_->get_virtual_coordinate_from_logical_coordinates(device_id, logical_core, CoreType::ETH);
+        auto [peer_chip, peer_logical] = cluster_->get_connected_ethernet_core({device_id, logical_core});
+        if (is_chip_unreachable(peer_chip)) {
+            continue;
+        }
+
+        bool peer_is_mmio = cluster_->mmio_chip_ids().count(peer_chip) > 0;
+        bool erisc1_running = false;
+        if (lite_fabric_hal_) {
+            if (peer_is_mmio) {
+                erisc1_running = true;
+            }
+            if (downstream_sender_cores_.count({device_id, static_cast<uint32_t>(logical_core.y)})) {
+                erisc1_running = true;
+            }
+            if (!erisc1_running) {
+                const auto& tunnels = lite_fabric_hal_->get_system_descriptor().tunnels_from_mmio;
+                for (const auto& t : tunnels) {
+                    if (t.connected_id == device_id &&
+                        static_cast<uint32_t>(t.connected_core_logical.y) == static_cast<uint32_t>(logical_core.y)) {
+                        erisc1_running = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (peer_is_mmio) {
+            remote_fabric_eth_channels_[device_id].insert(logical_core.y);
+        }
+
+        // Always use 0x47000 to kill ERISC1 when deasserting ERISC0.
+        // Using 0x46000 (keep ERISC1) causes TXQ0 contention between ERISC0
+        // (fabric router) and ERISC1 (lite fabric) → permanent TXQ hang.
+        // ERISC1 on remote devices never gets a STOP signal from terminate_lite_fabric_bootstrap
+        // (that only targets MMIO ERISC1), so it would run forever if kept alive.
+        // Keepalive: MMIO ERISC0 running base FW sends keepalive to remote → link alive.
+        uint32_t soft_reset_val = SOFT_RESET_ERISC0_ONLY;
+        log_info(
+            tt::LogMetal,
+            "Device {} launch remote ETH: deasserting ERISC0 ({:#x}) on core {} via write_core (peer {}:{}, ERISC1 was "
+            "running={})",
+            device_id,
+            soft_reset_val,
+            virtual_core.str(),
+            peer_chip,
+            peer_logical.str(),
+            erisc1_running);
+        cluster_->write_core(
+            &soft_reset_val, sizeof(uint32_t), tt_cxy_pair(device_id, virtual_core), SOFT_RESET_REG_ADDR);
+    }
+
+    cluster_->l1_barrier(device_id);
+    launched_remote_fabric_router_devices_.insert(device_id);
+    staged_remote_fabric_eth_cores_.erase(staged_it);
+}
+
+void MetalContext::terminate_lite_fabric_bootstrap() {
+    if (!lite_fabric_hal_ || lite_fabric_bootstrap_terminated_) {
+        return;
+    }
+
+    lite_fabric_hal_->terminate();
+    for (ChipId id : cluster_->all_chip_ids()) {
+        if (cluster_->mmio_chip_ids().contains(id)) {
+            continue;
+        }
+        auto* remote_chip = cluster_->get_driver()->get_remote_chip(id);
+        if (!remote_chip) {
+            continue;
+        }
+        // Drop the bootstrap relay bindings. After this point UMD is re-bound
+        // to the fabric-router channels by update_lite_fabric_bindings_for_fabric_routers().
+        remote_chip->set_remote_transfer_ethernet_cores(std::set<uint32_t>{});
+    }
+    lite_fabric_bootstrap_terminated_ = true;
 }
 
 void MetalContext::initialize_and_launch_firmware(ChipId device_id) {
