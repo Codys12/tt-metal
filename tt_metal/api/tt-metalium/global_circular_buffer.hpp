@@ -25,6 +25,12 @@ public:
         const std::vector<std::pair<CoreCoord, CoreRangeSet>>& sender_receiver_core_mapping,
         uint32_t size,
         BufferType buffer_type = BufferType::L1);
+    GlobalCircularBuffer(
+        IDevice* device,
+        const std::vector<std::pair<CoreCoord, CoreRangeSet>>& sender_receiver_core_mapping,
+        uint32_t size,
+        BufferType buffer_type,
+        uint32_t page_size);
 
     GlobalCircularBuffer(const GlobalCircularBuffer&) = default;
     GlobalCircularBuffer& operator=(const GlobalCircularBuffer&) = default;
@@ -40,14 +46,15 @@ public:
     DeviceAddr buffer_address() const;
     DeviceAddr config_address() const;
     uint32_t size() const;
+    uint32_t page_size() const { return page_size_; }
     const std::vector<std::pair<CoreCoord, CoreRangeSet>>& sender_receiver_core_mapping() const;
     IDevice* get_device() const { return this->device_; }
 
     static constexpr auto attribute_names =
-        std::forward_as_tuple("sender_receiver_core_mapping", "size", "buffer_type");
+        std::forward_as_tuple("sender_receiver_core_mapping", "size", "buffer_type", "page_size");
     auto attribute_values() const {
         return std::make_tuple(
-            this->sender_receiver_core_mapping_, this->size_, cb_buffer_.get_buffer()->buffer_type());
+            this->sender_receiver_core_mapping_, this->size_, cb_buffer_.get_buffer()->buffer_type(), this->page_size_);
     }
 
 private:
@@ -63,6 +70,7 @@ private:
     CoreRangeSet receiver_cores_;
     CoreRangeSet all_cores_;
     uint32_t size_ = 0;
+    uint32_t page_size_ = 0;
 };
 
 /**
@@ -79,6 +87,12 @@ GlobalCircularBuffer CreateGlobalCircularBuffer(
     const std::vector<std::pair<CoreCoord, CoreRangeSet>>& sender_receiver_core_mapping,
     uint32_t size,
     BufferType buffer_type = BufferType::L1);
+GlobalCircularBuffer CreateGlobalCircularBuffer(
+    IDevice* device,
+    const std::vector<std::pair<CoreCoord, CoreRangeSet>>& sender_receiver_core_mapping,
+    uint32_t size,
+    BufferType buffer_type,
+    uint32_t page_size);
 
 /**
  * @brief Creates a Circular Buffer in L1 memory of specified cores using the address space of the

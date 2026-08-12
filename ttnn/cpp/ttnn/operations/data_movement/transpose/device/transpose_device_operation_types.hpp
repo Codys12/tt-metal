@@ -15,6 +15,7 @@ struct TransposeParams {
     TransposeOpDim dim{};
     tt::tt_metal::MemoryConfig output_mem_config;
     float pad_value = 0.0f;
+    std::optional<CoreRangeSet> sub_core_grids = std::nullopt;
 };
 
 struct TransposeInputs {

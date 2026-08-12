@@ -506,8 +506,13 @@ int main() {
                 cb_l1_base =
                     (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg_address->kernel_config.remote_cb_offset);
                 uint32_t end_cb_index = launch_msg_address->kernel_config.min_remote_cb_start_index;
+#ifdef ARCH_BLACKHOLE
+                constexpr bool remote_cb_posted = false;
+#else
+                constexpr bool remote_cb_posted = true;
+#endif
                 experimental::setup_remote_cb_interfaces<true>(
-                    cb_l1_base, end_cb_index, noc_index, noc_mode, true, cmd_buf);
+                    cb_l1_base, end_cb_index, noc_index, noc_mode, remote_cb_posted, cmd_buf);
                 barrier_remote_cb_interface_setup(noc_index, noc_mode, end_cb_index);
                 start_ncrisc_kernel_run(enables);
                 uint32_t kernel_lma =
@@ -528,8 +533,13 @@ int main() {
                     cb_l1_base =
                         (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg_address->kernel_config.remote_cb_offset);
                     uint32_t end_cb_index = launch_msg_address->kernel_config.min_remote_cb_start_index;
+#ifdef ARCH_BLACKHOLE
+                    constexpr bool remote_cb_posted = false;
+#else
+                    constexpr bool remote_cb_posted = true;
+#endif
                     experimental::setup_remote_cb_interfaces<true>(
-                        cb_l1_base, end_cb_index, noc_index, noc_mode, true, cmd_buf);
+                        cb_l1_base, end_cb_index, noc_index, noc_mode, remote_cb_posted, cmd_buf);
                     barrier_remote_cb_interface_setup(noc_index, noc_mode, end_cb_index);
                 }
                 start_ncrisc_kernel_run(enables);

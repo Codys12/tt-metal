@@ -12,7 +12,7 @@ inline constexpr uint32_t READ_ALIGNMENT = 64;
 
 struct RepeatSharedVariables {
     tt::tt_metal::KernelHandle reader_kernel_id{};
-    tt::tt_metal::CoreRange total_cores{tt::tt_metal::CoreCoord{0, 0}};
+    tt::tt_metal::CoreRangeSet total_cores{tt::tt_metal::CoreRange{tt::tt_metal::CoreCoord{0, 0}}};
 };
 
 }  // namespace ttnn::prim

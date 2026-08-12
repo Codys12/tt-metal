@@ -24,7 +24,11 @@ struct UpperRepeatDims {
 };
 
 ttnn::Tensor repeat_upper_dims_rm(
-    const ttnn::Tensor& tensor, const uint32_t dim, const uint32_t repetitions, const MemoryConfig& output_mem_config) {
+    const ttnn::Tensor& tensor,
+    const uint32_t dim,
+    const uint32_t repetitions,
+    const MemoryConfig& output_mem_config,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
     // collapse upper dims to 4D or append 1s
     // collapse lower dims or insert 1s
     // op
@@ -46,7 +50,7 @@ ttnn::Tensor repeat_upper_dims_rm(
     auto input_tensor = ttnn::view(tensor, ttnn::Shape(collapsed_shape_vector));
 
     constexpr bool is_final_dim = false;
-    auto out_tensor = ttnn::prim::repeat(input_tensor, repetitions, is_final_dim, output_mem_config);
+    auto out_tensor = ttnn::prim::repeat(input_tensor, repetitions, is_final_dim, output_mem_config, sub_core_grids);
     auto expected_shape = input_shape;
     expected_shape[dim] *= repetitions;
 
@@ -54,7 +58,10 @@ ttnn::Tensor repeat_upper_dims_rm(
 }
 
 ttnn::Tensor repeat_last_dim_rm(
-    const ttnn::Tensor& tensor, const uint32_t repetitions, const MemoryConfig& output_mem_config) {
+    const ttnn::Tensor& tensor,
+    const uint32_t repetitions,
+    const MemoryConfig& output_mem_config,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
     // collapse to 2D
     // op
     // un-collapse
@@ -69,7 +76,7 @@ ttnn::Tensor repeat_last_dim_rm(
     auto input_tensor = ttnn::view(tensor, ttnn::Shape(collapsed_shape_vector));
 
     constexpr bool is_final_dim = true;
-    auto out_tensor = ttnn::prim::repeat(input_tensor, repetitions, is_final_dim, output_mem_config);
+    auto out_tensor = ttnn::prim::repeat(input_tensor, repetitions, is_final_dim, output_mem_config, sub_core_grids);
 
     auto expected_shape = input_shape;
     expected_shape[-1] *= repetitions;
@@ -122,6 +129,14 @@ ttnn::Tensor repeat(
     const ttnn::Tensor& input_tensor,
     const ttnn::SmallVector<uint32_t>& repetition_vector,
     const std::optional<MemoryConfig>& memory_config) {
+    return ttnn::repeat(input_tensor, repetition_vector, memory_config, std::nullopt);
+}
+
+ttnn::Tensor repeat(
+    const ttnn::Tensor& input_tensor,
+    const ttnn::SmallVector<uint32_t>& repetition_vector,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
     auto [working_tensor, working_repetition_vector] =
         operations::data_movement::detail::match_input_rank(input_tensor, repetition_vector);
     MemoryConfig output_mem_config = memory_config.value_or(input_tensor.memory_config());
@@ -159,7 +174,8 @@ ttnn::Tensor repeat(
 
     // tiled -> RM
     if (working_tensor.layout() == ttnn::TILE_LAYOUT) {
-        working_tensor = ttnn::to_layout(working_tensor, ttnn::ROW_MAJOR_LAYOUT);
+        working_tensor =
+            ttnn::to_layout(working_tensor, ttnn::ROW_MAJOR_LAYOUT, std::nullopt, std::nullopt, sub_core_grids);
     }
 
     // loop over dims in repetition vector, backwards because repeat pages first is faster
@@ -170,20 +186,21 @@ ttnn::Tensor repeat(
         }
         // if last dim
         if (it == working_repetition_vector.crbegin()) {
-            working_tensor =
-                operations::data_movement::detail::repeat_last_dim_rm(working_tensor, *it, working_output_mem_config);
+            working_tensor = operations::data_movement::detail::repeat_last_dim_rm(
+                working_tensor, *it, working_output_mem_config, sub_core_grids);
         }
         // if not last dim
         else {
             auto i = working_repetition_vector.crend() - it - 1;  // forward index
             working_tensor = operations::data_movement::detail::repeat_upper_dims_rm(
-                working_tensor, i, *it, working_output_mem_config);
+                working_tensor, i, *it, working_output_mem_config, sub_core_grids);
         }
     }
 
     // RM -> OG page layout
     if (input_tensor.layout() == ttnn::TILE_LAYOUT) {
-        working_tensor = ttnn::to_layout(working_tensor, ttnn::TILE_LAYOUT, input_tensor.dtype());
+        working_tensor =
+            ttnn::to_layout(working_tensor, ttnn::TILE_LAYOUT, input_tensor.dtype(), std::nullopt, sub_core_grids);
     }
 
     // Interleaved to OG mem layout
@@ -195,7 +212,8 @@ ttnn::Tensor repeat(
 }
 
 ttnn::Tensor repeat(const ttnn::Tensor& input_tensor, const ttnn::Shape& repeat_dims) {
-    return ttnn::repeat(input_tensor, SmallVector<uint32_t>(repeat_dims.cbegin(), repeat_dims.cend()), std::nullopt);
+    return ttnn::repeat(
+        input_tensor, SmallVector<uint32_t>(repeat_dims.cbegin(), repeat_dims.cend()), std::nullopt, std::nullopt);
 }
 
 }  // namespace ttnn

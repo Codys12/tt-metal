@@ -36,8 +36,17 @@ GlobalCircularBuffer::GlobalCircularBuffer(
     const std::vector<std::pair<CoreCoord, CoreRangeSet>>& sender_receiver_core_mapping,
     uint32_t size,
     BufferType buffer_type) :
-    device_(device), sender_receiver_core_mapping_(sender_receiver_core_mapping), size_(size) {
+    GlobalCircularBuffer(device, sender_receiver_core_mapping, size, buffer_type, 0) {}
+
+GlobalCircularBuffer::GlobalCircularBuffer(
+    IDevice* device,
+    const std::vector<std::pair<CoreCoord, CoreRangeSet>>& sender_receiver_core_mapping,
+    uint32_t size,
+    BufferType buffer_type,
+    uint32_t page_size) :
+    device_(device), sender_receiver_core_mapping_(sender_receiver_core_mapping), size_(size), page_size_(page_size) {
     TT_FATAL(device_ != nullptr, "Device cannot be null");
+    TT_FATAL(page_size_ == 0 || size_ % page_size_ == 0, "Global CB size must be divisible by its fixed page size");
     uint32_t num_sender_cores = sender_receiver_core_mapping.size();
     uint32_t num_receiver_cores = 0;
     uint32_t max_num_receivers_per_sender = 0;

@@ -1,0 +1,4 @@
+transformers @ git+https://github.com/huggingface/transformers.git@8e7d47a325d647d9e78b832b8e003c9d676b658a
+fastapi
+httpx
+uvicorn

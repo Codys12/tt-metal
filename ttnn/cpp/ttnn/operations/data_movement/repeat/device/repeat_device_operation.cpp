@@ -83,11 +83,15 @@ RepeatDeviceOperation::tensor_return_value_t repeat(
     const Tensor& input,
     uint32_t m_num_repeats,
     bool m_is_last_dim,
-    const tt::tt_metal::MemoryConfig& output_mem_config) {
+    const tt::tt_metal::MemoryConfig& output_mem_config,
+    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids) {
     using OperationType = RepeatDeviceOperation;
     return ttnn::device_operation::launch<OperationType>(
         OperationType::operation_attributes_t{
-            .m_num_repeats = m_num_repeats, .m_is_last_dim = m_is_last_dim, .m_output_mem_config = output_mem_config},
+            .m_num_repeats = m_num_repeats,
+            .m_is_last_dim = m_is_last_dim,
+            .m_output_mem_config = output_mem_config,
+            .sub_core_grids = sub_core_grids},
         OperationType::tensor_args_t{.input = input});
 }
 }  // namespace ttnn::prim

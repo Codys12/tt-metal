@@ -35,6 +35,11 @@ VERIFIED_MODEL_CONFIGS = {
     "Qwen3-VL-72B": {"dim": 8192, "hidden_dim": 28672, "n_heads": 64, "n_kv_heads": 8},
     "Gemma3-4B": {"dim": 2560, "hidden_dim": 14336, "n_heads": 20, "n_kv_heads": 20},
     "Gemma3-27B": {"dim": 4608, "hidden_dim": 24576, "n_heads": 32, "n_kv_heads": 8},
+    # QKV is the first enabled Muse stream. Larger projection families use
+    # their own split/padded shapes and are checked when inserted.
+    # The support table describes the largest BFP8 slice. Wider Muse MLP
+    # slices are BFP4 and are capacity-checked from their actual tensors.
+    "Muse-Glimmer-30B": {"dim": 6656, "hidden_dim": 2304, "n_heads": 32, "n_kv_heads": 2},
 }
 
 
@@ -232,6 +237,10 @@ class Prefetcher(LightweightModule):
         num_tensors: int,
         num_layers: int,
         num_receiver_cores: int = None,
+        receiver_mapping_override: Optional[dict] = None,
+        model_name: Optional[str] = None,
+        isolate_receiver_subdevice: bool = False,
+        worker_core_range_override: Optional[ttnn.CoreRangeSet] = None,
     ):
         """
         Prefetcher class that prefetches tensors from DRAM to L1.
@@ -247,34 +256,59 @@ class Prefetcher(LightweightModule):
         self.enable_performance_mode: bool = True
         self.global_cb: Optional[ttnn.GlobalCircularBuffer] = None
         self.worker_sub_device_id: Optional[ttnn.SubDeviceId] = None
+        self.receiver_sub_device_id: Optional[ttnn.SubDeviceId] = None
+        self.consumer_sub_device_ids: List[ttnn.SubDeviceId] = []
         self.num_tensors: int = num_tensors
         self.num_layers: int = num_layers
-        self.num_senders: int = len(self.pf_config["dram_banks"])
+        self.receiver_mapping_override: Optional[dict] = receiver_mapping_override
+        self.num_senders: int = (
+            len(self.receiver_mapping_override)
+            if self.receiver_mapping_override is not None
+            else len(self.pf_config["dram_banks"])
+        )
+        self.max_receivers_per_sender: int = (
+            max(len(receivers) for receivers in self.receiver_mapping_override.values())
+            if self.receiver_mapping_override is not None
+            else 0
+        )
         self.global_cb_size: int = 0  # Size of the global circular buffer in bytes storing prefetched matmul weights
+        self.global_cb_page_size: int = 0
         self.max_tensor_block_size: int = 0  # Max tensor block size is the largest block size of a tensor in bytes
-        self.receiver_mapping_override: Optional[dict] = None
-        self.model_name = os.getenv("HF_MODEL", "")
-        assert self.model_name != "", "HF_MODEL is not set. DRAM Prefetcher must be run with a model."
+        self.max_reader_block_size: int = 0  # Largest per-DRAM-reader block, before fanout to receivers
+        self.max_reader_block_tiles: int = 0
+        self.max_prefetch_tile_size: int = 0
+        self.isolate_receiver_subdevice = isolate_receiver_subdevice
+        self.worker_core_range_override = worker_core_range_override
+        self.model_name = model_name or os.getenv("HF_MODEL", "")
+        assert self.model_name != "", "model_name or HF_MODEL must be set to use the DRAM Prefetcher."
         assert (
             num_receiver_cores is None or num_receiver_cores in self.legal_receiver_cores
         ), "num_receiver_cores must be in legal_receiver_cores"
         if num_receiver_cores is not None:
-            assert is_prefetcher_supported(
+            supported = is_prefetcher_supported(
                 self.model_name, self.mesh_device.get_num_devices(), num_receiver_cores * self.num_senders
-            ), "num_receiver_cores is not supported"
-            self.num_receiver_cores = num_receiver_cores
-            self.receiver_mapping_override = (
-                generate_sender_receiver_mapping(num_receiver_cores) if num_receiver_cores > 3 else None
             )
+            bounded_muse_stream = (
+                "Muse" in self.model_name
+                and "Glimmer" in self.model_name
+                and self.receiver_mapping_override is not None
+            )
+            assert supported or bounded_muse_stream, "num_receiver_cores is not supported"
+            self.num_receiver_cores = num_receiver_cores
+            if self.receiver_mapping_override is None:
+                self.receiver_mapping_override = (
+                    generate_sender_receiver_mapping(num_receiver_cores) if num_receiver_cores > 3 else None
+                )
         else:
             for num_receivers in self.legal_receiver_cores:
                 if is_prefetcher_supported(
                     self.model_name, self.mesh_device.get_num_devices(), num_receivers * self.num_senders
                 ):
                     self.num_receiver_cores = num_receivers
-                    self.receiver_mapping_override = (
-                        generate_sender_receiver_mapping(num_receivers) if num_receivers > 3 else None
-                    )
+                    if self.receiver_mapping_override is None:
+                        self.receiver_mapping_override = (
+                            generate_sender_receiver_mapping(num_receivers) if num_receivers > 3 else None
+                        )
                     break
 
         ### Core Config
@@ -284,7 +318,13 @@ class Prefetcher(LightweightModule):
             cfg=self.pf_config,
             receiver_mapping_override=self.receiver_mapping_override,
         )
-        self.ring_size = self.num_receiver_cores * self.num_senders
+        self.ring_size = (
+            sum(len(receivers) for receivers in self.receiver_mapping_override.values())
+            if self.receiver_mapping_override is not None
+            else self.num_receiver_cores * self.num_senders
+        )
+        if self.max_receivers_per_sender == 0:
+            self.max_receivers_per_sender = self.num_receiver_cores
         self.dram_banks = self.core_config.dram_banks
 
         ### Worker core ranges for the worker sub device
@@ -298,7 +338,17 @@ class Prefetcher(LightweightModule):
                 for s in self.core_config.sender_cores(active=True)
             ]
             sender_set = ttnn.CoreRangeSet(sender_cores)
-            self.all_worker_cores_range_set = full_grid.subtract(sender_set)
+            non_sender_cores = full_grid.subtract(sender_set)
+            self.receiver_core_range_set = self.to_core_range_set(
+                self.core_config.receiver_cores(sender_active=True, receiver_active=True)
+            )
+            self.all_worker_cores_range_set = (
+                non_sender_cores.subtract(self.receiver_core_range_set)
+                if self.isolate_receiver_subdevice
+                else non_sender_cores
+            )
+            if self.worker_core_range_override is not None:
+                self.all_worker_cores_range_set = self.worker_core_range_override
         else:
             left_range = self.core_config._receiver_cols["left"]
             right_range = self.core_config._receiver_cols["right"]
@@ -322,6 +372,7 @@ class Prefetcher(LightweightModule):
         self.prefetched_tensors = []
         self.prefetched_tensor_addr = []
         self.prefetched_tt_addr_tensor = None
+        self.garbage_outputs = []
 
         ### Core Ranges
         self.sender_cores = None
@@ -378,6 +429,8 @@ class Prefetcher(LightweightModule):
             case Mode.DECODE:
                 self.prefetcher_sub_device = PrefetcherSubDevice(self.mesh_device)
                 self.prefetcher_sub_device.add_sub_device(self.to_core_range_set(self.sender_cores(active=True)))
+                if self.isolate_receiver_subdevice:
+                    self.prefetcher_sub_device.add_sub_device(self.receiver_core_range_set)
                 self.prefetcher_sub_device.add_sub_device(self.all_worker_cores_range_set)
                 self.prefetcher_sub_device.init_sub_device_manager()
             case Mode.PREFILL:
@@ -386,6 +439,16 @@ class Prefetcher(LightweightModule):
                 self.prefetcher_sub_device.init_sub_device_manager()
 
         self.worker_sub_device_id = self.prefetcher_sub_device.sub_devices_id[-1]
+        self.receiver_sub_device_id = (
+            self.prefetcher_sub_device.sub_devices_id[-2]
+            if mode == Mode.DECODE and self.isolate_receiver_subdevice
+            else self.worker_sub_device_id
+        )
+        self.consumer_sub_device_ids = (
+            [self.receiver_sub_device_id, self.worker_sub_device_id]
+            if mode == Mode.DECODE and self.isolate_receiver_subdevice
+            else [self.worker_sub_device_id]
+        )
         logger.info("=" * 50)
         logger.info("[Prefetcher Initialization]")
         logger.info(f"  Mode: {mode}")
@@ -411,13 +474,13 @@ class Prefetcher(LightweightModule):
         ), f"Number of tensor addresses have been inserted does not match the number of tensors to prefetch (num_tensors * num_layers), got {len(self.prefetched_tensor_addr)} != {self.num_tensors * self.num_layers}"
 
         tensor_addrs = torch.tensor(self.prefetched_tensor_addr)
-        tensor_addrs = tensor_addrs.repeat(self.mesh_device.dram_grid_size().x, 1)
+        tensor_addrs = tensor_addrs.repeat(self.num_senders, 1)
         tensor_addrs_mem_config = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
             ttnn.BufferType.L1,
             ttnn.ShardSpec(
                 self.to_core_range_set(self.sender_cores(active=True)),
-                [tensor_addrs.shape[0] // self.mesh_device.dram_grid_size().x, tensor_addrs.shape[1]],
+                [1, tensor_addrs.shape[1]],
                 ttnn.ShardOrientation.ROW_MAJOR,
             ),
         )
@@ -453,6 +516,13 @@ class Prefetcher(LightweightModule):
         w_tiles_padded = math.ceil(w_tiles / self.ring_size) * self.ring_size
         max_tensor_tiles = (h_tiles_padded * w_tiles_padded) // self.ring_size
         self.max_tensor_block_size = max(max_tensor_tiles * bytes_in_tile[tensor.dtype], self.max_tensor_block_size)
+        # Each sender reads one width shard from its DRAM bank, then fans the
+        # block out over its receivers.
+        reader_block_tiles_per_bank = (h_tiles_padded * w_tiles) // (self.ring_size * len(self.dram_banks()))
+        reader_block_tiles = reader_block_tiles_per_bank * self.max_receivers_per_sender // self.num_receiver_cores
+        self.max_reader_block_size = max(reader_block_tiles * bytes_in_tile[tensor.dtype], self.max_reader_block_size)
+        self.max_reader_block_tiles = max(reader_block_tiles, self.max_reader_block_tiles)
+        self.max_prefetch_tile_size = max(bytes_in_tile[tensor.dtype], self.max_prefetch_tile_size)
         self.prefetched_tensors.append(tensor)
         self.prefetched_tensor_addr.append(tensor.buffer_address())
         logger.info(
@@ -478,24 +548,36 @@ class Prefetcher(LightweightModule):
         # NO-OP for prefill mode
         return
 
-    def run(self):
-        """
-        Start prefetching weights into global CB with dram_prefetcher op
-        """
+    def prepare_global_cb(self):
+        """Allocate the persistent receiver ring before compiling its consumers."""
         assert self.init_decode_done, "Prefetcher has not been initialized for decode mode. Cannot run prefetcher"
-        # Create global cb buffer if it was not yet created.
         if self.global_cb is None:
-            self.global_cb_size = self.max_tensor_block_size
+            transport_page_size = (
+                self.max_reader_block_tiles * self.max_prefetch_tile_size // self.max_receivers_per_sender
+            )
+            self.global_cb_page_size = transport_page_size
+            # Sender DRAM staging has its own local CB. The GCB allocation is
+            # therefore only the receiver FIFO: two four-block chunks keep
+            # transfer and compute double buffered without reserving the
+            # sender's triple-buffer footprint on every receiver core.
+            receiver_pages = int(os.getenv("MUSE_PREFETCH_GCB_RECEIVER_PAGES", "8"))
+            self.global_cb_size = receiver_pages * transport_page_size
             logger.info(f"[DRAM Prefetcher] Creating global CB with size: {self.global_cb_size}")
             self.global_cb = ttnn.create_global_circular_buffer(
                 self.mesh_device,
                 self.sender_receiver_mapping,
                 self.global_cb_size,
+                page_size=transport_page_size,
             )
 
-        # Create address tensor if it was not created yet
         if self.prefetched_tt_addr_tensor is None:
             self.prefetched_tt_addr_tensor = self.create_address_tensor()
+
+    def run(self):
+        """
+        Start prefetching weights into global CB with dram_prefetcher op
+        """
+        self.prepare_global_cb()
 
         # Run prefetcher op (prefetcher op will start asynchronously prefetching weights until prefetcher.stop() is called)
         self.garbage = ttnn.dram_prefetcher(
@@ -504,13 +586,16 @@ class Prefetcher(LightweightModule):
             global_cb=self.global_cb,
             enable_performance_mode=self.enable_performance_mode,
         )
+        self.garbage_outputs.append(self.garbage)
         # Set worker sub device stall group
-        self.mesh_device.set_sub_device_stall_group([self.prefetcher_sub_device.sub_devices_id[-1]])
+        self.mesh_device.set_sub_device_stall_group(self.consumer_sub_device_ids)
         return
 
     def stop(self):
         assert self.init_decode_done, "Prefetcher has not been initialized for decode mode. Cannot stop prefetcher"
         assert self.garbage is not None, "Prefetcher has not been run. Cannot stop prefetcher"
-        ttnn.deallocate(self.garbage)
+        for output in self.garbage_outputs:
+            ttnn.deallocate(output)
+        self.garbage_outputs.clear()
         self.garbage = None
         return

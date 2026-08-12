@@ -61,5 +61,6 @@ ttnn::Tensor transpose(
     const Tensor& input_tensor,
     ttnn::prim::TransposeOpDim dim,
     const tt::tt_metal::MemoryConfig& output_mem_config,
-    float pad_value = 0.0f);
+    float pad_value = 0.0f,
+    const std::optional<CoreRangeSet>& sub_core_grids = std::nullopt);
 }  // namespace ttnn::prim

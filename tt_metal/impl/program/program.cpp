@@ -956,9 +956,11 @@ CBHandle detail::ProgramImpl::add_circular_buffer(
     TT_FATAL(this->compiled_.empty(), "Cannot add circular buffer to an already compiled program {}", this->id);
     TT_FATAL(
         this->dataflow_buffers_.empty(), "Cannot add circular buffer to a program that already has dataflow buffers");
-    // Merge ranges to reduce the number of multicasts needed to initialize CBs.
+    // Global circular buffers may intentionally use a sparse sender/receiver
+    // topology.  CoreRangeSet::merge_ranges can cover holes in that topology,
+    // producing cores which have no backing allocation in the global CB.
     std::shared_ptr<CircularBufferImpl> circular_buffer =
-        std::make_shared<CircularBufferImpl>(core_range_set.merge_ranges(), config, global_circular_buffer);
+        std::make_shared<CircularBufferImpl>(core_range_set, config, global_circular_buffer);
     return add_circular_buffer_(circular_buffer);
 }
 
@@ -1117,6 +1119,15 @@ void detail::ProgramImpl::allocate_circular_buffers(const IDevice* device) {
 void detail::ProgramImpl::validate_circular_buffer_region(const IDevice* device) {
     // ZoneScoped;
 
+    // Some traced pipelines intentionally time-multiplex statically allocated
+    // CBs with a persistent L1 buffer.  The caller is responsible for proving
+    // that the programs cannot execute concurrently and for restoring any
+    // persistent contents before their next consumer.  Keep this opt-in and
+    // scoped to program compilation/capture; the physical L1 bound below must
+    // still always be enforced.
+    const char* temporal_overlay_env = std::getenv("TT_METAL_ALLOW_L1_TEMPORAL_OVERLAY");
+    const bool allow_temporal_overlay = temporal_overlay_env != nullptr && std::strcmp(temporal_overlay_env, "1") == 0;
+
     // TODO: Circular buffer allocation and validation could be better optimized by determining usage per sub-device
     std::optional<DeviceAddr> lowest_address =
         device->lowest_occupied_compute_l1_address(this->determine_sub_device_ids(device));
@@ -1135,7 +1146,7 @@ void detail::ProgramImpl::validate_circular_buffer_region(const IDevice* device)
                 cb_region_end,
                 max_l1_size);
         }
-        if (lowest_address.has_value() and lowest_address.value() < cb_region_end) {
+        if (!allow_temporal_overlay && lowest_address.has_value() and lowest_address.value() < cb_region_end) {
             TT_THROW(
                 "Statically allocated circular buffers in program {} clash with L1 buffers on core range {}. L1 buffer "
                 "allocated at {} and static circular buffer region ends at {}",

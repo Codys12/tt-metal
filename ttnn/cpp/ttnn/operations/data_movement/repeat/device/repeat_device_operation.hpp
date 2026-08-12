@@ -40,5 +40,6 @@ RepeatDeviceOperation::tensor_return_value_t repeat(
     const Tensor& input,
     uint32_t m_num_repeats,
     bool m_is_last_dim,
-    const tt::tt_metal::MemoryConfig& output_mem_config);
+    const tt::tt_metal::MemoryConfig& output_mem_config,
+    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids = std::nullopt);
 }  // namespace ttnn::prim

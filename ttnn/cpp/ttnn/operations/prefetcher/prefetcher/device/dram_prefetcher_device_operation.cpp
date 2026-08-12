@@ -20,19 +20,19 @@ void DramPrefetcherOperation::validate_on_program_cache_miss(
 
     auto global_cb = *(args.global_cb);
 
-    // Check that global_cb sender_receiver_core_mapping has same number of receivers for each sender core
     const auto& sender_receiver_core_mapping = global_cb.sender_receiver_core_mapping();
-    uint32_t num_readers = input_tensors[0].shard_spec()->grid.num_cores();
+    uint32_t num_readers = sender_receiver_core_mapping.size();
+    uint32_t num_dram_banks = input_tensors[0].shard_spec()->grid.num_cores();
+    uint32_t num_receivers = 0;
     for (uint32_t i = 0; i < num_readers; ++i) {
         const auto& [sender_core, receiver_core_range] = sender_receiver_core_mapping[i];
-        TT_FATAL(
-            receiver_core_range.size() == sender_receiver_core_mapping.begin()->second.size(),
-            "Global circular buffer must have same number of receivers for each sender core");
+        TT_FATAL(receiver_core_range.num_cores() > 0, "Every sender core must have at least one receiver");
+        num_receivers += receiver_core_range.num_cores();
     }
-    uint32_t num_receivers_per_sender = sender_receiver_core_mapping[0].second.num_cores();
+    TT_FATAL(num_receivers % num_dram_banks == 0, "Receiver count must be divisible by DRAM bank count");
+    uint32_t num_receivers_per_bank = num_receivers / num_dram_banks;
 
     TT_FATAL(num_readers > 0, "Number of reader cores must be greater than zero");
-    TT_FATAL(num_receivers_per_sender > 0, "Number of receiver cores per sender must be greater than zero");
 
     for (size_t i = 0; i < input_tensors.size() - 1; ++i) {
         const auto& tensor = input_tensors[i];
@@ -44,13 +44,14 @@ void DramPrefetcherOperation::validate_on_program_cache_miss(
             "Input tensors must be width sharded");
         TT_FATAL(tensor.memory_config().buffer_type() == BufferType::DRAM, "Input tensors must be in DRAM");
 
-        // Check that all tensors' N (per shard) is divisible by number of cores in global CB receiver
+        // Each DRAM-bank shard is split across all receivers assigned to that
+        // bank, even when two reader cores own unequal receiver groups.
         TT_FATAL(
-            tensor.buffer()->shard_spec().shape()[1] % num_receivers_per_sender == 0,
+            tensor.buffer()->shard_spec().shape()[1] % num_receivers_per_bank == 0,
             "All tensors' padded shard size (in last dim) {} must be divisible by the number of receiver cores per "
-            "sender {}.",
+            "DRAM bank {}.",
             tensor.buffer()->shard_spec().shape()[1],
-            num_receivers_per_sender);
+            num_receivers_per_bank);
 
         tt::DataFormat tensor_data_format = tt::tt_metal::datatype_to_dataformat_converter(tensor.dtype());
         TT_FATAL(

@@ -131,6 +131,20 @@ FORCE_INLINE void update_rd_ptr_to_ring_index(
     }
 }
 
+// A single CB exchange is directional: whichever thread arrives second waits,
+// while the first can continue. Two exchanges form a full pack/unpack rendezvous.
+FORCE_INLINE void sync_packer_unpacker(uint32_t cb_id) {
+    constexpr uint32_t one_page = 1;
+    cb_reserve_back(cb_id, one_page);
+    cb_push_back(cb_id, one_page);
+    cb_wait_front(cb_id, one_page);
+    cb_pop_front(cb_id, one_page);
+    cb_reserve_back(cb_id, one_page);
+    cb_push_back(cb_id, one_page);
+    cb_wait_front(cb_id, one_page);
+    cb_pop_front(cb_id, one_page);
+}
+
 // Named CB arg lookup tables for batch-indexed output and partials CBs.
 // The factory emits "cb_mm_out_0" .. "cb_mm_out_N" and "cb_mm_partials_0" .. "cb_mm_partials_N"
 // as named compile-time args. These tables let fill_named_cb_array resolve them by index.
@@ -208,6 +222,8 @@ void kernel_main() {
     constexpr uint32_t in2_cb_id = get_named_compile_time_arg_val("cb_in2");
     constexpr uint32_t sync_cb = get_named_compile_time_arg_val("cb_sync");
     constexpr uint32_t sync_cb2 = get_named_compile_time_arg_val("cb_sync2");
+    constexpr uint32_t compute_sync_cb = get_named_compile_time_arg_val("cb_compute_sync");
+    constexpr uint32_t global_cb_blocks_per_chunk = get_named_compile_time_arg_val("global_cb_blocks_per_chunk");
 
     experimental::CircularBuffer in1_cb(in1_cb_id);
     experimental::CircularBuffer sync_buf(sync_cb);
@@ -256,9 +272,28 @@ void kernel_main() {
 
         UNPACK((in1_cb_start_addr = get_local_cb_start_addr(in1_cb_id)));
         UNPACK((in1_rd_ptr_start_addr = get_local_cb_rd_ptr(in1_cb_id)));
-        UNPACK((curr_in1_block_index = ring_idx));
+        // A bounded remote CB is a sequential stream, unlike the original
+        // full-tensor global CB which supported random access from ring_idx.
+        // Consume weights in producer order and index the much smaller,
+        // fully-gathered activation instead.
+        UNPACK((curr_in1_block_index = 0));
         UNPACK((in1_tensor_split = is_tensor_split(in1_cb_id, in1_tensor_size_bytes)));
-        UNPACK((update_rd_ptr_to_ring_index(in1_cb_id, in1_block_size_bytes, ring_idx, in1_tensor_split)));
+
+        experimental::CircularBuffer local_in0_cb(in0_cb_id);
+        experimental::CircularBuffer gathered_in0_cb(in2_cb_id);
+        constexpr uint32_t gathered_in0_num_tiles = (ring_size - 1) * in0_block_num_tiles;
+        uint32_t in0_block_size_words = 0;
+        uint32_t gathered_in0_rd_ptr_start_addr = 0;
+
+        // The ring reader owns reserve/push for gathered shards. Compute owns
+        // the local shard publication. Waiting for the complete activation is
+        // cheap (one decode row) and makes global K order directly addressable.
+        local_in0_cb.reserve_back(in0_block_num_tiles);
+        local_in0_cb.push_back(in0_block_num_tiles);
+        local_in0_cb.wait_front(in0_block_num_tiles);
+        gathered_in0_cb.wait_front(gathered_in0_num_tiles);
+        UNPACK((gathered_in0_rd_ptr_start_addr = get_local_cb_rd_ptr(in2_cb_id)));
+        UNPACK((in0_block_size_words = in0_block_num_tiles * get_local_cb_interface(in2_cb_id).fifo_page_size));
 #endif
         const uint32_t mm_out_cb_id = mm_out_cb_ids[b];
         const uint32_t mm_partials_cb_id = mm_partials_cb_ids[b];
@@ -279,12 +314,27 @@ void kernel_main() {
             PACK((pack_reconfig_data_format(mm_partials_cb_id)));
         }
 
-        // Wait to receive in1
+        // Ordinary DRAM/L1 readers publish the complete local CB once.  A
+        // global-CB producer publishes one K block at a time below.
+#ifndef ENABLE_GLOBAL_CB
         sync2_buf.wait_front(1);
         sync2_buf.pop_front(1);
+#endif
 
         for (uint32_t block = 0; block < num_blocks; block++) {
+#ifdef ENABLE_GLOBAL_CB
+            if (block % global_cb_blocks_per_chunk == 0) {
+                sync2_buf.wait_front(1);
+                sync2_buf.pop_front(1);
+            }
+#endif
+            // Ordinary ring matmul follows arrival order (local shard first).
+            // Global-CB matmul follows the producer's global K-block order.
+#ifdef ENABLE_GLOBAL_CB
+            const uint32_t curr_ring_idx = block;
+#else
             const uint32_t curr_ring_idx = (ring_idx + block) % ring_size;
+#endif
             uint32_t unpadded_in0_block_w = unpadded_in0_shard_widths_in_tiles[curr_ring_idx];
 
             // Wait for in1 block
@@ -292,7 +342,20 @@ void kernel_main() {
                 in1_cb.wait_front(in1_block_num_tiles);
             }
 
+#ifdef ENABLE_GLOBAL_CB
+            const bool use_local_in0 = curr_ring_idx == ring_idx;
+            const uint32_t input0_cb_id = use_local_in0 ? in0_cb_id : in2_cb_id;
+            if (!use_local_in0) {
+                // cb_in2 stores remote shards in ring arrival order:
+                // ring_idx+1, ..., ring_idx+ring_size-1. Translate the desired
+                // global shard to that compact zero-based position.
+                uint32_t gathered_position = (curr_ring_idx + ring_size - ring_idx) % ring_size - 1;
+                UNPACK((update_local_cb_rd_ptr(
+                    in2_cb_id, gathered_in0_rd_ptr_start_addr + gathered_position * in0_block_size_words)));
+            }
+#else
             const uint32_t input0_cb_id = block == 0 ? in0_cb_id : in2_cb_id;
+#endif
             experimental::CircularBuffer input0_cb(input0_cb_id);
             bool last_out = block == (num_blocks - 1);
 // Configure packer once for pack out without Bias
@@ -304,11 +367,13 @@ void kernel_main() {
 #endif
 
             // Wait to receive in0 block
+#ifndef ENABLE_GLOBAL_CB
             if (block == 0) {
                 input0_cb.reserve_back(in0_block_num_tiles);
                 input0_cb.push_back(in0_block_num_tiles);
             }
             input0_cb.wait_front(in0_block_num_tiles);
+#endif
 
 #ifdef ENABLE_GLOBAL_CB
             UNPACK((calculate_next_block_index_and_update_rd_ptr(
@@ -451,20 +516,29 @@ void kernel_main() {
             }
 #endif
 
+#ifndef ENABLE_GLOBAL_CB
             input0_cb.pop_front(in0_block_num_tiles);
+#endif
             if constexpr (in1_is_dram) {
                 in1_cb.pop_front(in1_block_num_tiles);
             }
 #ifdef ENABLE_GLOBAL_CB
             curr_in1_block_index = next_in1_block_index;
             UNPACK((update_local_cb_rd_ptr(in1_cb_id, next_in1_rd_ptr_addr)));
+            // Release a bounded chunk only after all unpack/math references
+            // to its pages have completed.
+            if ((block + 1) % global_cb_blocks_per_chunk == 0 || block + 1 == num_blocks) {
+                sync_packer_unpacker(compute_sync_cb);
+                sync_buf.reserve_back(1);
+                sync_buf.push_back(1);
+            }
 #endif
         }
 
 #ifdef ENABLE_GLOBAL_CB
-        // Release in1
-        sync_buf.reserve_back(1);
-        sync_buf.push_back(1);
+        UNPACK((update_local_cb_rd_ptr(in2_cb_id, gathered_in0_rd_ptr_start_addr)));
+        gathered_in0_cb.pop_front(gathered_in0_num_tiles);
+        local_in0_cb.pop_front(in0_block_num_tiles);
         UNPACK((update_local_cb_rd_ptr(in1_cb_id, in1_rd_ptr_start_addr)));  // reset rd_ptr back to the initial addr
         UNPACK((update_rd_ptr_to_ring_index(
             in1_cb_id, in1_block_size_bytes, ring_size, in1_tensor_split)));  // update to next tensor addr

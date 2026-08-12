@@ -110,6 +110,7 @@ void kernel_main() {
     constexpr uint32_t sync_cb = get_named_compile_time_arg_val("cb_sync");
     constexpr uint32_t sync_cb2 = get_named_compile_time_arg_val("cb_sync2");
     constexpr uint32_t remote_cb_id = get_named_compile_time_arg_val("cb_remote");
+    constexpr uint32_t global_cb_blocks_per_chunk = get_named_compile_time_arg_val("global_cb_blocks_per_chunk");
     constexpr auto in1_args = TensorAccessorArgs<12>();
 
     const uint32_t in1_block_num_tiles = in1_block_height_in_tiles * in1_block_width_in_tiles;
@@ -123,6 +124,10 @@ void kernel_main() {
     experimental::CircularBuffer cb_in1(cb_id_in1);
     experimental::CircularBuffer cb_sync(sync_cb);
     experimental::CircularBuffer cb_sync2(sync_cb2);
+    uint32_t total_aligned_pages_acked = 0;
+#ifdef ENABLE_GLOBAL_CB
+    total_aligned_pages_acked = experimental::remote_cb_local_pages_acked(remote_cb_id);
+#endif
 
     uint32_t in1_shard_width_offset_bytes = 0;
     uint32_t in1_dram_shard_block_size_bytes = 0;
@@ -137,12 +142,10 @@ void kernel_main() {
     }
 
     for (uint32_t b = 0; b < batch; ++b) {
+#ifndef ENABLE_GLOBAL_CB
         cb_sync2.reserve_back(1);
-#ifdef ENABLE_GLOBAL_CB
-        experimental::remote_cb_wait_front(remote_cb_id, num_blocks);
-#endif
-
         cb_sync2.push_back(1);
+#endif
 
         if constexpr (in1_is_dram_interleaved) {
             for (uint32_t block = 0; block < num_blocks; ++block) {
@@ -197,9 +200,29 @@ void kernel_main() {
         }
 
 #ifdef ENABLE_GLOBAL_CB
-        cb_sync.wait_front(1);
-        experimental::remote_cb_pop_front(remote_cb_id, num_blocks);
-        cb_sync.pop_front(1);
+        // The producer publishes one K block per remote page.  Hand each page
+        // to compute as soon as it arrives and return its credit immediately
+        // after compute is done, keeping DRAM and math overlapped with a
+        // bounded FIFO instead of staging the complete weight tensor in L1.
+        for (uint32_t block = 0; block < num_blocks; block += global_cb_blocks_per_chunk) {
+            uint32_t remaining_blocks = num_blocks - block;
+            uint32_t blocks_this_chunk =
+                remaining_blocks < global_cb_blocks_per_chunk ? remaining_blocks : global_cb_blocks_per_chunk;
+            experimental::remote_cb_wait_front_fixed_pages_tracked(
+                remote_cb_id, blocks_this_chunk, total_aligned_pages_acked);
+            cb_sync2.reserve_back(1);
+            cb_sync2.push_back(1);
+            cb_sync.wait_front(1);
+            if (block + blocks_this_chunk == num_blocks) {
+                total_aligned_pages_acked += experimental::remote_cb_pop_front_fixed_pages<true>(
+                    remote_cb_id, blocks_this_chunk, total_aligned_pages_acked);
+                noc_async_write_barrier(noc_index);
+            } else {
+                total_aligned_pages_acked += experimental::remote_cb_pop_front_fixed_pages<false>(
+                    remote_cb_id, blocks_this_chunk, total_aligned_pages_acked);
+            }
+            cb_sync.pop_front(1);
+        }
 #endif
         // Signal Here
         if constexpr (needs_signaler) {
@@ -211,7 +234,6 @@ void kernel_main() {
 
 #ifdef ENABLE_GLOBAL_CB
     experimental::update_remote_cb_config_in_l1(remote_cb_id);
-    noc.async_atomic_barrier();
 #endif
     noc.async_write_barrier();
 }

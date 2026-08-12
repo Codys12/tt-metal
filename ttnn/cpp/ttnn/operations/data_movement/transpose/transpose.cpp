@@ -24,7 +24,8 @@ inline Tensor transpose_(
     const Tensor& a,
     ttnn::prim::TransposeOpDim transpose_dim,
     const std::optional<MemoryConfig>& output_mem_config,
-    float pad_value = 0.0f) {
+    float pad_value,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
     uint32_t W = a.logical_shape()[3], H = a.logical_shape()[2];
     auto* device = a.device();
     auto lowest_address = device->lowest_occupied_compute_l1_address();
@@ -101,7 +102,7 @@ inline Tensor transpose_(
             break;
         default: break;
     }
-    return ttnn::prim::transpose(a, transpose_dim, output_mem_constructed, pad_value);
+    return ttnn::prim::transpose(a, transpose_dim, output_mem_constructed, pad_value, sub_core_grids);
 }
 
 ttnn::Tensor transpose_nd(
@@ -127,7 +128,8 @@ ttnn::Tensor transpose_impl(
     int64_t dim1,
     int64_t dim2,
     const std::optional<MemoryConfig>& memory_config_arg,
-    float pad_value = 0.0f) {
+    float pad_value,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
     const auto& input_shape = input_tensor.logical_shape();
     uint32_t normalized_dim1 = input_shape.get_normalized_index(dim1);
     uint32_t normalized_dim2 = input_shape.get_normalized_index(dim2);
@@ -140,6 +142,7 @@ ttnn::Tensor transpose_impl(
         normalized_dim1 += rank_diff;
         normalized_dim2 += rank_diff;
     } else if (initial_rank > 4) {
+        TT_FATAL(!sub_core_grids.has_value(), "ND transpose does not support sub core grids");
         return detail::transpose_nd(input_tensor, normalized_dim1, normalized_dim2, memory_config_arg, pad_value);
     }
 
@@ -186,7 +189,7 @@ ttnn::Tensor transpose_impl(
         } else {
             TT_ASSERT(false, "Unsupported transpose dims");
         }
-        output = detail::transpose_(input_typecasted, transpose_dim, memory_config_arg, pad_value);
+        output = detail::transpose_(input_typecasted, transpose_dim, memory_config_arg, pad_value, sub_core_grids);
     }
     output = initial_rank < 4u ? ttnn::squeeze_from_4D(output, initial_rank) : output;
     return typecast ? ttnn::typecast(output, DataType::BFLOAT8_B) : output;
@@ -202,7 +205,19 @@ ttnn::Tensor transpose(
     int64_t dim2,
     const std::optional<MemoryConfig>& memory_config,
     float pad_value) {
-    return operations::data_movement::transpose::transpose_impl(input_tensor, dim1, dim2, memory_config, pad_value);
+    return operations::data_movement::transpose::transpose_impl(
+        input_tensor, dim1, dim2, memory_config, pad_value, std::nullopt);
+}
+
+ttnn::Tensor transpose(
+    const ttnn::Tensor& input_tensor,
+    int64_t dim1,
+    int64_t dim2,
+    const std::optional<MemoryConfig>& memory_config,
+    float pad_value,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
+    return operations::data_movement::transpose::transpose_impl(
+        input_tensor, dim1, dim2, memory_config, pad_value, sub_core_grids);
 }
 
 ttnn::Tensor transpose(const ttnn::Tensor& input_tensor, int64_t dim1, int64_t dim2, float pad_value) {

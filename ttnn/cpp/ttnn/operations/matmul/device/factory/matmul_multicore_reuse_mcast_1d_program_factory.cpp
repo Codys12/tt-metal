@@ -1953,13 +1953,11 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (intersection.empty()) {
             continue;
         }
-        bool is_rectangular = cr.end_coord.x > cr.start_coord.x && cr.end_coord.y > cr.start_coord.y;
-        if (is_rectangular) {
-            non_idle_cores_vec.push_back(intersection.bounding_box());
-        } else {
-            for (const auto& ir : intersection.ranges()) {
-                non_idle_cores_vec.push_back(ir);
-            }
+        // The intersection can be sparse even when the sub-device range is
+        // rectangular. Its bounding box may include cores which are not
+        // receivers in the global circular buffer.
+        for (const auto& ir : intersection.ranges()) {
+            non_idle_cores_vec.push_back(ir);
         }
     }
     all_cores = CoreRangeSet(non_idle_cores_vec);
@@ -2073,12 +2071,31 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
     uint32_t src1_cb_index = base_cb_index + 1;
     tt::tt_metal::CBHandle cb_src1;
     uint32_t remote_cb_index = tt::CBIndex::c_31;
+    uint32_t global_cb_blocks_per_chunk = 1;
     if (use_global_cb) {
-        uint32_t in1_block_size_bytes = in1_single_tile_size * in1_block_num_tiles;
+        uint32_t weight_block_size_bytes = in1_single_tile_size * in1_block_num_tiles;
+        uint32_t transport_page_size = global_cb->page_size();
+        TT_FATAL(
+            transport_page_size >= weight_block_size_bytes,
+            "Global CB transport page {} is smaller than matmul weight block {}",
+            transport_page_size,
+            weight_block_size_bytes);
+        TT_FATAL(
+            transport_page_size % in1_single_tile_size == 0,
+            "Global CB transport page must be divisible by the weight tile size");
+        in1_block_size_bytes = transport_page_size;
+        in1_tensor_size_bytes = transport_page_size * num_blocks;
+        uint32_t global_cb_num_pages = global_cb->size() / transport_page_size;
+        TT_FATAL(global_cb_num_pages >= 2, "Global CB must hold at least two matmul weight blocks");
+        // Remote CB occupancy is tracked by monotonic sent/acked counters, so
+        // unlike a pointer-only FIFO it may safely use every allocated page.
+        // Half the receiver ring keeps one chunk in compute while the next is
+        // filled, maximizing DRAM/math overlap without overcommitting L1.
+        global_cb_blocks_per_chunk = std::min<uint32_t>(4, global_cb_num_pages);
         tt_metal::CircularBufferConfig remote_cb_config =
-            tt_metal::CircularBufferConfig((global_cb->size() / in1_block_size_bytes) * in1_block_size_bytes);
+            tt_metal::CircularBufferConfig(global_cb_num_pages * transport_page_size);
         remote_cb_config.remote_index(remote_cb_index)
-            .set_page_size(in1_block_size_bytes)
+            .set_page_size(transport_page_size)
             .set_data_format(in1_data_format);
         remote_cb_config.index(src1_cb_index).set_page_size(in1_single_tile_size).set_data_format(in1_data_format);
         cb_src1 = tt_metal::experimental::CreateCircularBuffer(program, all_cores, remote_cb_config, *global_cb);
@@ -2113,6 +2130,17 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         tt_metal::CircularBufferConfig(sync_cb2_size_bytes, {{sync_cb2_index, DataFormat::UInt16}})
             .set_page_size(sync_cb2_index, sync_cb2_size_bytes);
     tt_metal::CreateCircularBuffer(program, all_cores, sync_cb2_config);
+
+    uint32_t compute_sync_cb_index = base_cb_index + 5 + 2 * num_output_cb;
+    TT_FATAL(
+        compute_sync_cb_index < tt::CBIndex::c_31,
+        "Compute synchronization circular buffer index {} collides with remote CB {}",
+        compute_sync_cb_index,
+        tt::CBIndex::c_31);
+    tt_metal::CircularBufferConfig compute_sync_cb_config =
+        tt_metal::CircularBufferConfig(sync_cb_size_bytes, {{compute_sync_cb_index, DataFormat::UInt16}})
+            .set_page_size(compute_sync_cb_index, sync_cb_size_bytes);
+    tt_metal::CreateCircularBuffer(program, all_cores, compute_sync_cb_config);
 
     uint32_t output_cb_index = base_cb_index + 5;  // output operands start at index 16
     uint32_t interm0_cb_index = base_cb_index + 6;
@@ -2247,6 +2275,8 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         {"cb_in2", src2_cb_index},
         {"cb_sync", sync_cb_index},
         {"cb_sync2", sync_cb2_index},
+        {"cb_compute_sync", compute_sync_cb_index},
+        {"global_cb_blocks_per_chunk", global_cb_blocks_per_chunk},
     };
     for (uint32_t i = 0; i < num_output_cb; ++i) {
         compute_named_compile_args["cb_mm_out_" + std::to_string(i)] = output_cb_indices[i];
@@ -2323,7 +2353,8 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
                 {"cb_in1", src1_cb_index},
                 {"cb_sync", sync_cb_index},
                 {"cb_sync2", sync_cb2_index},
-                {"cb_remote", remote_cb_index}}});
+                {"cb_remote", remote_cb_index},
+                {"global_cb_blocks_per_chunk", global_cb_blocks_per_chunk}}});
 
     auto mm_kernel = tt_metal::CreateKernel(
         program,

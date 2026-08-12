@@ -12,6 +12,7 @@ struct RepeatParams {
     uint32_t m_num_repeats{};
     bool m_is_last_dim{};
     tt::tt_metal::MemoryConfig m_output_mem_config;
+    std::optional<tt::tt_metal::CoreRangeSet> sub_core_grids;
 };
 
 struct RepeatInputs {

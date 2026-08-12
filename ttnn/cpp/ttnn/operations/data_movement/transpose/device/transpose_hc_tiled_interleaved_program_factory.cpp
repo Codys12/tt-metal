@@ -28,7 +28,7 @@ void set_runtime_args_hc_tiled_interleaved(
     const Tensor& input_tensor,
     Tensor& output_tensor,
     bool is_create,
-    const CoreRange& total_cores) {
+    const CoreRangeSet& total_cores) {
     auto* input_buffer = input_tensor.buffer();
     auto* output_buffer = output_tensor.buffer();
 
@@ -42,17 +42,15 @@ void set_runtime_args_hc_tiled_interleaved(
     auto& cached_reader_args = GetRuntimeArgs(program, reader_kernel_id);
     auto& cached_writer_args = GetRuntimeArgs(program, writer_kernel_id);
 
-    auto compute_with_storage_grid_size = input_tensor.device()->compute_with_storage_grid_size();
     auto [num_cores, all_cores, core_group_1, core_group_2, num_tiles_per_core_group_1, num_tiles_per_core_group_2] =
-        split_work_to_cores(compute_with_storage_grid_size, num_tensor_tiles);
+        split_work_to_cores(total_cores, num_tensor_tiles);
     auto
         [padded_num_cores,
          padded_all_cores,
          padded_core_group_1,
          padded_core_group_2,
          padded_num_tiles_per_core_group_1,
-         padded_num_tiles_per_core_group_2] =
-            split_work_to_cores(compute_with_storage_grid_size, padded_num_tensor_tiles);
+         padded_num_tiles_per_core_group_2] = split_work_to_cores(total_cores, padded_num_tensor_tiles);
 
     all_cores = num_cores > padded_num_cores ? all_cores : padded_all_cores;
     auto cores = corerange_to_cores(all_cores, std::nullopt);
@@ -60,7 +58,7 @@ void set_runtime_args_hc_tiled_interleaved(
     uint32_t start_idx = 0;
     uint32_t padded_start_idx = 0;
     // Need to set runtime args for all cores, not just the ones doing work.
-    for (const auto& core : total_cores) {
+    for (const auto& core : corerange_to_cores(total_cores, std::nullopt, true)) {
         uint32_t num_tiles_per_core;
         uint32_t padded_tiles_per_core;
 
@@ -124,9 +122,8 @@ TransposeHCTiledInterleavedProgramFactory::cached_program_t TransposeHCTiledInte
     uint32_t single_tile_size = tt::tile_size(cb_data_format);
 
     auto compute_with_storage_grid_size = input_tensor.device()->compute_with_storage_grid_size();
-    uint32_t num_cores_x = compute_with_storage_grid_size.x;
-    uint32_t num_cores_y = compute_with_storage_grid_size.y;
-    CoreRange total_cores({0, 0}, {num_cores_x - 1, num_cores_y - 1});
+    CoreRangeSet total_cores = operation_attributes.sub_core_grids.value_or(
+        CoreRangeSet(CoreRange({0, 0}, {compute_with_storage_grid_size.x - 1, compute_with_storage_grid_size.y - 1})));
 
     uint32_t src0_cb_index = tt::CBIndex::c_0;
     uint32_t padding_cb_index = tt::CBIndex::c_1;
@@ -221,15 +218,14 @@ TransposeHCTiledInterleavedProgramFactory::cached_program_t TransposeHCTiledInte
 
 void TransposeHCTiledInterleavedProgramFactory::override_runtime_arguments(
     cached_program_t& cached_program,
-    const TransposeParams& /*operation_attributes*/,
+    const TransposeParams& operation_attributes,
     const TransposeInputs& tensor_args,
     Tensor& output_tensor) {
     auto& program = cached_program.program;
     auto& shared_variables = cached_program.shared_variables;
     auto compute_with_storage_grid_size = tensor_args.input.device()->compute_with_storage_grid_size();
-    uint32_t num_cores_x = compute_with_storage_grid_size.x;
-    uint32_t num_cores_y = compute_with_storage_grid_size.y;
-    CoreRange total_cores({0, 0}, {num_cores_x - 1, num_cores_y - 1});
+    CoreRangeSet total_cores = operation_attributes.sub_core_grids.value_or(
+        CoreRangeSet(CoreRange({0, 0}, {compute_with_storage_grid_size.x - 1, compute_with_storage_grid_size.y - 1})));
 
     set_runtime_args_hc_tiled_interleaved(
         program,
